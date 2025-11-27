@@ -1,0 +1,294 @@
+"""
+Model configuration utilities for HuggingFace models.
+
+This module provides utilities for loading and analyzing model configurations,
+including parameter estimation and parallelism recommendations.
+"""
+import logging
+import os
+import re
+from typing import Any, Dict, Optional
+
+logger = logging.getLogger(__name__)
+
+
+def load_model_config(base_model: str) -> Dict[str, Any]:
+    """
+    Load HuggingFace model config from base_model path.
+
+    Args:
+        base_model: Path to model (can be torch_dist format)
+
+    Returns:
+        Dict with model config parameters
+
+    Raises:
+        Exception: If config cannot be loaded
+    """
+    from transformers import AutoConfig
+
+    # Derive HF path (remove _torch_dist suffix if present)
+    hf_model_path = base_model.replace('_torch_dist', '')
+
+    try:
+        config = AutoConfig.from_pretrained(hf_model_path, trust_remote_code=True)
+
+        return {
+            'num_layers': config.num_hidden_layers,
+            'hidden_size': config.hidden_size,
+            'ffn_hidden_size': config.intermediate_size,
+            'num_attention_heads': config.num_attention_heads,
+            'num_query_groups': getattr(
+                config, 'num_key_value_heads', config.num_attention_heads
+            ),
+            'vocab_size': config.vocab_size,
+            'norm_epsilon': getattr(
+                config, 'rms_norm_eps',
+                getattr(config, 'layer_norm_eps', 1e-6)
+            ),
+            'rotary_base': getattr(config, 'rope_theta', 10000),
+            'tie_word_embeddings': getattr(config, 'tie_word_embeddings', False),
+        }
+    except Exception as e:
+        logger.error(f"Failed to load model config from {hf_model_path}: {e}")
+        raise
+
+
+def estimate_model_params(
+    model_config: Dict[str, Any],
+    model_name: str = ""
+) -> float:
+    """
+    Estimate model parameters in billions.
+
+    Uses two strategies:
+    1. Extract from model name (e.g., "Llama-3.1-8B" → 8.0B)
+    2. Estimate from hidden_size as proxy
+
+    Args:
+        model_config: Model configuration dict from load_model_config()
+        model_name: Optional model name/path
+
+    Returns:
+        Estimated parameters in billions
+    """
+    # Strategy 1: Extract from model name (most reliable)
+    # Examples: "Llama-3.1-8B", "Qwen2.5-0.5B", "Llama-2-70B"
+    if model_name:
+        match = re.search(r'(\d+\.?\d*)[Bb]', model_name)
+        if match:
+            size_b = float(match.group(1))
+            logger.info(f"Extracted {size_b}B from model name: {model_name}")
+            return size_b
+
+    # Strategy 2: Use hidden_size as proxy (fallback)
+    # Correlation across architectures:
+    # - hidden_size ~= 896: 0.5B (Qwen2.5-0.5B)
+    # - hidden_size ~= 2048: 1-2B
+    # - hidden_size ~= 4096: 7-8B (Llama-3.1-8B, Llama-2-7B)
+    # - hidden_size ~= 5120: 13B (Llama-2-13B)
+    # - hidden_size ~= 8192: 70B (Llama-2-70B)
+    hidden_size = model_config['hidden_size']
+
+    if hidden_size < 1536:  # < 1.5K → 0.5B range
+        return 0.5
+    elif hidden_size < 3072:  # 1.5K-3K → 1-2B range
+        return 1.5
+    elif hidden_size < 4608:  # 3K-4.6K → 7-8B range
+        return 8.0
+    elif hidden_size < 6144:  # 4.6K-6K → 13B range
+        return 13.0
+    elif hidden_size < 10240:  # 6K-10K → 30-70B range
+        return 30.0
+    else:  # > 10K
+        return 70.0
+
+
+def get_parallelism_config(
+    model_config: Dict[str, Any],
+    user_config: Optional[Dict] = None,
+    model_name: str = ""
+) -> Dict[str, int]:
+    """
+    Determine parallelism configuration using hybrid approach:
+    1. Environment defaults (deployment-level config)
+    2. Auto-detection based on model size (heuristic)
+    3. User override (request-level config)
+
+    Args:
+        model_config: Model configuration dict
+        user_config: Optional user-provided parallelism config
+        model_name: Optional model name/path for extracting size
+
+    Returns:
+        Dict with tensor_parallel_size, pipeline_parallel_size, num_gpus
+    """
+    # 1. Environment defaults
+    default_tp = int(os.getenv("SLIME_DEFAULT_TP", "1"))
+    default_pp = int(os.getenv("SLIME_DEFAULT_PP", "1"))
+    default_num_gpus = int(os.getenv("SLIME_NUM_GPUS", "4"))
+
+    # 2. Auto-detect based on model size (if env not explicitly set)
+    if default_tp == 1:
+        total_params = estimate_model_params(model_config, model_name)
+        logger.info(f"Estimated model params: {total_params:.2f}B")
+
+        # For 4 GPUs available: use TP*PP=4
+        # Llama-3.1-8B converted with TP=2, PP=2
+        if total_params >= 30:    # >= 30B params: TP=8, PP=1 (requires 8 GPUs)
+            default_tp = 8
+            default_pp = 1
+        elif total_params >= 10:  # 10B-30B params: TP=4, PP=1 (requires 4 GPUs)
+            default_tp = 4
+            default_pp = 1
+        elif total_params >= 2:   # 2B-10B params: TP=2, PP=2 (requires 4 GPUs)
+            default_tp = 2
+            default_pp = 2
+        # else: < 2B params: TP=1, PP=1 (requires 1 GPU)
+
+        logger.info(
+            f"Auto-detected TP={default_tp}, PP={default_pp} "
+            f"for {total_params:.2f}B params"
+        )
+
+    # 3. User override (optional)
+    if user_config:
+        tp = user_config.get("tensor_parallel_size", default_tp)
+        pp = user_config.get("pipeline_parallel_size", default_pp)
+        num_gpus = user_config.get("num_gpus", default_num_gpus)
+        logger.info(f"User override: TP={tp}, PP={pp}, GPUs={num_gpus}")
+    else:
+        tp, pp, num_gpus = default_tp, default_pp, default_num_gpus
+
+    return {
+        "tensor_parallel_size": tp,
+        "pipeline_parallel_size": pp,
+        "num_gpus": num_gpus
+    }
+
+
+def detect_torch_dist_path(base_model: str) -> tuple[str, str]:
+    """
+    Auto-detect torch_dist model path from HF path.
+
+    Args:
+        base_model: Base model path (HF or torch_dist format)
+
+    Returns:
+        Tuple of (megatron_checkpoint_path, hf_model_path)
+    """
+    if not base_model.endswith('_torch_dist'):
+        torch_dist_path = f"{base_model}_torch_dist"
+        if os.path.exists(torch_dist_path):
+            logger.info(
+                f"Auto-detected torch_dist model: {base_model} → {torch_dist_path}"
+            )
+            return torch_dist_path, base_model
+        else:
+            logger.warning(
+                f"No torch_dist version found at {torch_dist_path}, "
+                f"using {base_model} as-is"
+            )
+            return base_model, base_model
+    else:
+        # Already torch_dist format
+        hf_path = base_model.replace('_torch_dist', '')
+        logger.info(f"Using torch_dist model: {base_model}")
+        return base_model, hf_path
+
+
+def parse_checkpoint_uri(checkpoint_path: str, save_dir: str = "/data/checkpoints/tinker") -> str:
+    """
+    Parse tinker:// URI to filesystem checkpoint path.
+
+    Args:
+        checkpoint_path: Checkpoint path (tinker:// URI or filesystem path)
+        save_dir: Base directory for checkpoints
+
+    Returns:
+        Filesystem checkpoint path
+
+    Raises:
+        ValueError: If tinker:// URI format is invalid
+    """
+    if checkpoint_path.startswith("tinker://"):
+        import hashlib
+
+        uri_parts = checkpoint_path.replace("tinker://", "").split("/")
+        if len(uri_parts) >= 3 and uri_parts[1] == "weights":
+            checkpoint_name = uri_parts[2]
+            # Use same step_id calculation as save_weights
+            step_id = int(
+                hashlib.md5(checkpoint_name.encode()).hexdigest()[:8], 16
+            ) % 100000
+            filesystem_path = f"{save_dir}/iter_{step_id:07d}"
+            logger.info(
+                f"Checkpoint resume: {checkpoint_path} → {filesystem_path} "
+                f"(step_id={step_id})"
+            )
+            return filesystem_path
+        else:
+            raise ValueError(f"Invalid tinker:// URI format: {checkpoint_path}")
+    else:
+        # Direct filesystem path
+        logger.info(f"Checkpoint resume: loading from {checkpoint_path}")
+        return checkpoint_path
+
+
+def extract_model_name(args) -> str:
+    """
+    Extract HuggingFace model name from Slime args.
+
+    Args:
+        args: Slime argument Namespace
+
+    Returns:
+        HuggingFace model path/name
+    """
+    if hasattr(args, 'hf_checkpoint') and args.hf_checkpoint:
+        return args.hf_checkpoint
+
+    if hasattr(args, 'pretrained_checkpoint') and args.pretrained_checkpoint:
+        # Remove _torch_dist suffix if present
+        return args.pretrained_checkpoint.replace('_torch_dist', '')
+
+    logger.warning("Could not extract model name from args")
+    return "unknown"
+
+
+def detect_architecture(model_name: str) -> str:
+    """
+    Detect model architecture from model name.
+
+    Args:
+        model_name: Model name or path
+
+    Returns:
+        Architecture name (qwen2.5, llama, mistral, etc.)
+    """
+    short_name = model_name.split("/")[-1].lower()
+
+    # Match common architectures
+    if "qwen2.5" in short_name or "qwen-2.5" in short_name:
+        return "qwen2.5"
+    elif "qwen2" in short_name or "qwen-2" in short_name:
+        return "qwen2"
+    elif "qwen" in short_name:
+        return "qwen"
+    elif "llama-3" in short_name or "llama3" in short_name:
+        return "llama3"
+    elif "llama-2" in short_name or "llama2" in short_name:
+        return "llama2"
+    elif "llama" in short_name:
+        return "llama"
+    elif "mistral" in short_name:
+        return "mistral"
+    elif "mixtral" in short_name:
+        return "mixtral"
+    elif "phi" in short_name:
+        return "phi"
+    elif "gemma" in short_name:
+        return "gemma"
+    else:
+        logger.warning(f"Unknown architecture for model: {model_name}")
+        return "unknown"
