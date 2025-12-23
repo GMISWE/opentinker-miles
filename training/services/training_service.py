@@ -51,7 +51,8 @@ class TrainingService:
         model_id: str,
         train_group: Any,
         data: List[Any],
-        loss_fn: str
+        loss_fn: str,
+        client_info: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Execute forward-only pass (no gradients).
@@ -64,6 +65,7 @@ class TrainingService:
             train_group: Slime RayTrainGroup instance
             data: List of forward data samples
             loss_fn: Loss function type
+            client_info: Client metadata (contains rollout_manager for offload)
 
         Returns:
             Dict with forward results in Tinker format
@@ -72,6 +74,13 @@ class TrainingService:
             Exception: If forward pass fails
         """
         logger.info(f"Forward pass for {model_id}")
+
+        # Offload SGLang before forward pass to free GPU memory
+        rollout_manager = client_info.get("rollout_manager") if client_info else None
+        if rollout_manager is not None:
+            logger.info(f"Offloading SGLang for {model_id} before forward pass")
+            await asyncio.to_thread(lambda: ray.get(rollout_manager.offload.remote()))
+            logger.info(f"SGLang offloaded for {model_id}")
 
         # Convert Tinker data to Slime rollout format
         rollout_data = self.converter.forward_to_rollout(data)

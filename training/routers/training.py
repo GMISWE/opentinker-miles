@@ -101,7 +101,8 @@ async def forward(
             model_id=request.model_id,
             train_group=train_group,
             data=request.forward_input.data,
-            loss_fn=request.forward_input.loss_fn
+            loss_fn=request.forward_input.loss_fn,
+            client_info=client_info
         )
 
     # Create background task with automatic error handling
