@@ -73,13 +73,19 @@ def get_task_manager(
 # Sampling Endpoints
 # ============================================================================
 
+def get_session_service(request: Request):
+    """Session service from app state (None if unavailable)."""
+    return getattr(request.app.state, "session_service", None)
+
+
 @router.post("/api/v1/asample", response_model=AsyncOperationResponse)
 async def asample(
     request: ASampleRequest,
     _: None = Depends(verify_api_key_dep),
     service: SamplingService = Depends(get_sampling_service),
     task_manager: TaskManager = Depends(get_task_manager),
-    training_clients: Dict = Depends(get_training_clients)
+    training_clients: Dict = Depends(get_training_clients),
+    session_service=Depends(get_session_service),
 ):
     """
     Async sampling via SGLang.
@@ -95,6 +101,14 @@ async def asample(
     # Extract prompt tokens
     prompt_tokens = request.prompt.get_tokens()
 
+    # BUG-015: resolve the sampler's pinned weight version (snapshot samplers,
+    # e.g. DPO's frozen reference) so pinned logprob reads aren't served from
+    # the live refit-every-step engine.
+    pinned_version = None
+    if request.sampling_session_id and session_service is not None:
+        info = session_service.get_sampler(request.sampling_session_id)
+        pinned_version = getattr(info, "pinned_version", None) if info else None
+
     async def execute():
         result_dict = await service.async_sample(
             request_id=request_id,
@@ -102,7 +116,8 @@ async def asample(
             num_samples=request.num_samples,
             sampling_params=request.sampling_params.dict() if request.sampling_params else None,
             prompt_logprobs=request.prompt_logprobs,
-            training_clients=training_clients
+            training_clients=training_clients,
+            pinned_version=pinned_version,
         )
 
         # Convert to response model

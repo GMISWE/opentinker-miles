@@ -172,11 +172,16 @@ async def save_weights_for_sampler(
         sampling_session_id = result.get("sampling_session_id")
         if sampling_session_id:
             checkpoint_path = result.get("checkpoint_path")
+            # BUG-015: pin the weight version at save time so pinned logprob
+            # reads are not served from the live (refit-every-step) engine.
+            backend_handle = client_info.get("backend_handle")
+            pinned_version = getattr(backend_handle, "weight_version", None)
             session_service.register_ephemeral_sampler(
                 sampler_id=sampling_session_id,
                 model_id=request.model_id,
                 base_model=base_model,
-                model_path=checkpoint_path
+                model_path=checkpoint_path,
+                pinned_version=pinned_version,
             )
 
         return SaveWeightsForSamplerResult(**result)

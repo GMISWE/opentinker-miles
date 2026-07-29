@@ -77,11 +77,21 @@ class TrainingService:
 
         # Extract learning rate from adam_params (Tinker API pattern)
         learning_rate = None
+        adam_params_dict = None
         if adam_params is not None and hasattr(adam_params, "learning_rate"):
             learning_rate = adam_params.learning_rate
             logger.info("Setting learning rate to %s for %s", learning_rate, model_id)
+            # P4: forward the FULL AdamParams so backends can honor or at least
+            # detect-and-warn on beta/eps/clip values they cannot apply.
+            adam_params_dict = {
+                k: getattr(adam_params, k)
+                for k in ("beta1", "beta2", "eps", "weight_decay", "grad_clip_norm")
+                if hasattr(adam_params, k)
+            }
 
-        result = await self.backend.apply_optimizer_step(handle, learning_rate=learning_rate)
+        result = await self.backend.apply_optimizer_step(
+            handle, learning_rate=learning_rate, adam_params=adam_params_dict,
+        )
 
         logger.info(
             "Optimizer step completed for %s: grad_norm=%s, success=%s",

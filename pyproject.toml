@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# Editable-install the TinkerCloud server so `training` is importable on the
+# server AND on Ray workers (same venv), matching how nemo_rl / tinker /
+# tinker_cookbook are already installed. Fixes the /app-not-on-worker-path
+# misplacement that otherwise blocks shipping tinker-cloud code to workers
+# (e.g. training.backends.nemo_rl.losses.TinkerSumCELoss — see BUG-015).
+name = "tinkercloud-training"
+version = "0.1.0"
+description = "TinkerCloud multi-backend post-training server"
+requires-python = ">=3.10"
+# No dependencies declared on purpose: install with --no-deps, the runtime
+# image already provides everything. This entry only creates the import path.
+
+[tool.setuptools.packages.find]
+include = ["training*"]
