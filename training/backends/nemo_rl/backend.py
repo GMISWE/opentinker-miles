@@ -55,6 +55,8 @@ class NemoRLHandle(BackendHandle):
     generation_state: str = "generation_ready"  # "generation_ready" | "training_ready"
     _generation_state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _training_lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # Serialize optim_step GPU lifecycle
+    weight_version: int = 0              # Optim steps applied; BUG-015 sampler pinning
+    ref_logprob_accumulator: Any = None  # Lazy _RefLogprobAccumulator (BUG-015)
 
 
 class NemoRLBackend(TrainingBackend):
@@ -351,6 +353,7 @@ class NemoRLBackend(TrainingBackend):
         self,
         handle: BackendHandle,
         learning_rate: Optional[float] = None,
+        adam_params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Execute single policy.train() call with all buffered data.
@@ -434,6 +437,12 @@ class NemoRLBackend(TrainingBackend):
             if learning_rate is not None:
                 _set_learning_rate(h.policy, learning_rate)
 
+            # P4: betas/eps are fixed at creation (builder defaults match the
+            # Tinker AdamParams contract: 0.9/0.95/1e-8); the worker exposes no
+            # setter, so warn loudly if a client requests different values.
+            if adam_params:
+                _warn_on_adam_mismatch(h, adam_params)
+
             # Serialize GPU lifecycle: sleep vLLM → train → refit.
             # Pipelined SFT loops fire multiple optim_step calls concurrently;
             # without this lock they race on the same Ray actors/GPU memory,
@@ -479,8 +488,12 @@ class NemoRLBackend(TrainingBackend):
                             logger.info("prev_logprobs replaced with DTensor-computed values")
 
                     if h.loss_fn_name == "cross_entropy":
-                        from nemo_rl.algorithms.loss_functions import NLLLoss
-                        active_loss_fn = NLLLoss()
+                        # Pure-sum CE (Tinker contract), not NeMo RL's mean-normalized
+                        # NLLLoss — see BUG-015 and losses.TinkerSumCELoss. Ships to
+                        # Ray workers by reference (training is pip install -e'd, so
+                        # importable in the shared venv on server + workers).
+                        from .losses import TinkerSumCELoss
+                        active_loss_fn = TinkerSumCELoss()
                     else:
                         active_loss_fn = h.loss_fn  # ClippedPGLossFn (RL)
 
@@ -500,6 +513,10 @@ class NemoRLBackend(TrainingBackend):
                         list(train_result.keys()),
                         {k: v for k, v in train_result.get("all_mb_metrics", {}).items()},
                     )
+
+                    # BUG-015: weights advanced — bump version so pinned samplers
+                    # (e.g. DPO's frozen reference) stop matching the live engine.
+                    h.weight_version += 1
 
                     if h.policy_generation is not None and not h.debug_train_only:
                         logger.info("Refitting policy generation for %s", h.model_id)
@@ -701,15 +718,33 @@ class NemoRLBackend(TrainingBackend):
         num_samples: int,
         sampling_params: Optional[Dict[str, Any]] = None,
         prompt_logprobs: bool = False,
+        pinned_version: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Sample via Policy.generate() on vLLM Ray workers.
 
         PERF-002: requests are batch-accumulated per model and flushed as a
         single generate() call (~20-30x speedup for RL rollouts).
+
+        BUG-015: `pinned_version` is the weight version a snapshot sampler was
+        created at. The live vLLM engine is refit to the current policy every
+        optim step, so a pinned sampler's compute_logprobs must NOT be served
+        from it once versions diverge. v0-pinned samplers (DPO's frozen
+        reference) are served from NeMo RL's built-in frozen reference model.
         """
         from .generation import NemoRLBatchAccumulator
 
         h: NemoRLHandle = handle  # type: ignore[assignment]
+
+        # BUG-015 routing: version-pinned logprob reads
+        if prompt_logprobs and pinned_version is not None and pinned_version != h.weight_version:
+            if pinned_version == 0:
+                return await self._reference_prompt_logprobs(h, prompt_tokens)
+            logger.warning(
+                "[%s] sampler pinned at v%s but live weights at v%s — serving from "
+                "LIVE weights (known-wrong; needs version-pinned sampling, 003)",
+                request_id, pinned_version, h.weight_version,
+            )
+
         if h.policy_generation is None:
             raise BackendError(
                 "generation engine not initialized (debug_train_only mode?)",
@@ -726,6 +761,71 @@ class NemoRLBackend(TrainingBackend):
             sampling_params=sampling_params or {},
             prompt_logprobs=prompt_logprobs,
         )
+
+    async def _reference_prompt_logprobs(
+        self, h: "NemoRLHandle", prompt_tokens: List[int],
+    ) -> Dict[str, Any]:
+        """Serve compute_logprobs from the frozen reference model (W0).
+
+        BUG-015 fix: DPO's reference sampler is a t=0 snapshot; the policy
+        workers already hold frozen W0 (init_reference_model=True), so we call
+        NeMo RL's public get_reference_policy_logprobs — no NeMo RL changes.
+        Requests are batch-accumulated (DPO fires ~2x batch_size concurrent
+        calls per step) and flushed as one call.
+        """
+        if h.ref_logprob_accumulator is None:
+            h.ref_logprob_accumulator = _RefLogprobAccumulator()
+        lp = await h.ref_logprob_accumulator.submit(self, h, prompt_tokens)
+        # SDK reads prompt_logprobs only; one dummy sequence satisfies the schema.
+        return {
+            "sequences": [
+                {"stop_reason": "length", "tokens": [], "logprobs": [], "text": None}
+            ],
+            "prompt_logprobs": lp,
+        }
+
+    async def _run_reference_logprobs(
+        self, h: "NemoRLHandle", prompts: List[List[int]],
+    ) -> List[List[Optional[float]]]:
+        """One batched frozen-reference logprob pass. GPU lifecycle mirrors
+        forward(): sleep vLLM -> prepare_for_training -> compute, NO refit
+        (read-only; next generate() re-wakes via the safety net)."""
+        import torch
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+        batch_size = len(prompts)
+        max_len = max(len(p) for p in prompts)
+        input_ids = torch.zeros(batch_size, max_len, dtype=torch.long)
+        token_mask = torch.zeros(batch_size, max_len, dtype=torch.float32)
+        for i, p in enumerate(prompts):
+            input_ids[i, : len(p)] = torch.tensor(p, dtype=torch.long)
+            token_mask[i, : len(p)] = 1.0
+        data = BatchedDataDict({
+            "input_ids": input_ids,
+            "input_lengths": torch.tensor([len(p) for p in prompts], dtype=torch.long),
+            "token_mask": token_mask,
+            "sample_mask": torch.ones(batch_size, dtype=torch.float32),
+        })
+        dp_size = h.config.get("dp_size", 1)
+        mbs = h.config.get("policy", {}).get("train_micro_batch_size", 1)
+        data = await asyncio.to_thread(_maybe_pad_batch, data, dp_size, mbs, None)
+
+        async with h._training_lock:
+            async with h._generation_state_lock:
+                h.generation_state = "training_ready"
+            if h.policy_generation is not None and h.colocated_inference:
+                await asyncio.to_thread(h.policy_generation.finish_generation)
+            await asyncio.to_thread(h.policy.prepare_for_training)
+            out = await asyncio.to_thread(h.policy.get_reference_policy_logprobs, data)
+
+        ref = out["reference_logprobs"]  # [B_padded, S]; row t = logprob(token_t | <t)
+        results: List[List[Optional[float]]] = []
+        for i, p in enumerate(prompts):
+            row = ref[i]
+            vals = row[1: len(p)].tolist()
+            # BUG-013 convention: position 0 has no logprob
+            results.append([None] + [float(v) for v in vals])
+        return results
 
     async def prepare_for_generation(self, handle: BackendHandle) -> None:
         """Safety-net refit + wake if the engine was left in training state."""
@@ -971,6 +1071,37 @@ def _refit_policy_generation(policy, policy_generation, colocated_inference: boo
         policy_generation.prepare_for_generation(tags=["kv_cache"])
 
 
+def _warn_on_adam_mismatch(h: "NemoRLHandle", adam_params: Dict[str, Any]) -> None:
+    """P4: compare client-requested Adam params against the applied config.
+
+    Betas/eps/weight_decay/clip are baked into the optimizer at model creation;
+    NeMo RL's worker only exposes set_learning_rate, so differing requests
+    cannot be honored per-step without an upstream setter. Warn once per handle.
+    """
+    if getattr(h, "_adam_mismatch_warned", False):
+        return
+    kwargs = h.config.get("policy", {}).get("optimizer", {}).get("kwargs", {})
+    applied = {
+        "beta1": kwargs.get("betas", [0.9, 0.95])[0],
+        "beta2": kwargs.get("betas", [0.9, 0.95])[1],
+        "eps": kwargs.get("eps", 1e-8),
+        "weight_decay": kwargs.get("weight_decay", 0.0),
+        "grad_clip_norm": h.config.get("policy", {}).get("max_grad_norm", 1.0),
+    }
+    mismatches = {
+        k: (v, applied[k]) for k, v in adam_params.items()
+        if k in applied and v is not None and abs(float(v) - float(applied[k])) > 1e-12
+    }
+    if mismatches:
+        logger.warning(
+            "[P4] client AdamParams differ from applied optimizer config and "
+            "CANNOT be applied per-step (requested vs applied): %s — fix at "
+            "model creation (builder) or add an upstream NeMo RL setter.",
+            mismatches,
+        )
+    h._adam_mismatch_warned = True
+
+
 def _set_learning_rate(policy, learning_rate: float):
     """Set learning rate on the policy's optimizer via worker RPC."""
     import ray
@@ -987,6 +1118,59 @@ def _set_learning_rate(policy, learning_rate: float):
             "Could not set learning rate to %s: %s. Using default LR.",
             learning_rate, e,
         )
+
+
+class _RefLogprobAccumulator:
+    """Batch-accumulate frozen-reference logprob requests (BUG-015).
+
+    Same shape as NemoRLBatchAccumulator (PERF-002): concurrent
+    compute_logprobs calls within a flush window are served by ONE
+    get_reference_policy_logprobs pass. Single event loop => the
+    drain-then-exit check under the lock is race-free.
+    """
+
+    def __init__(self, flush_interval_s: float = 0.05):
+        self._flush_interval = flush_interval_s
+        self._pending: List[Any] = []  # (prompt_tokens, future)
+        self._lock = asyncio.Lock()
+        self._flush_task: Optional[asyncio.Task] = None
+
+    async def submit(self, backend, handle, prompt_tokens: List[int]):
+        fut = asyncio.get_event_loop().create_future()
+        async with self._lock:
+            self._pending.append((prompt_tokens, fut))
+            if self._flush_task is None or self._flush_task.done():
+                self._flush_task = asyncio.create_task(
+                    self._flush_loop(backend, handle)
+                )
+        return await fut
+
+    async def _flush_loop(self, backend, handle):
+        while True:
+            await asyncio.sleep(self._flush_interval)
+            async with self._lock:
+                pending, self._pending = self._pending, []
+            if not pending:
+                return
+            try:
+                results = await backend._run_reference_logprobs(
+                    handle, [p for p, _ in pending]
+                )
+                for (_, fut), lp in zip(pending, results):
+                    if not fut.done():
+                        fut.set_result(lp)
+            except Exception as e:  # propagate to all waiters
+                for _, fut in pending:
+                    if not fut.done():
+                        fut.set_exception(
+                            BackendError(
+                                str(e), backend="nemo_rl",
+                                operation="reference_logprobs", original_error=e,
+                            )
+                        )
+            async with self._lock:
+                if not self._pending:
+                    return
 
 
 def _maybe_pad_batch(batch, dp_size: int, mbs: int, image_preprocessor=None):

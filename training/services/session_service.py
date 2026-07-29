@@ -27,6 +27,9 @@ class SamplerInfo:
     base_model: Optional[str] = None
     model_path: Optional[str] = None
     created_at: datetime = field(default_factory=datetime.now)
+    # BUG-015: weight version of the owning model when this sampler was created.
+    # None = unknown (e.g. restored from storage) -> served from live weights.
+    pinned_version: Optional[int] = None
 
 
 @dataclass
@@ -409,7 +412,8 @@ class SessionService:
         sampler_id: str,
         model_id: str,
         base_model: Optional[str] = None,
-        model_path: Optional[str] = None
+        model_path: Optional[str] = None,
+        pinned_version: Optional[int] = None,
     ) -> bool:
         """
         Register an ephemeral sampler from save_weights_for_sampler.
@@ -443,6 +447,7 @@ class SessionService:
             session_id=session_id,
             base_model=base_model if base_model else None,
             model_path=model_path,
+            pinned_version=pinned_version,
         )
 
         # Persist to storage

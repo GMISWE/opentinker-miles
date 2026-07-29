@@ -218,13 +218,17 @@ class NemoRLArgumentBuilder(ArgumentBuilder):
                     "enabled": True,
                 },
             },
-            # Optimizer (AdamW defaults matching Miles)
+            # Optimizer. Betas/eps match the Tinker AdamParams contract defaults
+            # (beta2=0.95) — the client sends AdamParams per optim_step but the
+            # worker only exposes a learning-rate setter, so betas/eps are fixed
+            # at creation (P4; mismatches warned in backend.apply_optimizer_step).
             "optimizer": {
                 "name": "torch.optim.AdamW",
                 "kwargs": {
                     "lr": 5.0e-6,
                     "weight_decay": 0.0,
-                    "betas": [0.9, 0.999],
+                    "betas": [0.9, 0.95],
+                    "eps": 1.0e-8,
                     "foreach": False,
                     "fused": False,
                 },
@@ -232,13 +236,21 @@ class NemoRLArgumentBuilder(ArgumentBuilder):
         }
 
         if lora_config and lora_config.get("rank", 0) > 0:
+            # All-linear coverage (attention + MLP) to match hosted Tinker
+            # semantics — per the Tinker LoRA primer, attention-only LoRA
+            # under-performs even at matched parameter count (BUG-015 residual
+            # gap). Client may override via lora_config["target_modules"].
+            target_modules = lora_config.get("target_modules") or [
+                "*.q_proj", "*.k_proj", "*.v_proj", "*.o_proj",
+                "*.gate_proj", "*.up_proj", "*.down_proj",
+            ]
             policy_config["dtensor_cfg"]["lora_cfg"] = {
                 "enabled": True,
                 "dim": lora_config.get("rank", 8),
                 "alpha": lora_config.get("alpha") or lora_config.get("rank", 8),
                 "dropout": lora_config.get("dropout", 0.0),
                 "dropout_position": "pre",
-                "target_modules": ["*.q_proj", "*.k_proj", "*.v_proj", "*.o_proj"],
+                "target_modules": target_modules,
                 "exclude_modules": [],
                 "lora_A_init": "kaiming",
             }

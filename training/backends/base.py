@@ -146,10 +146,15 @@ class TrainingBackend(ABC):
         self,
         handle: BackendHandle,
         learning_rate: Optional[float] = None,
+        adam_params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Apply accumulated gradients via optimizer step, then sync
         weights to inference engine.
+
+        adam_params (P4): full client AdamParams (beta1/beta2/eps/weight_decay/
+        grad_clip_norm). Backends honor what they can and MUST warn on values
+        they cannot apply.
 
         NeMo RL behavior:
             Concatenates all buffered forward_backward data and calls
@@ -257,6 +262,7 @@ class TrainingBackend(ABC):
         num_samples: int,
         sampling_params: Optional[Dict[str, Any]] = None,
         prompt_logprobs: bool = False,
+        pinned_version: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Generate num_samples completions for one prompt via the backend's

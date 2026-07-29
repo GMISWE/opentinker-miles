@@ -41,10 +41,14 @@ class SamplingService:
         num_samples: int,
         sampling_params: Optional[Dict[str, Any]],
         prompt_logprobs: bool,
-        training_clients: Dict[str, Dict[str, Any]]
+        training_clients: Dict[str, Dict[str, Any]],
+        pinned_version: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Async sampling for a single prompt.
+
+        `pinned_version` (BUG-015): weight version the requesting sampler was
+        created at; backends route pinned logprob reads off the live engine.
 
         Returns:
             Dict with sequences and optional prompt_logprobs
@@ -62,6 +66,7 @@ class SamplingService:
             num_samples=num_samples,
             sampling_params=sampling_params,
             prompt_logprobs=prompt_logprobs,
+            pinned_version=pinned_version,
         )
 
     async def sync_sample(

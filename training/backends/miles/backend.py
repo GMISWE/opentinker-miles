@@ -301,7 +301,10 @@ class MilesBackend(TrainingBackend):
         self,
         handle: BackendHandle,
         learning_rate: Optional[float] = None,
+        adam_params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        # adam_params accepted for contract uniformity (P4); Miles applies lr
+        # only — betas/eps are Megatron args fixed at creation.
         h: MilesHandle = handle  # type: ignore[assignment]
         try:
             # TinkerTrainGroup: apply_optimizer_step(learning_rate) fans out to
@@ -446,8 +449,14 @@ class MilesBackend(TrainingBackend):
         num_samples: int,
         sampling_params: Optional[Dict[str, Any]] = None,
         prompt_logprobs: bool = False,
+        pinned_version: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Sample via per-request HTTP calls to the SGLang router."""
+        """Sample via per-request HTTP calls to the SGLang router.
+
+        pinned_version is accepted for contract uniformity but NOT honored:
+        Miles serves from the live SGLang engine (same BUG-015 aliasing class;
+        needs version-pinned sampling to fix).
+        """
         from ...utils.sglang_client import SGLangClient
 
         h: MilesHandle = handle  # type: ignore[assignment]
