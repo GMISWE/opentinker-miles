@@ -125,22 +125,30 @@ def main():
           f"{gn_b0!r} vs {gn_b1!r}")
 
     print("P3 interleave: pipelined cross-tenant == serialized (lr=0)", flush=True)
-    # Interleaved: submit before awaiting; the pool FIFO lock executes in
-    # submission order with A/B ops crossing.
+    # Interleaved: ALL ops via the SDK — its per-client _take_turn preserves
+    # submission order; mixing raw-HTTP steps with SDK fb races (the raw
+    # step can reach the server first and consume an empty slot; observed
+    # 2026-07-30: grad_norm 0.0 + exact 2x/4x leftover-grad multiples).
+    # Verdict comes from post-round state probes: an out-of-order step
+    # leaves unconsumed grads and the next probe's grad_norm doubles.
+    lr0 = types.AdamParams(learning_rate=0.0)
     fut_a = tc_a.forward_backward(probe_a, "cross_entropy")
     fut_b1 = tc_b.forward_backward(probe_b, "cross_entropy")
-    rid_sa = submit_step(tc_a.model_id, 0.0)
+    fut_sa = tc_a.optim_step(lr0)
     fut_b2 = tc_b.forward_backward(probe_b, "cross_entropy")
-    rid_sb = submit_step(tc_b.model_id, 0.0)
-    fut_a.result(); fut_b1.result(); fut_b2.result()
-    gn_a_i = await_future(rid_sa).get("grad_norm")
-    gn_b_i = await_future(rid_sb).get("grad_norm")
-    # Serialized per-tenant, same data (weights static under lr=0).
+    fut_sb = tc_b.optim_step(lr0)
+    for f in (fut_a, fut_b1, fut_sa, fut_b2, fut_sb):
+        f.result()
+    _, gn_a_i = probe(tc_a, tc_a.model_id, probe_a)
+    _, gn_b_i = probe(tc_b, tc_b.model_id, probe_b)
+    # Serialized per-tenant, same ops fully awaited (weights static: lr=0).
     tc_a.forward_backward(probe_a, "cross_entropy").result()
-    gn_a_s = step(tc_a.model_id, 0.0).get("grad_norm")
+    step(tc_a.model_id, 0.0)
     tc_b.forward_backward(probe_b, "cross_entropy").result()
     tc_b.forward_backward(probe_b, "cross_entropy").result()
-    gn_b_s = step(tc_b.model_id, 0.0).get("grad_norm")
+    step(tc_b.model_id, 0.0)
+    _, gn_a_s = probe(tc_a, tc_a.model_id, probe_a)
+    _, gn_b_s = probe(tc_b, tc_b.model_id, probe_b)
     check("P3 A interleaved == serialized", repr(gn_a_i) == repr(gn_a_s),
           f"{gn_a_i!r} vs {gn_a_s!r}")
     check("P3 B interleaved == serialized", repr(gn_b_i) == repr(gn_b_s),
@@ -150,8 +158,7 @@ def main():
     r = requests.post(f"{BASE}/api/v1/delete_model", headers=HDRS,
                       json={"model_id": tc_b.model_id})
     check("P4 delete B", r.status_code == 200, f"status={r.status_code}")
-    tc_a.forward_backward(probe_a, "cross_entropy").result()
-    gn_a_post = step(tc_a.model_id, 0.0).get("grad_norm")
+    _, gn_a_post = probe(tc_a, tc_a.model_id, probe_a)
     check("P4 A grad_norm after B's exit", repr(gn_a_post) == repr(gn_a_s),
           f"{gn_a_post!r} vs {gn_a_s!r}")
 
