@@ -7,7 +7,7 @@ forward_backward_only / apply_optimizer_step, pure-sum loss via rollout keys
 set in the converter."""
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -33,6 +33,13 @@ class MilesHandle(BackendHandle):
     wandb_config: Optional[Dict[str, Any]] = None
     created_at: str = ""
     training_run_id: str = ""
+    # Serializes GPU-bound ops per model. The task manager runs request
+    # handlers as concurrent asyncio tasks; without this, pipelined
+    # fb/optim_step broadcasts interleave inconsistently across the DP actors
+    # (mispaired collectives -> scrambled outputs; optim_step consuming a
+    # later fb's grads). asyncio.Lock wakes waiters FIFO, so execution
+    # follows submission order.
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class MilesBackend(TrainingBackend):
@@ -189,6 +196,7 @@ class MilesBackend(TrainingBackend):
         loss_fn: str,
     ) -> Dict[str, Any]:
         h: MilesHandle = handle  # type: ignore[assignment]
+        await h.lock.acquire()
         try:
             from miles.utils.ray_utils import Box
 
@@ -217,6 +225,8 @@ class MilesBackend(TrainingBackend):
             raise BackendError(
                 str(e), backend="miles", operation="forward", original_error=e,
             ) from e
+        finally:
+            h.lock.release()
 
     async def forward_backward(
         self,
@@ -225,6 +235,7 @@ class MilesBackend(TrainingBackend):
         loss_fn: str,
     ) -> Dict[str, Any]:
         h: MilesHandle = handle  # type: ignore[assignment]
+        await h.lock.acquire()
         try:
             from miles.utils.ray_utils import Box
 
@@ -296,6 +307,8 @@ class MilesBackend(TrainingBackend):
             raise BackendError(
                 str(e), backend="miles", operation="forward_backward", original_error=e,
             ) from e
+        finally:
+            h.lock.release()
 
     async def apply_optimizer_step(
         self,
@@ -306,6 +319,7 @@ class MilesBackend(TrainingBackend):
         # adam_params accepted for contract uniformity (P4); Miles applies lr
         # only — betas/eps are Megatron args fixed at creation.
         h: MilesHandle = handle  # type: ignore[assignment]
+        await h.lock.acquire()
         try:
             # TinkerTrainGroup: apply_optimizer_step(learning_rate) fans out to
             # the actors; _and_sync additionally pushes weights to SGLang.
@@ -341,15 +355,20 @@ class MilesBackend(TrainingBackend):
             raise BackendError(
                 str(e), backend="miles", operation="apply_optimizer_step", original_error=e,
             ) from e
+        finally:
+            h.lock.release()
 
     async def update_inference_weights(self, handle: BackendHandle) -> None:
         h: MilesHandle = handle  # type: ignore[assignment]
+        await h.lock.acquire()
         try:
             await h.train_group.update_weights()
         except Exception as e:
             raise BackendError(
                 str(e), backend="miles", operation="update_inference_weights", original_error=e,
             ) from e
+        finally:
+            h.lock.release()
 
     async def save_checkpoint(
         self,
@@ -358,6 +377,7 @@ class MilesBackend(TrainingBackend):
         step_id: Optional[int] = None,
     ) -> str:
         h: MilesHandle = handle  # type: ignore[assignment]
+        await h.lock.acquire()
         try:
             offload_train = h.args.offload_train if h.args else False
             if offload_train:
@@ -374,6 +394,8 @@ class MilesBackend(TrainingBackend):
             raise BackendError(
                 str(e), backend="miles", operation="save_checkpoint", original_error=e,
             ) from e
+        finally:
+            h.lock.release()
 
     async def load_checkpoint(
         self,
@@ -381,6 +403,7 @@ class MilesBackend(TrainingBackend):
         checkpoint_path: str,
     ) -> None:
         h: MilesHandle = handle  # type: ignore[assignment]
+        await h.lock.acquire()
         try:
             await h.train_group.load_checkpoint(checkpoint_path)
 
@@ -394,9 +417,14 @@ class MilesBackend(TrainingBackend):
             raise BackendError(
                 str(e), backend="miles", operation="load_checkpoint", original_error=e,
             ) from e
+        finally:
+            h.lock.release()
 
     async def delete_model(self, handle: BackendHandle) -> None:
         h: MilesHandle = handle  # type: ignore[assignment]
+        # Hold the op lock so teardown can't interleave with an in-flight
+        # fb/step (delete-during-optim_step crash class).
+        await h.lock.acquire()
         try:
             resources_freed = []
             for actor in h.train_group._actor_handles:
@@ -426,6 +454,8 @@ class MilesBackend(TrainingBackend):
             raise BackendError(
                 str(e), backend="miles", operation="delete_model", original_error=e,
             ) from e
+        finally:
+            h.lock.release()
 
     async def get_logprobs(
         self,
