@@ -20,7 +20,9 @@ from tinker_cookbook.supervised import train
 from tinker_cookbook.supervised.types import ChatDatasetBuilderCommonConfig
 
 MODEL = "Qwen/Qwen2.5-0.5B"
-LOG_PATH = "/data/g3_sl_basic_20260730"
+# Env-overridable so two instances can run concurrently against a pool-mode
+# server (the M2 per-tenant E2 gate).
+LOG_PATH = os.environ.get("G3_LOG_PATH", "/data/g3_sl_basic_20260730")
 
 config = train.Config(
     log_path=LOG_PATH,
