@@ -96,6 +96,7 @@ class MilesBackend(TrainingBackend):
                 f"requires a classification backend (automodel / megatron_bridge)",
                 backend="miles", operation="create_model",
             )
+        _cleanup: Dict[str, Any] = {}
         try:
             logger.info("[%s] Creating Miles model %s", request_id, model_id)
 
@@ -123,6 +124,9 @@ class MilesBackend(TrainingBackend):
             # Sync ray calls (pg.ready waits, actor allocation) — keep them off
             # the event loop or /retrieve_future polls stall and clients time out.
             pgs = await asyncio.to_thread(create_placement_groups, args)
+            # Failure past PG creation must not orphan GPU reservations
+            # (orphaned PGs starve every later create_model until a rotation).
+            _cleanup["pgs"] = pgs
 
             multi_lora = bool(getattr(args, "multi_lora", False))
             if multi_lora and debug_train_only:
@@ -139,6 +143,7 @@ class MilesBackend(TrainingBackend):
                 rollout_manager, _ = await asyncio.to_thread(
                     create_rollout_manager, args, pgs["rollout"]
                 )
+                _cleanup["rollout_manager"] = rollout_manager
 
             controller = None
             adapter_name = None
@@ -155,6 +160,7 @@ class MilesBackend(TrainingBackend):
                 controller = create_multilora_controller(
                     args, f"http://{router_ip}:{router_port}"
                 )
+                _cleanup["controller"] = controller
                 await controller.start.remote()
 
                 adapter_name = re.sub(r"[^A-Za-z0-9._-]", "-", model_id)
@@ -178,6 +184,7 @@ class MilesBackend(TrainingBackend):
                 with_ref=False,
                 rollout_manager=rollout_manager,
             ))
+            _cleanup["train_group"] = train_group
 
             try:
                 await asyncio.wait_for(train_group.init(), timeout=1800.0)
@@ -232,11 +239,43 @@ class MilesBackend(TrainingBackend):
             return handle
 
         except BackendError:
+            await asyncio.to_thread(self._teardown_partial, _cleanup)
             raise
         except Exception as e:
+            await asyncio.to_thread(self._teardown_partial, _cleanup)
             raise BackendError(
                 str(e), backend="miles", operation="create_model", original_error=e,
             ) from e
+
+    @staticmethod
+    def _teardown_partial(cleanup: Dict[str, Any]) -> None:
+        """Best-effort release of partially-booted resources (create_model
+        failure path). PG removal also reaps actors placed in them."""
+        train_group = cleanup.get("train_group")
+        if train_group is not None:
+            for actor in getattr(train_group, "_actor_handles", None) or []:
+                try:
+                    ray.kill(actor, no_restart=True)
+                except Exception:
+                    pass
+        for key in ("rollout_manager", "controller"):
+            actor = cleanup.get(key)
+            if actor is not None:
+                try:
+                    ray.kill(actor, no_restart=True)
+                except Exception:
+                    pass
+        seen = set()
+        for pg_tuple in (cleanup.get("pgs") or {}).values():
+            pg_obj = pg_tuple[0] if isinstance(pg_tuple, tuple) else pg_tuple
+            if pg_obj is not None and id(pg_obj) not in seen:
+                seen.add(id(pg_obj))
+                try:
+                    ray.util.remove_placement_group(pg_obj)
+                except Exception:
+                    pass
+        if cleanup:
+            logger.info("create_model failure teardown: released %s", sorted(cleanup))
 
     async def forward(
         self,
