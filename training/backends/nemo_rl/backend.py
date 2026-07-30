@@ -314,10 +314,18 @@ class NemoRLBackend(TrainingBackend):
             )
 
             # CHK010: deferred contract — empty metrics, real metrics at optim_step.
-            # Zero-logprob placeholders let SFT finish_batch zip(logprobs, weights);
-            # actual NLL comes from the forward() path.
+            #
+            # loss_fn_outputs by path:
+            # - cross_entropy (SFT + forward_backward_custom coefficients): zero
+            #   placeholders, shape-matched to `weights`, so client-side strict
+            #   zip(logprobs, weights) survives (supervised/train.py, SDK custom path).
+            # - RL loss fns: EMPTY list. This is the published deferred contract
+            #   tinker-cookbook rl/train.py (T062) branches on — "forward_backward
+            #   returns empty logprobs" — to consume the real per-sample logprobs
+            #   from the matching optim_step response instead. Per-datum empty
+            #   entries here would make that branch unreachable (001-P3 gap).
             placeholder_outputs = []
-            for datum in data:
+            for datum in data if loss_fn == "cross_entropy" else []:
                 # Handle both Pydantic ForwardBackwardDatum and plain dict
                 lfi = getattr(datum, "loss_fn_inputs", None) or (
                     datum.get("loss_fn_inputs") if isinstance(datum, dict) else None
@@ -1215,7 +1223,11 @@ def _maybe_pad_batch(batch, dp_size: int, mbs: int, image_preprocessor=None):
 def _extract_loss_fn_outputs(curr_logprobs, batched_data, original_size: int):
     """Convert curr_logprobs [B, S-1] to per-sample loss_fn_outputs.
 
-    Uses token_mask to extract response-only logprobs matching Miles format.
+    Returns datum-aligned FULL-LENGTH logprobs (Miles parity): position p holds
+    the logprob of target token x_p, length input_lengths[i]-1 == the wire
+    tensor length (mask/logprobs/advantages). Do NOT mask-compress — the
+    cookbook indexes these with a full-length action mask
+    (rl/metrics.py compute_kl_sample_train).
     Only produces outputs for the first ``original_size`` samples (skips padding).
 
     Returns:
@@ -1224,21 +1236,15 @@ def _extract_loss_fn_outputs(curr_logprobs, batched_data, original_size: int):
     if curr_logprobs is None:
         return []
 
-    import torch
-
-    token_mask = batched_data.get("token_mask") if hasattr(batched_data, "get") else None
+    input_lengths = batched_data.get("input_lengths") if hasattr(batched_data, "get") else None
     loss_fn_outputs = []
 
     for i in range(original_size):
-        lp_i = curr_logprobs[i]  # [S-1]
+        lp_i = curr_logprobs[i]  # [S_max-1], right-padded; real values in [:seq_len-1]
 
-        if token_mask is not None:
-            # token_mask is [B, S], curr_logprobs is [B, S-1].
-            # token_mask[:, 1:] aligns with logprobs (predict next token).
-            mask_i = token_mask[i, 1:]  # [S-1]
-            response_lp = lp_i[mask_i.bool()].cpu().tolist()
-        else:
-            response_lp = lp_i.cpu().tolist()
+        if input_lengths is not None:
+            lp_i = lp_i[: int(input_lengths[i]) - 1]
+        response_lp = lp_i.cpu().tolist()
 
         loss_fn_outputs.append({
             "logprobs": {
