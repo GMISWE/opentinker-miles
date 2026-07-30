@@ -13,3 +13,8 @@ rotate the server between runs (models are not auto-reaped).
 | `g2_pipelined.py` | G2 under pipelining | same, with fb/optim/fb/optim submitted before any await |
 | `g3_batch_probe.py` | G3 data-shape diagnostic | real shuffled NoRobots batch through fb, length audit |
 | `g3_sl_basic.py` | G3 end-to-end | 30-step SFT completes, NLL decreasing (2026-07-30: 2.80→2.28) |
+| `g4_pool_isolation.py` | G4 pool isolation (M2) | 2 tenants, 1 pool: join fast; B's pinned probe bit-stable across A's steps; interleaved ≡ serialized; A bit-equal after B's delete |
+
+G4 needs a pool-mode server (`TINKERCLOUD_MILES_MULTILORA_SLOTS>0`). The
+per-tenant E₂ gate is two `g3_sl_basic.py` runs launched concurrently
+against the same pool-mode server (each creates its own tenant).
