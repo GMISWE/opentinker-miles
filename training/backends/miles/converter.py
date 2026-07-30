@@ -21,10 +21,11 @@ class MilesDataConverter(DataConverter):
         self,
         data: List[Dict],
         args: Any,
+        adapter_slot: Any = None,
     ) -> Any:
         """Convert Tinker data to Miles rollout_data for forward pass."""
         rollout_data = self._inner.forward_to_rollout(data)
-        self._add_tinker_seam_keys(rollout_data, len(data))
+        self._add_tinker_seam_keys(rollout_data, len(data), adapter_slot=adapter_slot)
         return rollout_data
 
     def forward_backward_to_backend(
@@ -32,11 +33,12 @@ class MilesDataConverter(DataConverter):
         data: List[Dict],
         loss_fn: str,
         args: Any,
+        adapter_slot: Any = None,
     ) -> Any:
         """Convert Tinker data to Miles rollout_data for training."""
         is_rl = not getattr(args, "debug_train_only", False)
         rollout_data = self._inner.forward_backward_to_rollout(data, is_rl=is_rl)
-        self._add_tinker_seam_keys(rollout_data, len(data))
+        self._add_tinker_seam_keys(rollout_data, len(data), adapter_slot=adapter_slot)
         # Per-request loss selection (upstream dispatches on args.loss_type at
         # startup; the seam overrides per batch). The inner converter already
         # sets sft_loss when it detects SFT-shaped data — don't override that.
@@ -47,16 +49,20 @@ class MilesDataConverter(DataConverter):
         return rollout_data
 
     @staticmethod
-    def _add_tinker_seam_keys(rollout_data: Any, num_samples: int) -> None:
+    def _add_tinker_seam_keys(rollout_data: Any, num_samples: int, adapter_slot: Any = None) -> None:
         """Keys the tinker-seam miles branch consumes.
 
         - dynamic_global_batch_size: actual request size, so upstream
           get_data_iterator schedules correctly for variable batches.
         - _loss_norm_total=1: pure-sum gradients — invariant to how a logical
           batch is split across forward_backward calls (G1 contract).
+        - adapter_slots (pool mode): route every sample of this request to the
+          model's slot; the shard converter injects n_adapters from args.
         """
         rollout_data["dynamic_global_batch_size"] = num_samples
         rollout_data["_loss_norm_total"] = 1
+        if adapter_slot is not None:
+            rollout_data["adapter_slots"] = [adapter_slot] * num_samples
 
     def backend_to_forward_result(
         self,

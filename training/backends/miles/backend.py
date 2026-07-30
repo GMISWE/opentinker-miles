@@ -33,6 +33,11 @@ class MilesHandle(BackendHandle):
     wandb_config: Optional[Dict[str, Any]] = None
     created_at: str = ""
     training_run_id: str = ""
+    # Multi-LoRA pool mode (TINKERCLOUD_MILES_MULTILORA_SLOTS): this model is
+    # an adapter slot on shared rails rather than a dedicated full model.
+    controller: Any = None            # MultiLoRAController (named Ray actor)
+    adapter_name: Optional[str] = None
+    adapter_slot: Optional[int] = None
     # Serializes GPU-bound ops per model. The task manager runs request
     # handlers as concurrent asyncio tasks; without this, pipelined
     # fb/optim_step broadcasts interleave inconsistently across the DP actors
@@ -119,12 +124,48 @@ class MilesBackend(TrainingBackend):
             # the event loop or /retrieve_future polls stall and clients time out.
             pgs = await asyncio.to_thread(create_placement_groups, args)
 
+            multi_lora = bool(getattr(args, "multi_lora", False))
+            if multi_lora and debug_train_only:
+                raise BackendError(
+                    "Multi-LoRA pool mode requires rollout engines (adapter "
+                    "weight push targets SGLang); debug_train_only unsupported",
+                    backend="miles", operation="create_model",
+                )
+
             rollout_manager = None
             router_ip = None
             router_port = None
             if not debug_train_only:
                 rollout_manager, _ = await asyncio.to_thread(
                     create_rollout_manager, args, pgs["rollout"]
+                )
+
+            controller = None
+            adapter_name = None
+            adapter_slot = None
+            if multi_lora:
+                # Mirror the upstream driver boot: router -> controller
+                # (named actor; reconcile on the actors resolves it by name).
+                from miles.ray.multi_lora.controller import create_multilora_controller
+                from miles.utils.adapter_config import TinkerAdapterConfig
+                import re
+
+                router_ip, router_port = await rollout_manager.get_router_address.remote()
+                args.sglang_router_ip, args.sglang_router_port = router_ip, router_port
+                controller = create_multilora_controller(
+                    args, f"http://{router_ip}:{router_port}"
+                )
+                await controller.start.remote()
+
+                adapter_name = re.sub(r"[^A-Za-z0-9._-]", "-", model_id)
+                registration = await controller.register_adapter.remote(
+                    adapter_name,
+                    TinkerAdapterConfig(rank=args.lora_rank, alpha=args.lora_alpha),
+                )
+                adapter_slot = registration["slot"]
+                logger.info(
+                    "[%s] Multi-LoRA pool: adapter %s -> slot %d",
+                    request_id, adapter_name, adapter_slot,
                 )
 
             train_group = await asyncio.to_thread(lambda: TinkerTrainGroup(
@@ -149,6 +190,11 @@ class MilesBackend(TrainingBackend):
 
             if rollout_manager is not None:
                 await train_group.set_rollout_manager()
+
+                # Pool mode: load the registered adapter into its slot before
+                # the initial push (LoRA B=0 => zero-delta; PENDING->ACTIVE).
+                if multi_lora:
+                    await train_group.reconcile_adapters()
 
                 # Mirror upstream train.py startup: load weights into SGLang
                 # before anything samples, honoring rollout offload state.
@@ -177,6 +223,9 @@ class MilesBackend(TrainingBackend):
                 wandb_config=wandb_config,
                 created_at=datetime.now().isoformat(),
                 training_run_id=model_id,
+                controller=controller,
+                adapter_name=adapter_name,
+                adapter_slot=adapter_slot,
             )
 
             logger.info("[%s] Miles model %s created successfully", request_id, model_id)
@@ -203,7 +252,7 @@ class MilesBackend(TrainingBackend):
             if h.rollout_manager is not None and h.args.offload_rollout:
                 await h.rollout_manager.offload.remote()
 
-            rollout_data = self.converter.forward_to_backend(data, h.args)
+            rollout_data = self.converter.forward_to_backend(data, h.args, adapter_slot=h.adapter_slot)
             # TinkerTrainGroup returns per-sample logprob tensors already
             # merged into the client's submission order.
             logprobs = await h.train_group.forward_logprobs(0, Box(ray.put(rollout_data)))
@@ -260,7 +309,7 @@ class MilesBackend(TrainingBackend):
                 )
 
             rollout_data = self.converter.forward_backward_to_backend(
-                data, loss_fn, h.args,
+                data, loss_fn, h.args, adapter_slot=h.adapter_slot,
             )
 
             results = await h.train_group.forward_backward_only(0, Box(ray.put(rollout_data)))
@@ -326,12 +375,15 @@ class MilesBackend(TrainingBackend):
             offload_train = h.args.offload_train if h.args else True
             offload_rollout = h.args.offload_rollout if h.args else True
 
+            step_kwargs = {"adapter_slot": h.adapter_slot, "adapter_name": h.adapter_name}
             if h.rollout_manager is None:
-                results = await h.train_group.apply_optimizer_step(learning_rate)
+                results = await h.train_group.apply_optimizer_step(learning_rate, **step_kwargs)
             elif not offload_train and not offload_rollout:
-                results = await h.train_group.apply_optimizer_step_and_sync(learning_rate)
+                # Pool mode rides this arm: the sync pushes exactly the stepped
+                # adapter (per-adapter upsert via the pending set).
+                results = await h.train_group.apply_optimizer_step_and_sync(learning_rate, **step_kwargs)
             else:
-                results = await h.train_group.apply_optimizer_step(learning_rate)
+                results = await h.train_group.apply_optimizer_step(learning_rate, **step_kwargs)
 
                 # Mirror upstream train.py's offload dance around weight sync.
                 if offload_train:
@@ -427,6 +479,17 @@ class MilesBackend(TrainingBackend):
         await h.lock.acquire()
         try:
             resources_freed = []
+            # Pool mode: the pool dies with this model (M1: one tenant per
+            # pool). Kill the named controller so the next create_model can
+            # register a fresh one.
+            if h.controller is not None:
+                try:
+                    await h.controller.stop.remote()
+                except Exception:
+                    logger.warning("Multi-LoRA controller stop failed; killing", exc_info=True)
+                ray.kill(h.controller, no_restart=True)
+                resources_freed.append("multi_lora_controller")
+
             for actor in h.train_group._actor_handles:
                 ray.kill(actor, no_restart=True)
                 resources_freed.append("actor")
@@ -497,6 +560,14 @@ class MilesBackend(TrainingBackend):
             )
         client = SGLangClient(base_url=f"http://{h.router_ip}:{h.router_port}")
 
+        # Pool mode: route to this model's adapter by engine-side slot name.
+        # (pinned v0 -> base routing not wired yet; see 003 R6.)
+        lora_path = None
+        if h.adapter_slot is not None:
+            from miles.utils.multi_lora import slot_lora_name
+
+            lora_path = slot_lora_name(h.adapter_slot)
+
         sequences = []
         prompt_logprobs_result = None
         for _ in range(num_samples):
@@ -504,6 +575,7 @@ class MilesBackend(TrainingBackend):
                 input_ids=prompt_tokens,
                 sampling_params=sampling_params or {},
                 prompt_logprobs=prompt_logprobs,
+                lora_path=lora_path,
             )
             sequences.append({
                 "tokens": result["tokens"],

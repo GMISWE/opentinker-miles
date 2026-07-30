@@ -38,7 +38,8 @@ class SGLangClient:
         self,
         input_ids: List[int],
         sampling_params: Optional[Dict[str, Any]] = None,
-        prompt_logprobs: bool = False
+        prompt_logprobs: bool = False,
+        lora_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Generate text completion from SGLang.
@@ -75,10 +76,14 @@ class SGLangClient:
             "return_logprob": True,
         }
 
+        # Multi-LoRA pool: route to the model's adapter (engine-side slot name).
+        if lora_path is not None:
+            payload["lora_path"] = lora_path
+
         # Request prompt logprobs if needed
         if prompt_logprobs:
             payload["logprob_start_len"] = 0
-            logger.debug(f"Requesting prompt logprobs from SGLang")
+            logger.debug("Requesting prompt logprobs from SGLang")
 
         # Make async HTTP request
         async with httpx.AsyncClient() as client:

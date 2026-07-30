@@ -82,6 +82,24 @@ class SlimeArgumentBuilder:
         if parallelism_config:
             num_gpus = parallelism_config.get("num_gpus", num_gpus)
 
+        # Multi-LoRA pool mode (explicit opt-in, Constitution P3). Requires a
+        # LoRA model; boots disaggregated (train/rollout GPUs split — upstream
+        # bans colocate+offload with multi-LoRA).
+        multi_lora_slots = int(os.environ.get("TINKERCLOUD_MILES_MULTILORA_SLOTS", "0") or 0)
+        if multi_lora_slots > 0 and not (lora_config and lora_config.get("rank", 0) > 0):
+            logger.info("Multi-LoRA pool disabled for this model: no LoRA rank in lora_config")
+            multi_lora_slots = 0
+        if multi_lora_slots > 0 and rlve_enabled:
+            raise ValueError("Multi-LoRA pool mode does not support RLVE")
+        rollout_gpus = 0
+        if multi_lora_slots > 0:
+            train_gpus = int(os.environ.get("TINKERCLOUD_MILES_TRAIN_GPUS", "0") or 0) or max(num_gpus // 2, 1)
+            rollout_gpus = num_gpus - train_gpus
+            assert rollout_gpus > 0, (
+                f"Multi-LoRA needs disaggregated rollout GPUs: total={num_gpus}, train={train_gpus}"
+            )
+            num_gpus = train_gpus  # parallelism + actor sizing below see train GPUs only
+
         # Get max sequence length for CP decision
         # Use parameter value (from tinker-cookbook), but allow rlve_config to override for RLVE mode
         if rlve_config and rlve_config.get('rollout_max_response_len'):
@@ -113,7 +131,9 @@ class SlimeArgumentBuilder:
         minimal_args = self._build_minimal_args(
             hf_model_path, model_config, tp_size, pp_size, cp_size, megatron_checkpoint_path, max_batch_size,
             num_gpus=num_gpus,
-            rlve_config=rlve_config
+            rlve_config=rlve_config,
+            multi_lora_slots=multi_lora_slots,
+            lora_config=lora_config,
         )
 
         # Parse args to get Slime defaults
@@ -130,7 +150,9 @@ class SlimeArgumentBuilder:
             model_config,
             parallel_config,
             rlve_config=rlve_config,
-            wandb_config=wandb_config
+            wandb_config=wandb_config,
+            multi_lora_slots=multi_lora_slots,
+            rollout_gpus=rollout_gpus,
         )
 
         return args, hf_model_path
@@ -145,7 +167,9 @@ class SlimeArgumentBuilder:
         megatron_checkpoint_path: str,
         max_batch_size: int = 4096,
         num_gpus: int = 4,
-        rlve_config: Optional[Dict[str, Any]] = None
+        rlve_config: Optional[Dict[str, Any]] = None,
+        multi_lora_slots: int = 0,
+        lora_config: Optional[Dict[str, Any]] = None,
     ) -> list:
         """Build minimal CLI arguments for Slime's parse_args."""
         # Check if RLVE mode is enabled
@@ -212,11 +236,29 @@ class SlimeArgumentBuilder:
             '--ref-load', megatron_checkpoint_path,
             '--save', self.default_save_dir,
             '--save-interval', '20000',  # ~100 batches (each batch ~200 microbatches)
+        ]
+
+        if multi_lora_slots > 0:
+            # Multi-LoRA pool: validate_multi_lora_args runs inside parse_args
+            # and needs the LoRA surface at parse time; it also bans
+            # colocate/offload (disaggregated boot) and forces the multi-LoRA
+            # rollout fn / data source / dynamic GBS.
+            rank = lora_config.get("rank", 32) if lora_config else 32
+            alpha = (lora_config.get("alpha") or rank) if lora_config else rank
+            minimal_args.extend([
+                '--multi-lora-n-adapters', str(multi_lora_slots),
+                '--lora-rank', str(rank),
+                '--lora-alpha', str(alpha),
+                '--target-modules', 'all-linear',
+                '--qkv-format', 'thd',
+            ])
+        else:
             # Memory management: colocate SGLang with Megatron, enable offload
             # These MUST be set here because parse_args() sets defaults based on them
-            '--colocate',
-            '--offload',  # Equivalent to --offload-train + --offload-rollout
-        ]
+            minimal_args.extend([
+                '--colocate',
+                '--offload',  # Equivalent to --offload-train + --offload-rollout
+            ])
 
         # Add kv-channels if model has explicit head_dim (e.g., Qwen3)
         if model_config.get('kv_channels'):
@@ -303,7 +345,9 @@ class SlimeArgumentBuilder:
         model_config: Dict[str, Any],
         parallel_config: Dict[str, int],
         rlve_config: Optional[Dict[str, Any]] = None,
-        wandb_config: Optional[Dict[str, Any]] = None
+        wandb_config: Optional[Dict[str, Any]] = None,
+        multi_lora_slots: int = 0,
+        rollout_gpus: int = 0,
     ) -> Namespace:
         """Configure model-specific argument overrides."""
         # Check if RLVE mode is enabled
@@ -410,11 +454,11 @@ class SlimeArgumentBuilder:
         args.max_tokens_per_gpu = 4096
 
         # Features
-        args.colocate = True
+        args.colocate = multi_lora_slots == 0
         args.move_rl_fields_to_gpu = True
 
         # Rollout/SGLang configuration
-        args.rollout_num_gpus = 4
+        args.rollout_num_gpus = rollout_gpus if multi_lora_slots > 0 else 4
         args.rollout_num_gpus_per_engine = 1
         args.sglang_router_ip = None
         args.sglang_router_port = None
@@ -431,14 +475,20 @@ class SlimeArgumentBuilder:
         args.debug_train_only = debug_train_only
         args.sglang_mem_fraction_static = compute_sglang_mem_fraction(model_config, base_model)
 
-        # Rollout function paths
-        args.rollout_function_path = "miles.rollout.sglang_rollout.generate_rollout"
-        args.eval_function_path = "miles.rollout.sglang_rollout.generate_rollout"
+        # Rollout function paths. Pool mode keeps the multi-LoRA pair that
+        # validate_multi_lora_args swapped in during parse (never driven by
+        # TinkerCloud, but reset here would break reconcile-time wiring).
+        if multi_lora_slots == 0:
+            args.rollout_function_path = "miles.rollout.sglang_rollout.generate_rollout"
+            args.eval_function_path = "miles.rollout.sglang_rollout.generate_rollout"
 
         # No server-side prompt dataset: Tinker clients drive all training and
         # sampling data, so RolloutManager must not load one (its data source
-        # raises if the file is missing).
-        args.rollout_global_dataset = False
+        # raises if the file is missing). (Pool mode: validate forces True —
+        # the per-adapter data source is controller-global; it loads nothing
+        # for Tinker adapters.)
+        if multi_lora_slots == 0:
+            args.rollout_global_dataset = False
         args.prompt_data = "/data/datasets/gsm8k_rl.jsonl"
         args.rollout_shuffle = False
         args.rollout_max_prompt_len = 2048
