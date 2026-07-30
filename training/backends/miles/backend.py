@@ -7,6 +7,8 @@ forward_backward_only / apply_optimizer_step, pure-sum loss via rollout keys
 set in the converter."""
 import asyncio
 import logging
+import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -43,7 +45,29 @@ class MilesHandle(BackendHandle):
     # fb/optim_step broadcasts interleave inconsistently across the DP actors
     # (mispaired collectives -> scrambled outputs; optim_step consuming a
     # later fb's grads). asyncio.Lock wakes waiters FIFO, so execution
-    # follows submission order.
+    # follows submission order. Pool-mode handles share the pool's lock:
+    # every broadcast rides the same actor group, so cross-tenant ops must
+    # serialize too (M2: N tenants, serialized train calls).
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+@dataclass
+class MilesPool:
+    """Shared multi-LoRA rails (M2): one boot serves N tenant adapters.
+
+    First create_model boots the pool; later creates register into it;
+    delete deregisters, and the last tenant out tears the pool down."""
+
+    train_group: Any
+    rollout_manager: Any
+    placement_group: Any            # create_placement_groups() dict
+    controller: Any                 # MultiLoRAController (named Ray actor)
+    args: Any                       # pool-boot Megatron Namespace (governs all tenants)
+    hf_path: str
+    base_model: str
+    router_ip: Optional[str] = None
+    router_port: Optional[int] = None
+    tenants: Dict[str, int] = field(default_factory=dict)   # model_id -> slot
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -55,6 +79,10 @@ class MilesBackend(TrainingBackend):
         # Lazy-import converter to avoid import errors when Miles is not installed
         self._converter = None
         self._builder = None
+        # Multi-LoRA pool (M2). _pool_admin serializes boot/join/teardown;
+        # lock order is always admin -> pool.lock.
+        self._pool: Optional[MilesPool] = None
+        self._pool_admin = asyncio.Lock()
 
     @property
     def converter(self):
@@ -71,6 +99,152 @@ class MilesBackend(TrainingBackend):
         return self._builder
 
     async def create_model(
+        self,
+        model_id: str,
+        request_id: str,
+        base_model: str,
+        num_gpus: int,
+        lora_config: Optional[Dict[str, Any]] = None,
+        parallelism: Optional[Dict[str, Any]] = None,
+        rl_config: Optional[Dict[str, Any]] = None,
+        rollout_config: Optional[Dict[str, Any]] = None,
+        debug_train_only: bool = False,
+        checkpoint_path: Optional[str] = None,
+        max_batch_size: int = 4096,
+        max_seq_len: int = 2048,
+        rlve_config: Optional[Dict[str, Any]] = None,
+        wandb_config: Optional[Dict[str, Any]] = None,
+        objective: str = "language_modeling",
+        num_labels: Optional[int] = None,
+        head_config: Optional[Dict[str, Any]] = None,
+    ) -> MilesHandle:
+        boot_kwargs = dict(
+            model_id=model_id, request_id=request_id, base_model=base_model,
+            num_gpus=num_gpus, lora_config=lora_config, parallelism=parallelism,
+            rl_config=rl_config, rollout_config=rollout_config,
+            debug_train_only=debug_train_only, checkpoint_path=checkpoint_path,
+            max_batch_size=max_batch_size, max_seq_len=max_seq_len,
+            rlve_config=rlve_config, wandb_config=wandb_config,
+            objective=objective, num_labels=num_labels, head_config=head_config,
+        )
+        # Mirror the builder's pool gate (slime_builder: env slots + LoRA rank).
+        slots = int(os.environ.get("TINKERCLOUD_MILES_MULTILORA_SLOTS", "0") or 0)
+        pool_eligible = slots > 0 and bool(lora_config and lora_config.get("rank", 0) > 0)
+        if not pool_eligible:
+            return await self._boot_model(**boot_kwargs)
+        async with self._pool_admin:
+            if self._pool is not None:
+                return await self._join_pool(
+                    model_id=model_id, request_id=request_id,
+                    base_model=base_model, lora_config=lora_config,
+                    debug_train_only=debug_train_only,
+                    checkpoint_path=checkpoint_path, rlve_config=rlve_config,
+                    objective=objective,
+                )
+            return await self._boot_model(**boot_kwargs)
+
+    async def _join_pool(
+        self,
+        model_id: str,
+        request_id: str,
+        base_model: str,
+        lora_config: Dict[str, Any],
+        debug_train_only: bool,
+        checkpoint_path: Optional[str],
+        rlve_config: Optional[Dict[str, Any]],
+        objective: str,
+    ) -> MilesHandle:
+        """Register a new tenant adapter into the live pool (caller holds
+        _pool_admin). The pool's boot args govern parallelism/batch shape;
+        only the tenant's LoRA rank/alpha are per-adapter."""
+        pool = self._pool
+        if objective != "language_modeling":
+            raise BackendError(
+                f"Miles is a language-modeling backend; objective {objective!r} "
+                f"requires a classification backend (automodel / megatron_bridge)",
+                backend="miles", operation="create_model",
+            )
+        if base_model != pool.base_model:
+            raise BackendError(
+                f"Multi-LoRA pool serves base model {pool.base_model!r}; "
+                f"cannot create {base_model!r} on it (one base per pool)",
+                backend="miles", operation="create_model",
+            )
+        if debug_train_only or rlve_config:
+            raise BackendError(
+                "Multi-LoRA pool mode supports neither debug_train_only nor RLVE",
+                backend="miles", operation="create_model",
+            )
+        if checkpoint_path:
+            raise BackendError(
+                "Resuming from a checkpoint into a multi-LoRA pool is not "
+                "supported yet (adapter-scoped resume unimplemented)",
+                backend="miles", operation="create_model",
+            )
+
+        from miles.utils.adapter_config import TinkerAdapterConfig
+
+        # Same rank/alpha derivation as the builder (slime_builder LoRA args).
+        rank = int(lora_config.get("rank", 0))
+        alpha = int(lora_config.get("alpha") or rank)
+        adapter_name = re.sub(r"[^A-Za-z0-9._-]", "-", model_id)
+        try:
+            registration = await pool.controller.register_adapter.remote(
+                adapter_name, TinkerAdapterConfig(rank=rank, alpha=alpha)
+            )
+        except Exception as e:
+            # Registry errors (slots full, name colliding/cleaning-up,
+            # rank > allocated max) surface here.
+            raise BackendError(
+                str(e), backend="miles", operation="create_model", original_error=e,
+            ) from e
+        adapter_slot = registration["slot"]
+
+        try:
+            async with pool.lock:
+                # Actors load the PENDING adapter into its slot and mark it
+                # for push; update_weights upserts exactly the pending set
+                # (LoRA B=0 => zero-delta) and promotes it to ACTIVE.
+                await pool.train_group.reconcile_adapters()
+                await pool.train_group.update_weights()
+        except Exception as e:
+            try:
+                await pool.controller.deregister_adapter.remote(adapter_name)
+                async with pool.lock:
+                    await pool.train_group.reconcile_adapters()
+            except Exception:
+                logger.warning(
+                    "[%s] Pool join rollback failed for adapter %s",
+                    request_id, adapter_name, exc_info=True,
+                )
+            raise BackendError(
+                str(e), backend="miles", operation="create_model", original_error=e,
+            ) from e
+
+        pool.tenants[model_id] = adapter_slot
+        logger.info(
+            "[%s] Multi-LoRA pool join: %s -> slot %d (%d tenants)",
+            request_id, adapter_name, adapter_slot, len(pool.tenants),
+        )
+        return MilesHandle(
+            model_id=model_id,
+            backend_type="miles",
+            train_group=pool.train_group,
+            rollout_manager=pool.rollout_manager,
+            placement_group=None,   # pool-owned; freed only at pool teardown
+            args=pool.args,
+            hf_path=pool.hf_path,
+            router_ip=pool.router_ip,
+            router_port=pool.router_port,
+            created_at=datetime.now().isoformat(),
+            training_run_id=model_id,
+            controller=pool.controller,
+            adapter_name=adapter_name,
+            adapter_slot=adapter_slot,
+            lock=pool.lock,
+        )
+
+    async def _boot_model(
         self,
         model_id: str,
         request_id: str,
@@ -153,7 +327,6 @@ class MilesBackend(TrainingBackend):
                 # (named actor; reconcile on the actors resolves it by name).
                 from miles.ray.multi_lora.controller import create_multilora_controller
                 from miles.utils.adapter_config import TinkerAdapterConfig
-                import re
 
                 router_ip, router_port = await rollout_manager.get_router_address.remote()
                 args.sglang_router_ip, args.sglang_router_port = router_ip, router_port
@@ -234,6 +407,23 @@ class MilesBackend(TrainingBackend):
                 adapter_name=adapter_name,
                 adapter_slot=adapter_slot,
             )
+
+            if multi_lora:
+                # First tenant boots the pool; later creates join it (M2).
+                pool = MilesPool(
+                    train_group=train_group,
+                    rollout_manager=rollout_manager,
+                    placement_group=pgs,
+                    controller=controller,
+                    args=args,
+                    hf_path=hf_path,
+                    base_model=base_model,
+                    router_ip=router_ip,
+                    router_port=router_port,
+                )
+                pool.tenants[model_id] = adapter_slot
+                handle.lock = pool.lock
+                self._pool = pool
 
             logger.info("[%s] Miles model %s created successfully", request_id, model_id)
             return handle
@@ -494,6 +684,14 @@ class MilesBackend(TrainingBackend):
         checkpoint_path: str,
     ) -> None:
         h: MilesHandle = handle  # type: ignore[assignment]
+        if h.adapter_slot is not None:
+            # train_group.load_checkpoint is a full-model resume broadcast;
+            # on shared rails it would clobber every co-tenant.
+            raise BackendError(
+                "load_checkpoint is not supported in multi-LoRA pool mode "
+                "(adapter-scoped resume unimplemented)",
+                backend="miles", operation="load_checkpoint",
+            )
         await h.lock.acquire()
         try:
             await h.train_group.load_checkpoint(checkpoint_path)
@@ -513,13 +711,16 @@ class MilesBackend(TrainingBackend):
 
     async def delete_model(self, handle: BackendHandle) -> None:
         h: MilesHandle = handle  # type: ignore[assignment]
+        if h.adapter_slot is not None and self._pool is not None:
+            await self._delete_pool_tenant(h)
+            return
         # Hold the op lock so teardown can't interleave with an in-flight
         # fb/step (delete-during-optim_step crash class).
         await h.lock.acquire()
         try:
             resources_freed = []
-            # Pool mode: the pool dies with this model (M1: one tenant per
-            # pool). Kill the named controller so the next create_model can
+            # Fallback for a pool handle that outlived its pool record:
+            # kill the named controller so the next create_model can
             # register a fresh one.
             if h.controller is not None:
                 try:
@@ -558,6 +759,66 @@ class MilesBackend(TrainingBackend):
             ) from e
         finally:
             h.lock.release()
+
+    async def _delete_pool_tenant(self, h: MilesHandle) -> None:
+        """Pool-mode delete (M2): deregister this tenant's adapter; the last
+        tenant out tears the pool down (controller name freed for reboot)."""
+        async with self._pool_admin:
+            pool = self._pool
+            if pool is None:
+                return
+            if len(pool.tenants) > 1 or h.model_id not in pool.tenants:
+                try:
+                    async with pool.lock:
+                        await pool.controller.deregister_adapter.remote(h.adapter_name)
+                        # Actors retire the slot: abort in-flight sampling,
+                        # save the final adapter ckpt, clear slot weights /
+                        # optimizer state / retained grads, free the slot.
+                        await pool.train_group.reconcile_adapters()
+                except Exception as e:
+                    raise BackendError(
+                        str(e), backend="miles", operation="delete_model", original_error=e,
+                    ) from e
+                pool.tenants.pop(h.model_id, None)
+                logger.info(
+                    "Pool tenant %s deregistered (slot %s); %d tenant(s) remain",
+                    h.model_id, h.adapter_slot, len(pool.tenants),
+                )
+                return
+            # Last tenant: the pool dies with it. Null the record even on a
+            # partial teardown — a half-dead pool must not accept joins.
+            try:
+                async with pool.lock:
+                    resources_freed = []
+                    try:
+                        await pool.controller.stop.remote()
+                    except Exception:
+                        logger.warning("Multi-LoRA controller stop failed; killing", exc_info=True)
+                    ray.kill(pool.controller, no_restart=True)
+                    resources_freed.append("multi_lora_controller")
+                    for actor in pool.train_group._actor_handles:
+                        ray.kill(actor, no_restart=True)
+                        resources_freed.append("actor")
+                    if pool.rollout_manager is not None:
+                        ray.kill(pool.rollout_manager, no_restart=True)
+                        resources_freed.append("rollout_manager")
+                    seen = set()
+                    for pg_tuple in (pool.placement_group or {}).values():
+                        pg_obj = pg_tuple[0] if isinstance(pg_tuple, tuple) else pg_tuple
+                        if pg_obj is not None and id(pg_obj) not in seen:
+                            seen.add(id(pg_obj))
+                            ray.util.remove_placement_group(pg_obj)
+                            resources_freed.append("placement_group")
+            except Exception as e:
+                raise BackendError(
+                    str(e), backend="miles", operation="delete_model", original_error=e,
+                ) from e
+            finally:
+                self._pool = None
+            logger.info(
+                "Miles pool torn down with last tenant %s, freed %d resources",
+                h.model_id, len(resources_freed),
+            )
 
     async def get_logprobs(
         self,
