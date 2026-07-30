@@ -298,8 +298,13 @@ def auto_detect_all_parallelism(
     if env_cp:
         cp = int(env_cp)
         logger.info(f"Using SLIME_DEFAULT_CP override: CP={cp}")
-    elif max_seq_len > 2048:
-        cp = 2  # Long sequences benefit from context parallel
+    elif max_seq_len > 8192:
+        # CP caveat: the miles seam returns per-CP-rank logprob chunks for
+        # fb/forward (no full-sequence reassembly yet) — clients would see
+        # half-length per-sample logprobs at CP=2. Engage CP only when the
+        # sequence length actually requires it; ≤8K fits without CP for the
+        # supported model sizes.
+        cp = 2
     else:
         cp = 1  # Short sequences don't need CP
 
