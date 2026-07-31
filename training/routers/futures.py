@@ -66,7 +66,8 @@ async def retrieve_future(
     Returns:
     - 408 (Request Timeout) if operation is still running
     - 200 with result if completed successfully
-    - 500 if failed
+    - 400 if the operation terminally failed (the SDK retries 408 and every
+      5xx indefinitely, so a failed future MUST return 4xx or clients hang)
 
     Benefits:
     - Storage abstraction instead of direct dict access
@@ -130,8 +131,10 @@ async def retrieve_future(
             error = result["error"]
         elif "error" in future:
             error = future["error"]
-        # Return 500 with error
-        raise HTTPException(status_code=500, detail=error or "Operation failed")
+        # Terminal failure -> 4xx: the SDK treats 408 and all 5xx as
+        # retryable, so 500 here turns a dead op into an infinite client
+        # poll loop (observed 2026-07-31, G6 blocker probe).
+        raise HTTPException(status_code=400, detail=error or "Operation failed")
 
     else:  # status == "pending"
         # Return 408 (Request Timeout) while pending
@@ -152,7 +155,7 @@ async def retrieve_future_body(
     Returns:
     - 408 (Request Timeout) if operation is still running
     - 200 with result if completed successfully
-    - 500 if failed
+    - 400 if the operation terminally failed
     """
     # Delegate to the path-based version which implements the correct behavior
     return await retrieve_future(

@@ -667,6 +667,9 @@ class MilesBackend(TrainingBackend):
             }
 
         try:
+            # Same sample-count gate as fb: a request smaller than the DP
+            # width crashes get_data_iterator on the actors (num_local_gbs=0).
+            self._validate_fb(h, data)
             pool = self._pool
             if h.adapter_slot is not None and pool is not None:
                 return await self._pool_run(pool, _run)
@@ -675,7 +678,7 @@ class MilesBackend(TrainingBackend):
                 return await _run()
             finally:
                 h.lock.release()
-        except BackendError:
+        except (BackendError, ValueError):
             raise
         except Exception as e:
             raise BackendError(
