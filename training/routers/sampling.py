@@ -93,21 +93,28 @@ async def asample(
     """
     request_id = generate_request_id()
 
-    # Find model with RolloutManager
-    model_id = find_model_with_rollout_manager(training_clients)
-    if not model_id:
-        raise HTTPException(status_code=404, detail="No model with RolloutManager found")
-
     # Extract prompt tokens
     prompt_tokens = request.prompt.get_tokens()
 
     # BUG-015: resolve the sampler's pinned weight version (snapshot samplers,
     # e.g. DPO's frozen reference) so pinned logprob reads aren't served from
-    # the live refit-every-step engine.
+    # the live refit-every-step engine. The sampler also names its OWNING
+    # model — required routing under a multi-tenant pool, where find-first
+    # would serve a co-tenant's adapter.
     pinned_version = None
+    target_model_id = None
     if request.sampling_session_id and session_service is not None:
         info = session_service.get_sampler(request.sampling_session_id)
         pinned_version = getattr(info, "pinned_version", None) if info else None
+        target_model_id = getattr(info, "model_id", None) if info else None
+    if target_model_id is None and request.model_path:
+        # tinker://<model_id>/weights/... — the sampler URI names its model.
+        parts = request.model_path.removeprefix("tinker://").split("/")
+        if parts and parts[0] in training_clients:
+            target_model_id = parts[0]
+    model_id = target_model_id or find_model_with_rollout_manager(training_clients)
+    if not model_id:
+        raise HTTPException(status_code=404, detail="No model with RolloutManager found")
 
     async def execute():
         result_dict = await service.async_sample(
@@ -118,6 +125,7 @@ async def asample(
             prompt_logprobs=request.prompt_logprobs,
             training_clients=training_clients,
             pinned_version=pinned_version,
+            model_id=target_model_id,
         )
 
         # Convert to response model

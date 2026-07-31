@@ -40,6 +40,12 @@ class MilesHandle(BackendHandle):
     controller: Any = None            # MultiLoRAController (named Ray actor)
     adapter_name: Optional[str] = None
     adapter_slot: Optional[int] = None
+    # Weight version = successful optim steps applied. Sampler registration
+    # snapshots it (routers/checkpoints.py) so a sampler saved before any
+    # step pins v0. v0 == base model only for fresh-init LoRA (B=0 at init),
+    # hence created_from_checkpoint gates the v0->base sampling route.
+    weight_version: int = 0
+    created_from_checkpoint: bool = False
     # Serializes GPU-bound ops per model. The task manager runs request
     # handlers as concurrent asyncio tasks; without this, pipelined
     # fb/optim_step broadcasts interleave inconsistently across the DP actors
@@ -406,6 +412,7 @@ class MilesBackend(TrainingBackend):
                 controller=controller,
                 adapter_name=adapter_name,
                 adapter_slot=adapter_slot,
+                created_from_checkpoint=bool(checkpoint_path),
             )
 
             if multi_lora:
@@ -623,6 +630,9 @@ class MilesBackend(TrainingBackend):
                 if offload_rollout:
                     await h.rollout_manager.onload_kv.remote()
 
+            if results[0]["success"]:
+                h.weight_version += 1
+
             return {
                 "success": results[0]["success"],
                 "grad_norm": results[0]["grad_norm"],
@@ -695,6 +705,7 @@ class MilesBackend(TrainingBackend):
         await h.lock.acquire()
         try:
             await h.train_group.load_checkpoint(checkpoint_path)
+            h.created_from_checkpoint = True
 
             # Sync loaded weights to inference engine
             if h.rollout_manager is not None:
@@ -846,9 +857,12 @@ class MilesBackend(TrainingBackend):
     ) -> Dict[str, Any]:
         """Sample via per-request HTTP calls to the SGLang router.
 
-        pinned_version is accepted for contract uniformity but NOT honored:
-        Miles serves from the live SGLang engine (same BUG-015 aliasing class;
-        needs version-pinned sampling to fix).
+        Pool mode honors pinned_version==0 by routing to the BASE weights
+        (fresh-init LoRA delta is zero at v0, so v0 == base): a sampler
+        saved before any optim step is a frozen reference — DPO's ref model
+        with no second copy resident. Nonzero pins (and every pin outside
+        pool mode) are still served from the live engine — the BUG-015
+        aliasing class; logged loudly rather than silently aliased.
         """
         from ...utils.sglang_client import SGLangClient
 
@@ -861,12 +875,27 @@ class MilesBackend(TrainingBackend):
         client = SGLangClient(base_url=f"http://{h.router_ip}:{h.router_port}")
 
         # Pool mode: route to this model's adapter by engine-side slot name.
-        # (pinned v0 -> base routing not wired yet; see 003 R6.)
         lora_path = None
         if h.adapter_slot is not None:
-            from miles.utils.multi_lora import slot_lora_name
+            if pinned_version == 0 and not h.created_from_checkpoint:
+                pass  # v0 == base: no lora_path
+            else:
+                if pinned_version is not None:
+                    logger.warning(
+                        "[%s] pinned_version=%s not honorable for %s "
+                        "(nonzero or checkpoint-created); serving LIVE slot "
+                        "weights (v%d) — BUG-015 aliasing risk",
+                        request_id, pinned_version, h.model_id, h.weight_version,
+                    )
+                from miles.utils.multi_lora import slot_lora_name
 
-            lora_path = slot_lora_name(h.adapter_slot)
+                lora_path = slot_lora_name(h.adapter_slot)
+        elif pinned_version is not None and pinned_version != h.weight_version:
+            logger.warning(
+                "[%s] pinned_version=%s not honored for %s (non-pool miles "
+                "serves the live engine, v%d) — BUG-015 aliasing risk",
+                request_id, pinned_version, h.model_id, h.weight_version,
+            )
 
         sequences = []
         prompt_logprobs_result = None

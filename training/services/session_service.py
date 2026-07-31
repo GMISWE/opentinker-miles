@@ -30,6 +30,9 @@ class SamplerInfo:
     # BUG-015: weight version of the owning model when this sampler was created.
     # None = unknown (e.g. restored from storage) -> served from live weights.
     pinned_version: Optional[int] = None
+    # Owning model: sampling requests carrying this sampler resolve their
+    # target model from here (multi-tenant pools break find-first routing).
+    model_id: Optional[str] = None
 
 
 @dataclass
@@ -130,6 +133,7 @@ class SessionService:
                     session_id=session_id,
                     base_model=sampler_data.get("base_model"),
                     model_path=sampler_data.get("model_path"),
+                    model_id=sampler_data.get("model_id"),
                 )
 
         logger.info(
@@ -322,6 +326,7 @@ class SessionService:
                 session_id=session_id,
                 base_model=base_model if base_model else None,
                 model_path=model_path,
+                model_id=model_id,
             )
 
             # Persist to storage
@@ -448,6 +453,7 @@ class SessionService:
             base_model=base_model if base_model else None,
             model_path=model_path,
             pinned_version=pinned_version,
+            model_id=model_id,
         )
 
         # Persist to storage
