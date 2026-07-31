@@ -23,10 +23,19 @@ class SamplingService:
         self.backend = backend
 
     def _resolve_handle(
-        self, training_clients: Dict[str, Dict[str, Any]]
+        self,
+        training_clients: Dict[str, Dict[str, Any]],
+        model_id: Optional[str] = None,
     ) -> BackendHandle:
-        """Find the model serving rollouts and return its backend handle."""
-        model_id = find_model_with_rollout_manager(training_clients)
+        """Return the target model's backend handle.
+
+        An explicit model_id (from the requesting sampler's session) wins:
+        find-first is only correct when a single model serves rollouts, and
+        a multi-LoRA pool has one per tenant."""
+        if model_id and model_id not in training_clients:
+            raise RuntimeError(f"Sampler's model {model_id} no longer exists")
+        if not model_id:
+            model_id = find_model_with_rollout_manager(training_clients)
         if not model_id:
             raise RuntimeError("No model with RolloutManager found")
         handle = training_clients[model_id].get("backend_handle")
@@ -43,12 +52,14 @@ class SamplingService:
         prompt_logprobs: bool,
         training_clients: Dict[str, Dict[str, Any]],
         pinned_version: Optional[int] = None,
+        model_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Async sampling for a single prompt.
 
         `pinned_version` (BUG-015): weight version the requesting sampler was
         created at; backends route pinned logprob reads off the live engine.
+        `model_id`: the sampler's owning model (multi-tenant routing).
 
         Returns:
             Dict with sequences and optional prompt_logprobs
@@ -57,7 +68,7 @@ class SamplingService:
             RuntimeError: If no model with RolloutManager found
             BackendError: If the inference engine is unavailable
         """
-        handle = self._resolve_handle(training_clients)
+        handle = self._resolve_handle(training_clients, model_id)
         logger.info(f"[{request_id}] Async sampling for {handle.model_id}")
         return await self.backend.sample(
             handle=handle,
