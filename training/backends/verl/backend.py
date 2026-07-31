@@ -135,7 +135,12 @@ class VerlBackend(TrainingBackend):
                 logprobs = await asyncio.to_thread(self._model_output_logprobs, out, td)
                 loss_fn_outputs = self.converter.extract_logprobs(logprobs, data)
                 metrics = _scalar_metrics(out)
-                return {"loss_fn_outputs": loss_fn_outputs, "metrics": metrics, "deferred": False}
+                return {
+                    "loss_fn_output_type": loss_fn,
+                    "loss_fn_outputs": loss_fn_outputs,
+                    "metrics": metrics,
+                    "deferred": False,
+                }
             except BackendError:
                 raise
             except Exception as e:
@@ -185,7 +190,7 @@ class VerlBackend(TrainingBackend):
         loss_fn: str,
     ) -> Dict[str, Any]:
         logprobs = await self.get_logprobs(handle, data)
-        return {"loss_fn_outputs": logprobs, "metrics": {}}
+        return {"loss_fn_output_type": loss_fn, "loss_fn_outputs": logprobs, "metrics": {}}
 
     async def get_logprobs(
         self,
@@ -297,12 +302,15 @@ class VerlBackend(TrainingBackend):
 
         padded = self.converter.forward_backward_to_backend(data, loss_fn, h.config)
 
-        # DP divisibility: pad with zero-weight clones (pure-sum => zero grad
-        # contribution, E0-safe) instead of rejecting or trimming.
+        # Divisibility: engine needs per-DP-rank count % micro_batch_size == 0.
+        # Pad with zero-weight clones (pure-sum => zero grad, E0-safe)
+        # instead of rejecting or trimming.
+        micro_bs = int(h.config.get("engine", {}).get("micro_batch_size_per_gpu", 1) or 1)
+        multiple = h.dp_size * micro_bs
         b = padded["input_ids"].shape[0]
-        remainder = b % h.dp_size
+        remainder = b % multiple
         if remainder:
-            pad_n = h.dp_size - remainder
+            pad_n = multiple - remainder
             for key, t in padded.items():
                 clone = t[:1].repeat(pad_n, *([1] * (t.dim() - 1))).clone()
                 if key in ("weights", "advantages"):
@@ -312,7 +320,9 @@ class VerlBackend(TrainingBackend):
         global_token_num = padded["attention_mask"].sum(dim=-1).tolist()
         td = TensorDict(padded, batch_size=[padded["input_ids"].shape[0]])
         td = left_right_2_no_padding(td)
-        tu.assign_non_tensor(td, global_token_num=global_token_num)
+        # temperature: engine divides logits by it (logprob provenance);
+        # training-side logprobs are untempered in the Tinker contract
+        tu.assign_non_tensor(td, global_token_num=global_token_num, temperature=1.0)
         return td
 
     @staticmethod
@@ -361,8 +371,17 @@ def _scalar_metrics(out) -> Dict[str, Any]:
         metrics = tu.get(out, "metrics") or {}
     except Exception:
         metrics = {}
-    return {k: v for k, v in dict(metrics).items()
-            if isinstance(v, (int, float, str)) and not k.startswith("perf/")}
+    out_metrics = {}
+    for k, v in dict(metrics).items():
+        if k.startswith("perf/"):
+            continue
+        if hasattr(v, "data"):
+            v = v.data
+        if isinstance(v, (int, float)):
+            # SDK metric keys are "name:reduction" (chunked_fwdbwd_helpers)
+            key = k.replace(":", "_").replace("/", "_")
+            out_metrics[f"{key}:sum"] = float(v)
+    return out_metrics
 
 
 def _boot_worker_group(cfg: Dict[str, Any], model_id: str):

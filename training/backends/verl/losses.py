@@ -20,7 +20,11 @@ def _padded_logprobs(model_output, data):
 
 
 def _dp_size(data):
-    v = data.get("dp_size", None)
+    from verl.utils import tensordict_utils as tu
+
+    v = tu.get_non_tensor_data(data=data, key="dp_size", default=1)
+    if hasattr(v, "data"):  # NonTensorData wrapper
+        v = v.data
     return int(v) if v is not None else 1
 
 

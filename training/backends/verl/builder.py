@@ -31,7 +31,9 @@ class VerlArgumentBuilder(ArgumentBuilder):
 
         hf_path = self._resolve_hf_path(base_model)
 
-        lora_rank = int(lora_config.get("rank", lora_config.get("lora_rank", 0)) or 0)
+        # request payloads carry explicit None values — coalesce, don't .get()-default
+        lora_rank = int(lora_config.get("rank") or lora_config.get("lora_rank") or 0)
+        lora_alpha = float(lora_config.get("alpha") or lora_config.get("lora_alpha") or 32)
         target_modules = lora_config.get("target_modules") or "all-linear"
 
         cfg: Dict[str, Any] = {
@@ -44,7 +46,7 @@ class VerlArgumentBuilder(ArgumentBuilder):
                 # namespace (model.lora.rank) must stay 0 — duplicated-knob
                 # trap, specs/006 q2-plan.md
                 "lora_rank": lora_rank,
-                "lora_alpha": float(lora_config.get("alpha", lora_config.get("lora_alpha", 32))),
+                "lora_alpha": lora_alpha,
                 "target_modules": target_modules,
             },
             "engine": {
