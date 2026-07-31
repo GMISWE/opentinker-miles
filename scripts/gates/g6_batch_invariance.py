@@ -94,7 +94,11 @@ def main():
     probe_a = make_datums(8, salt=1)
     probe_b = make_datums(8, salt=2)
     probe_b2 = make_datums(4, salt=7, seq=48)   # different content AND shape
-    blocker = make_datums(1, salt=9)
+    # Queue-occupier for the merge window. NOTE: must be >= DP size — a
+    # request with fewer samples than DP ranks crashes miles'
+    # get_data_iterator (num_local_gbs=0 -> ZeroDivisionError) and the
+    # failed future leaves the SDK re-polling forever (known gaps, 003).
+    blocker = make_datums(2, salt=9)
 
     print("P2 solo baselines", flush=True)
     ra = tc_a.forward_backward(probe_a, "cross_entropy").result()
