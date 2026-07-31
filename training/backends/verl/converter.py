@@ -6,7 +6,8 @@ veRL's prompt_len > 0 requirement), responses = tokens[1:] right-padded.
 Engine log_probs[t] = logp(tokens[t+1] | tokens[:t+1]) then align 1:1 with
 client target_tokens / weights / advantages (all length N-1, Miles parity).
 
-Datum schemas (from tinker-cookbook):
+Datum schemas (from tinker-cookbook; arrives as Pydantic
+ForwardBackwardDatum OR plain dict — handle both):
   SFT: model_input.tokens = tokens[:-1], target_tokens = tokens[1:],
        weights = weights[1:]  (full seq = tokens[:-1] + [target_tokens[-1]])
   RL:  model_input.tokens = full rollout, loss_fn_inputs = {advantages,
@@ -19,45 +20,65 @@ import torch
 from ..base import DataConverter
 
 
-def _get_field(datum: Dict, *names):
-    """First present key among names, searching datum and loss_fn_inputs.
+def _attr_or_key(obj, field: str):
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(field)
+    return getattr(obj, field, None)
 
-    hasattr-before-dict ordering matters: plain dicts expose .values (bound
-    method) — always check dict membership first (BUG: values-collision).
-    """
-    for holder in (datum, datum.get("loss_fn_inputs") or {}):
-        for name in names:
-            if isinstance(holder, dict):
-                if name in holder:
-                    return holder[name]
-            elif hasattr(holder, name):
-                return getattr(holder, name)
+
+def _tensor_data(obj, dtype) -> torch.Tensor:
+    """TensorData (pydantic .data / wire {'data': ...}) or raw list -> 1-D tensor."""
+    if obj is None:
+        return None
+    data = obj
+    if not isinstance(obj, (list, tuple, torch.Tensor)):
+        inner = _attr_or_key(obj, "data")
+        if inner is not None:
+            data = inner
+    if isinstance(data, torch.Tensor):
+        return data.detach().cpu().to(dtype).flatten()
+    try:
+        return torch.tensor(data, dtype=dtype).flatten()
+    except (TypeError, ValueError):
+        return None
+
+
+def _loss_input(datum, *names):
+    lfi = _attr_or_key(datum, "loss_fn_inputs")
+    for name in names:
+        v = _attr_or_key(lfi, name)
+        if v is not None:
+            return v
     return None
 
 
-def _as_1d_tensor(value, dtype):
-    if value is None:
-        return None
-    if isinstance(value, torch.Tensor):
-        return value.detach().to(dtype).flatten()
-    if isinstance(value, dict) and "data" in value:  # TensorData wire format
-        return torch.tensor(value["data"], dtype=dtype).flatten()
-    return torch.tensor(value, dtype=dtype).flatten()
+def _extract_tokens(datum) -> torch.Tensor:
+    toks: List[int] = []
+    model_input = _attr_or_key(datum, "model_input")
+    if model_input is not None:
+        chunks = _attr_or_key(model_input, "chunks")
+        if chunks:
+            for c in chunks:
+                t = _attr_or_key(c, "tokens")
+                if t is not None:
+                    toks.extend(t.tolist() if isinstance(t, torch.Tensor) else list(t))
+        else:
+            t = _attr_or_key(model_input, "tokens")
+            if t is not None:
+                toks = t.tolist() if isinstance(t, torch.Tensor) else list(t)
+    if not toks:
+        t = _attr_or_key(datum, "tokens")
+        if t is not None:
+            toks = t.tolist() if isinstance(t, torch.Tensor) else list(t)
+    assert toks, "datum has no tokens"
+    return torch.tensor(toks, dtype=torch.long)
 
 
-def _full_tokens(datum: Dict) -> torch.Tensor:
-    model_input = datum.get("model_input") or {}
-    tokens = _get_field({"model_input": None, **datum}, "tokens") or (
-        model_input.get("tokens") if isinstance(model_input, dict) else None
-    )
-    if tokens is None and isinstance(model_input, dict):
-        # chunked wire format: model_input {"chunks": [{"tokens": [...]}]}
-        chunks = model_input.get("chunks") or []
-        tokens = [t for c in chunks for t in c.get("tokens", [])]
-    tokens = _as_1d_tensor(tokens, torch.long)
-    assert tokens is not None and tokens.numel() > 0, "datum has no tokens"
-
-    target = _as_1d_tensor(_get_field(datum, "target_tokens"), torch.long)
+def _full_tokens(datum) -> torch.Tensor:
+    tokens = _extract_tokens(datum)
+    target = _tensor_data(_loss_input(datum, "target_tokens"), torch.long)
     if target is not None and target.numel() > 0:
         # SFT shape: model tokens are tokens[:-1]; append final target token
         return torch.cat([tokens, target[-1:]])
@@ -70,7 +91,7 @@ class VerlDataConverter(DataConverter):
 
     def forward_backward_to_backend(
         self,
-        data: List[Dict],
+        data: List[Any],
         loss_fn: str,
         args: Any,
     ) -> Dict[str, torch.Tensor]:
@@ -96,13 +117,13 @@ class VerlDataConverter(DataConverter):
             responses[i, : n - 1] = seq[1:]
             response_mask[i, : n - 1] = 1
 
-            w = _as_1d_tensor(_get_field(data[i], "weights"), torch.float32)
+            w = _tensor_data(_loss_input(data[i], "weights"), torch.float32)
             if w is not None:
                 weights[i, : min(len(w), n - 1)] = w[: n - 1]
-            adv = _as_1d_tensor(_get_field(data[i], "advantages"), torch.float32)
+            adv = _tensor_data(_loss_input(data[i], "advantages"), torch.float32)
             if adv is not None:
                 advantages[i, : min(len(adv), n - 1)] = adv[: n - 1]
-            lp = _as_1d_tensor(_get_field(data[i], "logprobs", "log_probs"), torch.float32)
+            lp = _tensor_data(_loss_input(data[i], "logprobs", "log_probs"), torch.float32)
             if lp is not None:
                 old_log_probs[i, : min(len(lp), n - 1)] = lp[: n - 1]
 
@@ -121,21 +142,21 @@ class VerlDataConverter(DataConverter):
             out["old_log_probs"] = old_log_probs
         return out
 
-    def forward_to_backend(self, data: List[Dict], args: Any) -> Any:
+    def forward_to_backend(self, data: List[Any], args: Any) -> Any:
         return self.forward_backward_to_backend(data, "cross_entropy", args)
 
-    def backend_to_forward_result(self, result: Any, data: List[Dict]) -> Dict[str, Any]:
+    def backend_to_forward_result(self, result: Any, data: List[Any]) -> Dict[str, Any]:
         return {"loss_fn_outputs": self.extract_logprobs(result, data), "metrics": {}}
 
-    def backend_to_forward_backward_result(self, result: Any, data: List[Dict]) -> Dict[str, Any]:
+    def backend_to_forward_backward_result(self, result: Any, data: List[Any]) -> Dict[str, Any]:
         return {"loss_fn_outputs": self.extract_logprobs(result, data), "metrics": {}}
 
     @staticmethod
-    def extract_logprobs(padded_logprobs: torch.Tensor, data: List[Dict]) -> List[Dict[str, Any]]:
+    def extract_logprobs(padded_logprobs: torch.Tensor, data: List[Any]) -> List[Dict[str, Any]]:
         """Datum-aligned per-sample logprobs (length N_i - 1 each)."""
         outputs = []
         for i, datum in enumerate(data):
             n = int(_full_tokens(datum).numel())
-            lp = padded_logprobs[i, : n - 1].detach().cpu()
+            lp = padded_logprobs[i, : n - 1].detach().float().cpu()
             outputs.append({"logprobs": {"data": lp.tolist(), "dtype": "float32", "shape": [n - 1]}})
         return outputs
