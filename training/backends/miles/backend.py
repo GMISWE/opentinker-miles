@@ -65,6 +65,7 @@ class _PoolOp:
     kind: str                                   # "fb" | "other" | "stop"
     future: Optional[asyncio.Future] = None
     run: Any = None                             # "other": async closure
+    tenant: Optional[str] = None                # model_id; None = barrier op
     # fb fields:
     handle: Any = None
     rollout_data: Any = None
@@ -99,6 +100,10 @@ class MilesPool:
     queue: "asyncio.Queue[_PoolOp]" = field(default_factory=asyncio.Queue)
     dispatcher: Optional[asyncio.Task] = None
     cobatch_max_samples: int = 0
+    # Reorder drain: the merge window may defer OTHER tenants' non-fb ops
+    # (cross-tenant order is not contractual; per-tenant FIFO is preserved
+    # via the blocked-tenant rule). Off by default.
+    cobatch_reorder: bool = False
 
 
 class MilesBackend(TrainingBackend):
@@ -461,11 +466,16 @@ class MilesBackend(TrainingBackend):
                 pool.cobatch_max_samples = int(
                     os.environ.get("TINKERCLOUD_MILES_COBATCH_MAX_SAMPLES", "0") or 0
                 )
+                pool.cobatch_reorder = bool(int(
+                    os.environ.get("TINKERCLOUD_MILES_COBATCH_REORDER", "0") or 0
+                ))
                 pool.dispatcher = asyncio.create_task(self._pool_dispatcher_loop(pool))
                 if pool.cobatch_max_samples > 0:
                     logger.info(
-                        "Pool co-batching ON: merging consecutive fb up to %d samples",
+                        "Pool co-batching ON: merging consecutive fb up to %d samples"
+                        " (reorder drain %s)",
                         pool.cobatch_max_samples,
+                        "ON" if pool.cobatch_reorder else "off",
                     )
                 self._pool = pool
 
@@ -522,20 +532,48 @@ class MilesBackend(TrainingBackend):
         pool.queue.put_nowait(op)
         return await op.future
 
-    async def _pool_run(self, pool: MilesPool, run) -> Any:
-        """Serialize an async closure through the pool queue (strict FIFO)."""
-        return await self._pool_submit(pool, _PoolOp(kind="other", run=run))
+    async def _pool_run(self, pool: MilesPool, run, tenant: Optional[str] = None) -> Any:
+        """Serialize an async closure through the pool queue (strict FIFO).
+        `tenant` marks ownership for the reorder drain; None = barrier."""
+        return await self._pool_submit(pool, _PoolOp(kind="other", run=run, tenant=tenant))
 
     async def _pool_dispatcher_loop(self, pool: MilesPool) -> None:
         """Single consumer of pool.queue. FIFO order is the execution order;
-        the only transformation is merging CONSECUTIVE same-loss_fn fb ops
-        (any tenants) into one mixed-slot train call — an op of any other
-        kind ends the drain, so a step never overtakes or absorbs a later fb."""
+        the only transformation is merging same-loss_fn fb ops (any tenants)
+        into one mixed-slot train call.
+
+        Conservative drain (default): only CONSECUTIVE fb ops merge — an op
+        of any other kind ends the drain, so a step never overtakes or
+        absorbs a later fb. Pipelined recipe traffic (fb+step back-to-back
+        per tenant) therefore never merges: the tenant's own step closes
+        the window microseconds after its fb.
+
+        Reorder drain (cobatch_reorder): only PER-TENANT submission order is
+        contractual; cross-tenant order is scheduler freedom (isolation
+        invariant, gate G4). The drain may defer other ops past the merge
+        window and replay them, in order, right after the merged call.
+        Per-tenant FIFO is exact: once ANY op of tenant t is deferred, t is
+        blocked — its later fb cannot join the batch (would overtake the
+        deferred op) and its later ops all defer (keep relative order).
+        Barrier ops (tenant None: stop / pool admin) still end the drain."""
         carry: Optional[_PoolOp] = None
+        pending: List[_PoolOp] = []       # reorder drain: deferred ops
         while True:
-            op = carry if carry is not None else await pool.queue.get()
-            carry = None
+            if carry is not None:
+                # carry left the queue after everything now in pending —
+                # append keeps replay order == queue arrival order.
+                pending.append(carry)
+                carry = None
+            if pending:
+                op = pending.pop(0)
+            else:
+                op = await pool.queue.get()
             if op.kind == "stop":
+                for p in pending:         # drain deferred before stopping
+                    if p.future is not None and not p.future.done():
+                        p.future.set_exception(
+                            BackendError("pool stopped", backend="miles", operation="pool")
+                        )
                 if op.future is not None and not op.future.done():
                     op.future.set_result(None)
                 return
@@ -550,6 +588,8 @@ class MilesBackend(TrainingBackend):
                 continue
             batch = [op]
             total = op.num_samples
+            blocked = {p.tenant for p in pending}
+            deferred_now = 0
             while pool.cobatch_max_samples > 0:
                 try:
                     nxt = pool.queue.get_nowait()
@@ -558,13 +598,27 @@ class MilesBackend(TrainingBackend):
                 if (
                     nxt.kind == "fb"
                     and nxt.loss_fn == op.loss_fn
+                    and nxt.tenant not in blocked
                     and total + nxt.num_samples <= pool.cobatch_max_samples
                 ):
                     batch.append(nxt)
                     total += nxt.num_samples
+                elif (
+                    pool.cobatch_reorder
+                    and nxt.kind != "stop"
+                    and nxt.tenant is not None
+                ):
+                    pending.append(nxt)   # defer; replayed in order after the call
+                    blocked.add(nxt.tenant)
+                    deferred_now += 1
                 else:
                     carry = nxt   # FIFO: this op becomes the next head
                     break
+            if deferred_now:
+                logger.info(
+                    "Reorder drain: deferred %d op(s) past the merge window",
+                    deferred_now,
+                )
             try:
                 per_request = await self._execute_fb_batch(pool, batch)
                 for o, r in zip(batch, per_request):
@@ -672,7 +726,7 @@ class MilesBackend(TrainingBackend):
             self._validate_fb(h, data)
             pool = self._pool
             if h.adapter_slot is not None and pool is not None:
-                return await self._pool_run(pool, _run)
+                return await self._pool_run(pool, _run, tenant=h.model_id)
             await h.lock.acquire()
             try:
                 return await _run()
@@ -721,7 +775,7 @@ class MilesBackend(TrainingBackend):
                 )
                 return await self._pool_submit(pool, _PoolOp(
                     kind="fb", handle=h, rollout_data=rollout_data,
-                    loss_fn=loss_fn, num_samples=len(data),
+                    loss_fn=loss_fn, num_samples=len(data), tenant=h.model_id,
                 ))
             except (BackendError, ValueError):
                 raise
@@ -837,7 +891,7 @@ class MilesBackend(TrainingBackend):
         try:
             pool = self._pool
             if h.adapter_slot is not None and pool is not None:
-                return await self._pool_run(pool, _run)
+                return await self._pool_run(pool, _run, tenant=h.model_id)
             await h.lock.acquire()
             try:
                 return await _run()
@@ -859,7 +913,7 @@ class MilesBackend(TrainingBackend):
         try:
             pool = self._pool
             if h.adapter_slot is not None and pool is not None:
-                await self._pool_run(pool, _run)
+                await self._pool_run(pool, _run, tenant=h.model_id)
                 return
             await h.lock.acquire()
             try:
@@ -891,7 +945,7 @@ class MilesBackend(TrainingBackend):
         try:
             pool = self._pool
             if h.adapter_slot is not None and pool is not None:
-                return await self._pool_run(pool, _run)
+                return await self._pool_run(pool, _run, tenant=h.model_id)
             await h.lock.acquire()
             try:
                 return await _run()
@@ -1001,7 +1055,7 @@ class MilesBackend(TrainingBackend):
                     await pool.train_group.reconcile_adapters()
 
                 try:
-                    await self._pool_run(pool, _retire)
+                    await self._pool_run(pool, _retire, tenant=h.model_id)
                 except Exception as e:
                     raise BackendError(
                         str(e), backend="miles", operation="delete_model", original_error=e,
