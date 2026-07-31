@@ -14,7 +14,14 @@ rotate the server between runs (models are not auto-reaped).
 | `g3_batch_probe.py` | G3 data-shape diagnostic | real shuffled NoRobots batch through fb, length audit |
 | `g3_sl_basic.py` | G3 end-to-end | 30-step SFT completes, NLL decreasing (2026-07-30: 2.80→2.28) |
 | `g4_pool_isolation.py` | G4 pool isolation (M2) | 2 tenants, 1 pool: join fast; B's pinned probe bit-stable across A's steps; interleaved ≡ serialized; A bit-equal after B's delete |
+| `g5_pinned_v0.py` | G5 pinned-v0 + sampler routing | v0 sampler == base, bit-stable across training; live != base; per-tenant routing (B live == base while A live differs) |
 
-G4 needs a pool-mode server (`TINKERCLOUD_MILES_MULTILORA_SLOTS>0`). The
+G4/G5 need a pool-mode server (`TINKERCLOUD_MILES_MULTILORA_SLOTS>0`). The
 per-tenant E₂ gate is two `g3_sl_basic.py` runs launched concurrently
 against the same pool-mode server (each creates its own tenant).
+
+Known gap (surfaced by G5 run 1): only the SDK's EPHEMERAL sampler flavor
+(`save_weights_and_get_sampling_client()`, name=None) registers a
+version-pinned sampler session. A NAMED `save_weights_for_sampler(name)` +
+`create_sampling_client(path)` yields an unpinned sampler served LIVE on
+both backends — snapshot-implying API, live semantics (BUG-015 class).

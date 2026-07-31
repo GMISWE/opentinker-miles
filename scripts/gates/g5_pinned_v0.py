@@ -104,8 +104,11 @@ def main():
     print("P1: tenant A + v0 sampler", flush=True)
     tc_a = sc.create_lora_training_client(base_model=BASE_MODEL, rank=RANK)
     print(f"  A={tc_a.model_id}", flush=True)
-    path = tc_a.save_weights_for_sampler("g5-ref-v0").result().path
-    pinned = tc_a.create_sampling_client(path)
+    # MUST be the ephemeral (unnamed) flavor: only that path registers the
+    # sampler session with a pinned weight_version — a named
+    # save_weights_for_sampler + create_sampling_client(path) yields an
+    # UNPINNED sampler served live (cost G5 run 1).
+    pinned = tc_a.save_weights_and_get_sampling_client()
     s0_toks, s0_lps = sdk_sample(pinned)
     print(f"  S0 tokens={s0_toks[:60]}...", flush=True)
 
