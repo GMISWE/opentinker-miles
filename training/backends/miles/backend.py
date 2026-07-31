@@ -678,14 +678,32 @@ class MilesBackend(TrainingBackend):
         for o in batch:
             lps = logprobs_list[offset:offset + o.num_samples]
             offset += o.num_samples
+            # Observation contract: per-datum logprobs are datum-aligned —
+            # length == model_input token length. The RL path computes N-1
+            # (causal shift over a full-sequence response): front-pad, which
+            # keeps suffix (action-token) alignment. Longer than the datum is
+            # a layout error: refuse rather than guess (reassemble-or-refuse).
+            toks = (o.rollout_data or {}).get("tokens") or []
+            outs = []
+            for j, lp in enumerate(lps):
+                lp_list = lp.tolist()
+                full = len(toks[j]) if j < len(toks) else len(lp_list)
+                if len(lp_list) < full:
+                    lp_list = [0.0] * (full - len(lp_list)) + lp_list
+                elif len(lp_list) > full:
+                    raise BackendError(
+                        f"sample {j}: {len(lp_list)} logprobs for "
+                        f"{full}-token input",
+                        backend="miles", operation="forward_backward",
+                    )
+                outs.append({"logprobs": {
+                    "data": lp_list, "shape": [len(lp_list)], "dtype": "float32",
+                }})
             per_request.append({
                 "loss_fn_output_type": o.loss_fn,
                 "loss": averaged.get("loss"),
                 "metrics": dict(metrics),
-                "loss_fn_outputs": [
-                    {"logprobs": {"data": lp.tolist(), "shape": [len(lp)], "dtype": "float32"}}
-                    for lp in lps
-                ],
+                "loss_fn_outputs": outs,
                 "deferred": False,
             })
         return per_request
