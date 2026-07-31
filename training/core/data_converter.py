@@ -21,11 +21,13 @@ class TinkerDataConverter:
 
     @staticmethod
     def _get_field(obj: Any, field: str) -> Any:
-        """Get field from either dict or Pydantic model."""
+        """Get field from either dict or Pydantic model. Dict lookup FIRST:
+        hasattr-first returns bound methods for key names that collide with
+        dict methods (e.g. "values" -> dict.values, hit by the RL path)."""
+        if isinstance(obj, dict):
+            return obj.get(field)
         if hasattr(obj, field):
             return getattr(obj, field)
-        elif isinstance(obj, dict):
-            return obj.get(field)
         return None
 
     @staticmethod
