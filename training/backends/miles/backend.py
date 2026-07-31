@@ -20,6 +20,22 @@ from ..base import BackendError, BackendHandle, TrainingBackend
 logger = logging.getLogger(__name__)
 
 
+def _model_input_lens(data: List[Any]) -> List[int]:
+    """Per-datum model_input token lengths (the observation-contract unit:
+    fb logprobs are datum-aligned to these, NOT to rollout tokens which
+    append the final target)."""
+    from ...core.data_converter import TinkerDataConverter
+
+    lens = []
+    for d in data:
+        mi = d.get("model_input") if isinstance(d, dict) else getattr(d, "model_input", None)
+        try:
+            lens.append(len(TinkerDataConverter.extract_tokens_from_model_input(mi)))
+        except Exception:  # noqa: BLE001 — fall back to no-op alignment
+            lens.append(0)
+    return lens
+
+
 @dataclass
 class MilesHandle(BackendHandle):
     """Miles-specific runtime state."""
@@ -71,6 +87,7 @@ class _PoolOp:
     rollout_data: Any = None
     loss_fn: Optional[str] = None
     num_samples: int = 0
+    input_lens: Optional[List[int]] = None      # per-datum model_input lengths
 
 
 @dataclass
@@ -679,15 +696,17 @@ class MilesBackend(TrainingBackend):
             lps = logprobs_list[offset:offset + o.num_samples]
             offset += o.num_samples
             # Observation contract: per-datum logprobs are datum-aligned —
-            # length == model_input token length. The RL path computes N-1
-            # (causal shift over a full-sequence response): front-pad, which
-            # keeps suffix (action-token) alignment. Longer than the datum is
-            # a layout error: refuse rather than guess (reassemble-or-refuse).
-            toks = (o.rollout_data or {}).get("tokens") or []
+            # length == the datum's model_input token length (captured at
+            # submit; rollout tokens append the final target and are +1).
+            # The RL path computes one fewer (causal shift over a
+            # full-sequence response): front-pad, which keeps suffix
+            # (action-token) alignment. Longer than the datum is a layout
+            # error: refuse rather than guess (reassemble-or-refuse).
+            in_lens = o.input_lens or []
             outs = []
             for j, lp in enumerate(lps):
                 lp_list = lp.tolist()
-                full = len(toks[j]) if j < len(toks) else len(lp_list)
+                full = in_lens[j] if j < len(in_lens) and in_lens[j] > 0 else len(lp_list)
                 if len(lp_list) < full:
                     lp_list = [0.0] * (full - len(lp_list)) + lp_list
                 elif len(lp_list) > full:
@@ -794,6 +813,7 @@ class MilesBackend(TrainingBackend):
                 return await self._pool_submit(pool, _PoolOp(
                     kind="fb", handle=h, rollout_data=rollout_data,
                     loss_fn=loss_fn, num_samples=len(data), tenant=h.model_id,
+                    input_lens=_model_input_lens(data),
                 ))
             except (BackendError, ValueError):
                 raise
