@@ -15,6 +15,7 @@ rotate the server between runs (models are not auto-reaped).
 | `g3_sl_basic.py` | G3 end-to-end | 30-step SFT completes, NLL decreasing (2026-07-30: 2.80→2.28) |
 | `g4_pool_isolation.py` | G4 pool isolation (M2) | 2 tenants, 1 pool: join fast; B's pinned probe bit-stable across A's steps; interleaved ≡ serialized; A bit-equal after B's delete |
 | `g5_pinned_v0.py` | G5 pinned-v0 + sampler routing | v0 sampler == base, bit-stable across training; live != base; per-tenant routing (B live == base while A live differs) |
+| `g6_batch_invariance.py` | G6 batch-invariance (M3, AC1) | same tenant data solo vs co-batched with different co-tenant mixes ⇒ bit-identical per-tenant grad_norm + logprobs (needs `TINKERCLOUD_MILES_COBATCH_MAX_SAMPLES>=16`) |
 
 G4/G5 need a pool-mode server (`TINKERCLOUD_MILES_MULTILORA_SLOTS>0`). The
 per-tenant E₂ gate is two `g3_sl_basic.py` runs launched concurrently

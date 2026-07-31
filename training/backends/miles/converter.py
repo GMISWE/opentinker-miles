@@ -64,6 +64,35 @@ class MilesDataConverter(DataConverter):
         if adapter_slot is not None:
             rollout_data["adapter_slots"] = [adapter_slot] * num_samples
 
+    @staticmethod
+    def merge_forward_backward_batches(batches: List[Any]) -> Any:
+        """Concatenate per-request rollout_data dicts into one mixed-slot
+        batch (M3 co-batching). Per-sample list keys concatenate in request
+        order; scalars must agree across requests (same-loss_fn merge rule);
+        dynamic_global_batch_size sums. The miles DP split slot-sorts each
+        partition, so merged order need not be slot-sorted here."""
+        if len(batches) == 1:
+            return batches[0]
+        keys = set(batches[0].keys())
+        assert all(set(b.keys()) == keys for b in batches), \
+            f"co-batch key mismatch: {[sorted(b.keys()) for b in batches]}"
+        sizes = [b["dynamic_global_batch_size"] for b in batches]
+        merged: Dict[str, Any] = {}
+        for key in batches[0]:
+            v0 = batches[0][key]
+            if key == "dynamic_global_batch_size":
+                merged[key] = sum(sizes)
+            elif isinstance(v0, list) and all(
+                isinstance(b[key], list) and len(b[key]) == n
+                for b, n in zip(batches, sizes)
+            ):
+                merged[key] = [x for b in batches for x in b[key]]
+            else:
+                assert all(repr(b[key]) == repr(v0) for b in batches), \
+                    f"co-batch scalar mismatch on {key!r}"
+                merged[key] = v0
+        return merged
+
     def backend_to_forward_result(
         self,
         result: Any,

@@ -58,11 +58,32 @@ class MilesHandle(BackendHandle):
 
 
 @dataclass
+class _PoolOp:
+    """One queued pool operation. kind 'fb' ops are mergeable; 'other' ops
+    run their closure; 'stop' ends the dispatcher."""
+
+    kind: str                                   # "fb" | "other" | "stop"
+    future: Optional[asyncio.Future] = None
+    run: Any = None                             # "other": async closure
+    # fb fields:
+    handle: Any = None
+    rollout_data: Any = None
+    loss_fn: Optional[str] = None
+    num_samples: int = 0
+
+
+@dataclass
 class MilesPool:
-    """Shared multi-LoRA rails (M2): one boot serves N tenant adapters.
+    """Shared multi-LoRA rails (M2/M3): one boot serves N tenant adapters.
 
     First create_model boots the pool; later creates register into it;
-    delete deregisters, and the last tenant out tears the pool down."""
+    delete deregisters, and the last tenant out tears the pool down.
+
+    All GPU-bound ops flow through `queue`, consumed by ONE dispatcher task
+    in strict FIFO — the pool's serializer (was an asyncio.Lock in M2; a
+    queue makes the M3 co-batch merge window explicit). Consecutive queued
+    fb ops with the same loss_fn merge into one mixed-slot train call, up
+    to `cobatch_max_samples` (0 = merging off; batch of 1 == M2 behavior)."""
 
     train_group: Any
     rollout_manager: Any
@@ -75,6 +96,9 @@ class MilesPool:
     router_port: Optional[int] = None
     tenants: Dict[str, int] = field(default_factory=dict)   # model_id -> slot
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    queue: "asyncio.Queue[_PoolOp]" = field(default_factory=asyncio.Queue)
+    dispatcher: Optional[asyncio.Task] = None
+    cobatch_max_samples: int = 0
 
 
 class MilesBackend(TrainingBackend):
@@ -206,18 +230,22 @@ class MilesBackend(TrainingBackend):
             ) from e
         adapter_slot = registration["slot"]
 
+        async def _load_and_push() -> None:
+            # Actors load the PENDING adapter into its slot and mark it
+            # for push; update_weights upserts exactly the pending set
+            # (LoRA B=0 => zero-delta) and promotes it to ACTIVE.
+            await pool.train_group.reconcile_adapters()
+            await pool.train_group.update_weights()
+
+        async def _rollback() -> None:
+            await pool.controller.deregister_adapter.remote(adapter_name)
+            await pool.train_group.reconcile_adapters()
+
         try:
-            async with pool.lock:
-                # Actors load the PENDING adapter into its slot and mark it
-                # for push; update_weights upserts exactly the pending set
-                # (LoRA B=0 => zero-delta) and promotes it to ACTIVE.
-                await pool.train_group.reconcile_adapters()
-                await pool.train_group.update_weights()
+            await self._pool_run(pool, _load_and_push)
         except Exception as e:
             try:
-                await pool.controller.deregister_adapter.remote(adapter_name)
-                async with pool.lock:
-                    await pool.train_group.reconcile_adapters()
+                await self._pool_run(pool, _rollback)
             except Exception:
                 logger.warning(
                     "[%s] Pool join rollback failed for adapter %s",
@@ -430,6 +458,15 @@ class MilesBackend(TrainingBackend):
                 )
                 pool.tenants[model_id] = adapter_slot
                 handle.lock = pool.lock
+                pool.cobatch_max_samples = int(
+                    os.environ.get("TINKERCLOUD_MILES_COBATCH_MAX_SAMPLES", "0") or 0
+                )
+                pool.dispatcher = asyncio.create_task(self._pool_dispatcher_loop(pool))
+                if pool.cobatch_max_samples > 0:
+                    logger.info(
+                        "Pool co-batching ON: merging consecutive fb up to %d samples",
+                        pool.cobatch_max_samples,
+                    )
                 self._pool = pool
 
             logger.info("[%s] Miles model %s created successfully", request_id, model_id)
@@ -474,6 +511,131 @@ class MilesBackend(TrainingBackend):
         if cleanup:
             logger.info("create_model failure teardown: released %s", sorted(cleanup))
 
+    # ---- Pool dispatcher: the pool's serializer + M3 co-batch window ----
+
+    async def _pool_submit(self, pool: MilesPool, op: _PoolOp) -> Any:
+        if pool.dispatcher is None or pool.dispatcher.done():
+            raise BackendError(
+                "pool dispatcher not running", backend="miles", operation="pool",
+            )
+        op.future = asyncio.get_running_loop().create_future()
+        pool.queue.put_nowait(op)
+        return await op.future
+
+    async def _pool_run(self, pool: MilesPool, run) -> Any:
+        """Serialize an async closure through the pool queue (strict FIFO)."""
+        return await self._pool_submit(pool, _PoolOp(kind="other", run=run))
+
+    async def _pool_dispatcher_loop(self, pool: MilesPool) -> None:
+        """Single consumer of pool.queue. FIFO order is the execution order;
+        the only transformation is merging CONSECUTIVE same-loss_fn fb ops
+        (any tenants) into one mixed-slot train call — an op of any other
+        kind ends the drain, so a step never overtakes or absorbs a later fb."""
+        carry: Optional[_PoolOp] = None
+        while True:
+            op = carry if carry is not None else await pool.queue.get()
+            carry = None
+            if op.kind == "stop":
+                if op.future is not None and not op.future.done():
+                    op.future.set_result(None)
+                return
+            if op.kind == "other":
+                try:
+                    result = await op.run()
+                    if not op.future.done():
+                        op.future.set_result(result)
+                except Exception as e:  # noqa: BLE001 — surfaced via the future
+                    if not op.future.done():
+                        op.future.set_exception(e)
+                continue
+            batch = [op]
+            total = op.num_samples
+            while pool.cobatch_max_samples > 0:
+                try:
+                    nxt = pool.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if (
+                    nxt.kind == "fb"
+                    and nxt.loss_fn == op.loss_fn
+                    and total + nxt.num_samples <= pool.cobatch_max_samples
+                ):
+                    batch.append(nxt)
+                    total += nxt.num_samples
+                else:
+                    carry = nxt   # FIFO: this op becomes the next head
+                    break
+            try:
+                per_request = await self._execute_fb_batch(pool, batch)
+                for o, r in zip(batch, per_request):
+                    if not o.future.done():
+                        o.future.set_result(r)
+            except Exception as e:  # noqa: BLE001 — surfaced via the futures
+                for o in batch:
+                    if o.future is not None and not o.future.done():
+                        o.future.set_exception(e)
+
+    async def _execute_fb_batch(self, pool: MilesPool, batch: List[_PoolOp]) -> List[Dict[str, Any]]:
+        """One train call for 1..k merged fb requests; split results back."""
+        from miles.utils.ray_utils import Box
+        from miles.ray.tinker_group import merge_dp_sample_outputs
+
+        if pool.rollout_manager is not None and pool.args.offload_rollout:
+            await pool.rollout_manager.offload.remote()
+
+        merged = self.converter.merge_forward_backward_batches(
+            [o.rollout_data for o in batch]
+        )
+        if len(batch) > 1:
+            logger.info(
+                "Co-batched fb: %d requests / %d samples / tenants %s",
+                len(batch), sum(o.num_samples for o in batch),
+                sorted({o.handle.model_id for o in batch}),
+            )
+
+        results = await pool.train_group.forward_backward_only(0, Box(ray.put(merged)))
+
+        # Batch-global metrics (per-tenant scalar loss is not separable in a
+        # mixed batch; per-datum outputs below are exact per tenant).
+        summed: Dict[str, float] = {}
+        reporting = 0
+        for r in results or []:
+            loss_dict = (r or {}).get("loss") or {}
+            if loss_dict:
+                reporting += 1
+                for k, v in loss_dict.items():
+                    summed[k] = summed.get(k, 0.0) + float(v)
+        averaged = {k: v / reporting for k, v in summed.items()} if reporting else {}
+        metrics = {f"{k}:mean": v for k, v in averaged.items()}
+        if len(batch) > 1:
+            metrics["co_batched_fb:max"] = float(len(batch))
+
+        logprobs_list = merge_dp_sample_outputs(results or [], key="log_probs")
+        expected = sum(o.num_samples for o in batch)
+        if len(logprobs_list) != expected:
+            raise BackendError(
+                f"co-batched fb returned {len(logprobs_list)} per-sample "
+                f"outputs for {expected} samples",
+                backend="miles", operation="forward_backward",
+            )
+
+        per_request = []
+        offset = 0
+        for o in batch:
+            lps = logprobs_list[offset:offset + o.num_samples]
+            offset += o.num_samples
+            per_request.append({
+                "loss_fn_output_type": o.loss_fn,
+                "loss": averaged.get("loss"),
+                "metrics": dict(metrics),
+                "loss_fn_outputs": [
+                    {"logprobs": {"data": lp.tolist(), "shape": [len(lp)], "dtype": "float32"}}
+                    for lp in lps
+                ],
+                "deferred": False,
+            })
+        return per_request
+
     async def forward(
         self,
         handle: BackendHandle,
@@ -481,8 +643,8 @@ class MilesBackend(TrainingBackend):
         loss_fn: str,
     ) -> Dict[str, Any]:
         h: MilesHandle = handle  # type: ignore[assignment]
-        await h.lock.acquire()
-        try:
+
+        async def _run() -> Dict[str, Any]:
             from miles.utils.ray_utils import Box
 
             if h.rollout_manager is not None and h.args.offload_rollout:
@@ -504,14 +666,39 @@ class MilesBackend(TrainingBackend):
                 "metrics": {},
             }
 
+        try:
+            pool = self._pool
+            if h.adapter_slot is not None and pool is not None:
+                return await self._pool_run(pool, _run)
+            await h.lock.acquire()
+            try:
+                return await _run()
+            finally:
+                h.lock.release()
         except BackendError:
             raise
         except Exception as e:
             raise BackendError(
                 str(e), backend="miles", operation="forward", original_error=e,
             ) from e
-        finally:
-            h.lock.release()
+
+    @staticmethod
+    def _validate_fb(h: MilesHandle, data: List[Dict]) -> None:
+        from ...core.validators import RequestValidator
+        from ...config import get_config
+
+        is_rl = not h.args.debug_train_only
+        config = get_config()
+        allow_partial = getattr(config, "allow_partial_batches", False)
+        validator = RequestValidator(h.args, allow_partial_batches=allow_partial)
+        validation_error = validator.validate_forward_backward_request(
+            data, is_rl=is_rl,
+        )
+        if validation_error:
+            raise ValueError(
+                f"Request validation failed:\n{validation_error}\n\n"
+                f"{validator.get_config_summary()}"
+            )
 
     async def forward_backward(
         self,
@@ -520,6 +707,25 @@ class MilesBackend(TrainingBackend):
         loss_fn: str,
     ) -> Dict[str, Any]:
         h: MilesHandle = handle  # type: ignore[assignment]
+        pool = self._pool
+        if h.adapter_slot is not None and pool is not None:
+            # Pool path: validate + convert here (CPU), then queue the GPU
+            # work — the dispatcher serializes and may co-batch it (M3).
+            try:
+                self._validate_fb(h, data)
+                rollout_data = self.converter.forward_backward_to_backend(
+                    data, loss_fn, h.args, adapter_slot=h.adapter_slot,
+                )
+                return await self._pool_submit(pool, _PoolOp(
+                    kind="fb", handle=h, rollout_data=rollout_data,
+                    loss_fn=loss_fn, num_samples=len(data),
+                ))
+            except (BackendError, ValueError):
+                raise
+            except Exception as e:
+                raise BackendError(
+                    str(e), backend="miles", operation="forward_backward", original_error=e,
+                ) from e
         await h.lock.acquire()
         try:
             from miles.utils.ray_utils import Box
@@ -527,22 +733,7 @@ class MilesBackend(TrainingBackend):
             if h.rollout_manager is not None and h.args.offload_rollout:
                 await h.rollout_manager.offload.remote()
 
-            is_rl = not h.args.debug_train_only
-
-            from ...core.validators import RequestValidator
-            from ...config import get_config
-
-            config = get_config()
-            allow_partial = getattr(config, "allow_partial_batches", False)
-            validator = RequestValidator(h.args, allow_partial_batches=allow_partial)
-            validation_error = validator.validate_forward_backward_request(
-                data, is_rl=is_rl,
-            )
-            if validation_error:
-                raise ValueError(
-                    f"Request validation failed:\n{validation_error}\n\n"
-                    f"{validator.get_config_summary()}"
-                )
+            self._validate_fb(h, data)
 
             rollout_data = self.converter.forward_backward_to_backend(
                 data, loss_fn, h.args, adapter_slot=h.adapter_slot,
@@ -604,8 +795,8 @@ class MilesBackend(TrainingBackend):
         # adam_params accepted for contract uniformity (P4); Miles applies lr
         # only — betas/eps are Megatron args fixed at creation.
         h: MilesHandle = handle  # type: ignore[assignment]
-        await h.lock.acquire()
-        try:
+
+        async def _run() -> Dict[str, Any]:
             # TinkerTrainGroup: apply_optimizer_step(learning_rate) fans out to
             # the actors; _and_sync additionally pushes weights to SGLang.
             offload_train = h.args.offload_train if h.args else True
@@ -640,26 +831,42 @@ class MilesBackend(TrainingBackend):
                 "model_id": h.model_id,
             }
 
+        try:
+            pool = self._pool
+            if h.adapter_slot is not None and pool is not None:
+                return await self._pool_run(pool, _run)
+            await h.lock.acquire()
+            try:
+                return await _run()
+            finally:
+                h.lock.release()
         except BackendError:
             raise
         except Exception as e:
             raise BackendError(
                 str(e), backend="miles", operation="apply_optimizer_step", original_error=e,
             ) from e
-        finally:
-            h.lock.release()
 
     async def update_inference_weights(self, handle: BackendHandle) -> None:
         h: MilesHandle = handle  # type: ignore[assignment]
-        await h.lock.acquire()
-        try:
+
+        async def _run() -> None:
             await h.train_group.update_weights()
+
+        try:
+            pool = self._pool
+            if h.adapter_slot is not None and pool is not None:
+                await self._pool_run(pool, _run)
+                return
+            await h.lock.acquire()
+            try:
+                await _run()
+            finally:
+                h.lock.release()
         except Exception as e:
             raise BackendError(
                 str(e), backend="miles", operation="update_inference_weights", original_error=e,
             ) from e
-        finally:
-            h.lock.release()
 
     async def save_checkpoint(
         self,
@@ -668,25 +875,29 @@ class MilesBackend(TrainingBackend):
         step_id: Optional[int] = None,
     ) -> str:
         h: MilesHandle = handle  # type: ignore[assignment]
-        await h.lock.acquire()
-        try:
+
+        async def _run() -> str:
             offload_train = h.args.offload_train if h.args else False
             if offload_train:
                 logger.info("Skipping save_model (offload_train=True)")
                 return checkpoint_path
 
-            if step_id is None:
-                step_id = 0
-
-            await h.train_group.save_model(step_id)
+            await h.train_group.save_model(step_id if step_id is not None else 0)
             return checkpoint_path
 
+        try:
+            pool = self._pool
+            if h.adapter_slot is not None and pool is not None:
+                return await self._pool_run(pool, _run)
+            await h.lock.acquire()
+            try:
+                return await _run()
+            finally:
+                h.lock.release()
         except Exception as e:
             raise BackendError(
                 str(e), backend="miles", operation="save_checkpoint", original_error=e,
             ) from e
-        finally:
-            h.lock.release()
 
     async def load_checkpoint(
         self,
@@ -779,13 +990,15 @@ class MilesBackend(TrainingBackend):
             if pool is None:
                 return
             if len(pool.tenants) > 1 or h.model_id not in pool.tenants:
+                async def _retire() -> None:
+                    await pool.controller.deregister_adapter.remote(h.adapter_name)
+                    # Actors retire the slot: abort in-flight sampling,
+                    # save the final adapter ckpt, clear slot weights /
+                    # optimizer state / retained grads, free the slot.
+                    await pool.train_group.reconcile_adapters()
+
                 try:
-                    async with pool.lock:
-                        await pool.controller.deregister_adapter.remote(h.adapter_name)
-                        # Actors retire the slot: abort in-flight sampling,
-                        # save the final adapter ckpt, clear slot weights /
-                        # optimizer state / retained grads, free the slot.
-                        await pool.train_group.reconcile_adapters()
+                    await self._pool_run(pool, _retire)
                 except Exception as e:
                     raise BackendError(
                         str(e), backend="miles", operation="delete_model", original_error=e,
@@ -799,27 +1012,33 @@ class MilesBackend(TrainingBackend):
             # Last tenant: the pool dies with it. Null the record even on a
             # partial teardown — a half-dead pool must not accept joins.
             try:
-                async with pool.lock:
-                    resources_freed = []
-                    try:
-                        await pool.controller.stop.remote()
-                    except Exception:
-                        logger.warning("Multi-LoRA controller stop failed; killing", exc_info=True)
-                    ray.kill(pool.controller, no_restart=True)
-                    resources_freed.append("multi_lora_controller")
-                    for actor in pool.train_group._actor_handles:
-                        ray.kill(actor, no_restart=True)
-                        resources_freed.append("actor")
-                    if pool.rollout_manager is not None:
-                        ray.kill(pool.rollout_manager, no_restart=True)
-                        resources_freed.append("rollout_manager")
-                    seen = set()
-                    for pg_tuple in (pool.placement_group or {}).values():
-                        pg_obj = pg_tuple[0] if isinstance(pg_tuple, tuple) else pg_tuple
-                        if pg_obj is not None and id(pg_obj) not in seen:
-                            seen.add(id(pg_obj))
-                            ray.util.remove_placement_group(pg_obj)
-                            resources_freed.append("placement_group")
+                # Drain + stop the dispatcher first: FIFO means every
+                # already-queued op completes before the stop resolves, so
+                # the kills below never race an in-flight broadcast.
+                try:
+                    await self._pool_submit(pool, _PoolOp(kind="stop"))
+                except BackendError:
+                    pass  # dispatcher already dead — proceed to kills
+                resources_freed = []
+                try:
+                    await pool.controller.stop.remote()
+                except Exception:
+                    logger.warning("Multi-LoRA controller stop failed; killing", exc_info=True)
+                ray.kill(pool.controller, no_restart=True)
+                resources_freed.append("multi_lora_controller")
+                for actor in pool.train_group._actor_handles:
+                    ray.kill(actor, no_restart=True)
+                    resources_freed.append("actor")
+                if pool.rollout_manager is not None:
+                    ray.kill(pool.rollout_manager, no_restart=True)
+                    resources_freed.append("rollout_manager")
+                seen = set()
+                for pg_tuple in (pool.placement_group or {}).values():
+                    pg_obj = pg_tuple[0] if isinstance(pg_tuple, tuple) else pg_tuple
+                    if pg_obj is not None and id(pg_obj) not in seen:
+                        seen.add(id(pg_obj))
+                        ray.util.remove_placement_group(pg_obj)
+                        resources_freed.append("placement_group")
             except Exception as e:
                 raise BackendError(
                     str(e), backend="miles", operation="delete_model", original_error=e,
