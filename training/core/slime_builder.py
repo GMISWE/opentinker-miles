@@ -462,7 +462,12 @@ class SlimeArgumentBuilder:
         args.rollout_num_gpus_per_engine = 1
         args.sglang_router_ip = None
         args.sglang_router_port = None
-        args.rollout_temperature = 0.7
+        # Must be 1.0: miles' loss hub divides training logits by this arg
+        # (logit_processors.get_responses, an RL importance-sampling
+        # convention), so any other value silently trains and reports
+        # log_softmax(z/T) for every loss fn. Tinker training logprobs are
+        # untempered; sampling temperature is per-request, never this arg.
+        args.rollout_temperature = 1.0
         args.rollout_top_p = 0.9
         args.rollout_top_k = 50
         args.rollout_max_response_len = 256
