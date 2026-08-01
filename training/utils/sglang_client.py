@@ -47,7 +47,7 @@ class SGLangClient:
         Args:
             input_ids: List of input token IDs
             sampling_params: Sampling parameters dict with:
-                - temperature: float (default 0.7)
+                - temperature: float (default 1.0, matching the API schema default)
                 - top_p: float (default 0.9)
                 - max_tokens: int (default 256)
             prompt_logprobs: Whether to return prompt log probabilities
@@ -69,7 +69,7 @@ class SGLangClient:
         payload = {
             "input_ids": input_ids,
             "sampling_params": {
-                "temperature": sampling_params.get("temperature", 0.7),
+                "temperature": sampling_params.get("temperature", 1.0),
                 "top_p": sampling_params.get("top_p", 0.9),
                 "max_new_tokens": sampling_params.get("max_tokens", 256),
             },
