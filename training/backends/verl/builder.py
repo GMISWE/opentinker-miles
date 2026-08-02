@@ -73,6 +73,27 @@ class VerlArgumentBuilder(ArgumentBuilder):
                 "lr_scheduler_type": "constant",
             },
             "max_seq_len": max_seq_len,
+            # M2: vLLM rollout servers colocated with the training engine
+            # (hybrid timeshare: replicas sleep during training ops, wake +
+            # weight-sync for sampling). load_format stays "dummy" — the boot
+            # sequence does one naive update_weights so vLLM never serves
+            # dummy weights.
+            "rollout": {
+                "name": "vllm",
+                "mode": "async",
+                "prompt_length": max_seq_len,
+                "response_length": int(
+                    (rollout_config or {}).get("max_response_len")
+                    or self.overrides.get("response_length", 1024)
+                ),
+                "tensor_model_parallel_size": int((rollout_config or {}).get("tp_size") or 1),
+                "gpu_memory_utilization": float(
+                    self.overrides.get("rollout_gpu_memory_utilization", 0.5)
+                ),
+                # eager avoids cudagraph capture at every wake on small gate
+                # models; flip via overrides for throughput runs
+                "enforce_eager": bool(self.overrides.get("enforce_eager", True)),
+            },
         }
         return cfg
 
