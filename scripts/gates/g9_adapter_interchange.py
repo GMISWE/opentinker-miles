@@ -68,14 +68,36 @@ def _datum(toks: list[int]) -> types.Datum:
     )
 
 
-def _probe_logprobs(tc, probe: list[list[int]]) -> list[float]:
-    """Backend's per-token logprobs on the frozen probe batch. forward_backward
-    accumulates grads but applies nothing — the observable is read-only as long
-    as no optim_step follows before the snapshot is taken."""
-    out = tc.forward_backward([_datum(t) for t in probe], loss_fn="cross_entropy").result()
+def _flatten_logprobs(outputs) -> list[float]:
+    """loss_fn_outputs entries are Pydantic LossFnOutput on some paths and
+    plain dicts on others; both index, only one has .get."""
     lps: list[float] = []
-    for o in out.loss_fn_outputs:
-        lps.extend(list(o["logprobs"].data))
+    for o in outputs or []:
+        try:
+            lp = o["logprobs"]
+        except Exception:
+            lp = getattr(o, "logprobs", None)
+        if lp is not None:
+            lps.extend(list(getattr(lp, "data", lp)))
+    return lps
+
+
+def _probe_logprobs(tc, probe: list[list[int]]) -> list[float]:
+    """Backend's per-token logprobs on the frozen probe batch.
+
+    Uses the forward-only primitive deliberately: forward_backward is not a
+    read-only observable on every backend — R9-buffering backends (nemo_rl)
+    execute nothing there and hand back zero placeholders, deferring the real
+    values to optim_step (001-P3). forward() means the same thing everywhere
+    and leaves no gradient state behind.
+    """
+    out = tc.forward([_datum(t) for t in probe], loss_fn="cross_entropy").result()
+    lps = _flatten_logprobs(out.loss_fn_outputs)
+    if not lps or not any(lps):
+        raise SystemExit(
+            "forward() returned no per-token logprobs — this backend's "
+            "forward-only path does not carry the observable the seam gate needs"
+        )
     return lps
 
 
