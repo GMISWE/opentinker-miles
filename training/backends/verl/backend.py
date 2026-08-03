@@ -30,6 +30,12 @@ from ..base import BackendError, BackendHandle, TrainingBackend, UnsupportedFeat
 logger = logging.getLogger(__name__)
 
 
+def _set_event() -> asyncio.Event:
+    e = asyncio.Event()
+    e.set()
+    return e
+
+
 @dataclass
 class VerlHandle(BackendHandle):
     """veRL-specific runtime state."""
@@ -51,6 +57,10 @@ class VerlHandle(BackendHandle):
     rollout_synced_version: int = -1  # weight_version last synced to vLLM
     lora_rank: int = 0
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # FIFO per handle
+    # Sample concurrency: generates run OUTSIDE _lock so vLLM batches them;
+    # training ops quiesce active samplers first (_quiesce_samplers).
+    _active_samplers: int = 0
+    _samplers_drained: asyncio.Event = field(default_factory=_set_event)
 
 
 class VerlBackend(TrainingBackend):
@@ -153,6 +163,7 @@ class VerlBackend(TrainingBackend):
         h: VerlHandle = handle  # type: ignore[assignment]
         async with h._lock:
             try:
+                await self._quiesce_samplers(h)
                 await asyncio.to_thread(self._ensure_training_ready, h)
                 await asyncio.to_thread(self._ensure_loss_fn, h, loss_fn)
                 td = await asyncio.to_thread(self._to_tensordict, h, data, loss_fn)
@@ -180,6 +191,7 @@ class VerlBackend(TrainingBackend):
         h: VerlHandle = handle  # type: ignore[assignment]
         async with h._lock:
             try:
+                await self._quiesce_samplers(h)
                 await asyncio.to_thread(self._ensure_training_ready, h)
                 params: Dict[str, Any] = {}
                 if learning_rate is not None:
@@ -226,6 +238,7 @@ class VerlBackend(TrainingBackend):
         h: VerlHandle = handle  # type: ignore[assignment]
         async with h._lock:
             try:
+                await self._quiesce_samplers(h)
                 await asyncio.to_thread(self._ensure_training_ready, h)
                 td = await asyncio.to_thread(self._to_tensordict, h, data, "cross_entropy", True)
                 from verl.utils import tensordict_utils as tu
@@ -263,6 +276,7 @@ class VerlBackend(TrainingBackend):
         h: VerlHandle = handle  # type: ignore[assignment]
         async with h._lock:
             try:
+                await self._quiesce_samplers(h)
                 await asyncio.to_thread(
                     h.worker_group.save_checkpoint, checkpoint_path, None, step_id or h.weight_version,
                 )
@@ -274,6 +288,7 @@ class VerlBackend(TrainingBackend):
         h: VerlHandle = handle  # type: ignore[assignment]
         async with h._lock:
             try:
+                await self._quiesce_samplers(h)
                 await asyncio.to_thread(h.worker_group.load_checkpoint, checkpoint_path)
             except Exception as e:
                 raise BackendError(str(e), backend="verl", operation="load_checkpoint", original_error=e) from e
@@ -326,7 +341,10 @@ class VerlBackend(TrainingBackend):
                 suggestion="model was created debug_train_only; recreate with rollout enabled",
             )
         # Hybrid timeshare: generation must not overlap training ops on the
-        # same GPUs, so sampling holds the handle FIFO lock too.
+        # same GPUs. Register as an active sampler under the FIFO lock (which
+        # serializes the wake/weight-sync), then generate WITHOUT the lock so
+        # concurrent sample requests batch inside vLLM; training ops quiesce
+        # samplers via _quiesce_samplers before touching the GPUs.
         async with h._lock:
             try:
                 await asyncio.to_thread(self._ensure_rollout_ready, h)
@@ -345,7 +363,14 @@ class VerlBackend(TrainingBackend):
                         "[%s] prompt_logprobs unsupported on verl sample path "
                         "(use forward/get_logprobs); returning None", request_id,
                     )
-
+                h._active_samplers += 1
+                h._samplers_drained.clear()
+            except (BackendError, UnsupportedFeatureError):
+                raise
+            except Exception as e:
+                raise BackendError(str(e), backend="verl", operation="sample", original_error=e) from e
+        try:
+            try:
                 vllm_sp = _to_vllm_sampling_params(sampling_params)
                 max_tokens = vllm_sp.get("max_tokens")
 
@@ -364,25 +389,29 @@ class VerlBackend(TrainingBackend):
                     return out
 
                 outs = await asyncio.gather(*[_one(i) for i in range(num_samples)])
-                sequences = []
-                for out in outs:
-                    if out.stop_reason == "aborted":
-                        raise BackendError(
-                            "rollout request aborted", backend="verl", operation="sample",
-                        )
-                    n_tok = len(out.token_ids)
-                    stop_reason = "length" if (max_tokens is not None and n_tok >= max_tokens) else "stop"
-                    sequences.append({
-                        "tokens": list(out.token_ids),
-                        "logprobs": list(out.log_probs) if out.log_probs is not None else None,
-                        "text": None,
-                        "stop_reason": stop_reason,
-                    })
-                return {"sequences": sequences, "prompt_logprobs": None}
-            except (BackendError, UnsupportedFeatureError):
-                raise
-            except Exception as e:
-                raise BackendError(str(e), backend="verl", operation="sample", original_error=e) from e
+            finally:
+                h._active_samplers -= 1
+                if h._active_samplers == 0:
+                    h._samplers_drained.set()
+            sequences = []
+            for out in outs:
+                if out.stop_reason == "aborted":
+                    raise BackendError(
+                        "rollout request aborted", backend="verl", operation="sample",
+                    )
+                n_tok = len(out.token_ids)
+                stop_reason = "length" if (max_tokens is not None and n_tok >= max_tokens) else "stop"
+                sequences.append({
+                    "tokens": list(out.token_ids),
+                    "logprobs": list(out.log_probs) if out.log_probs is not None else None,
+                    "text": None,
+                    "stop_reason": stop_reason,
+                })
+            return {"sequences": sequences, "prompt_logprobs": None}
+        except (BackendError, UnsupportedFeatureError):
+            raise
+        except Exception as e:
+            raise BackendError(str(e), backend="verl", operation="sample", original_error=e) from e
 
     async def prepare_for_generation(self, handle: BackendHandle) -> None:
         h: VerlHandle = handle  # type: ignore[assignment]
@@ -400,6 +429,13 @@ class VerlBackend(TrainingBackend):
                 ) from e
 
     # -------------------------------------------------------------- helpers
+
+    @staticmethod
+    async def _quiesce_samplers(h: VerlHandle) -> None:
+        """Drain in-flight generates. Call with h._lock HELD: new samplers
+        queue behind the lock; active ones finish without needing it."""
+        while h._active_samplers:
+            await h._samplers_drained.wait()
 
     @staticmethod
     def _ensure_training_ready(h: VerlHandle) -> None:
