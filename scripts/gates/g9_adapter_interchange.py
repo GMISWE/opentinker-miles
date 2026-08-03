@@ -41,7 +41,10 @@ from tinker import types
 
 BASE_MODEL = os.environ.get("G9_BASE_MODEL", "Qwen/Qwen2.5-0.5B")
 RANK = int(os.environ.get("G9_RANK", "32"))
-SEQ = 64
+# 257 tokens => 256-token inputs after the target shift: miles' TE fused-attn
+# backward fails with CUDNN_STATUS_BAD_PARAM on short/odd sequence lengths
+# (63 crashed), so keep the probe on a power-of-two length.
+SEQ = 257
 N_TRAIN = 4          # datums per training step
 PROBE_SEED = 20260803
 CORR_BAR, GAP_BAR = 0.999, 0.03
@@ -85,7 +88,10 @@ def _train(tc, steps: int, lr: float) -> list[float]:
         st = tc.optim_step(types.AdamParams(learning_rate=lr))
         fb.result()
         res = st.result()
-        gn = getattr(res, "grad_norm", None)
+        # OptimStepResponse has no top-level grad_norm — it rides in metrics
+        # (key name varies by backend: grad_norm / optim/grad_norm / ...).
+        metrics = getattr(res, "metrics", None) or {}
+        gn = next((v for k, v in metrics.items() if "grad_norm" in k), None)
         norms.append(float(gn) if gn is not None else float("nan"))
         print(f"  step {step}: grad_norm={norms[-1]}")
     return norms

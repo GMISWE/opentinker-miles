@@ -235,7 +235,13 @@ class SlimeArgumentBuilder:
             # checkpoint resume is specified (see miles/utils/arguments.py:1452-1460)
             '--ref-load', megatron_checkpoint_path,
             '--save', self.default_save_dir,
-            '--save-interval', '20000',  # ~100 batches (each batch ~200 microbatches)
+            # Pool mode: save_due_adapter_checkpoints only writes adapters at a
+            # save-interval multiple, and the interval lives on the ACTORS' args
+            # copy — interval 1 makes the client's save_state the trigger (saves
+            # are skipped when the step dir already exists). This is what
+            # publishes the cross-backend adapter (specs/007).
+            # Dedicated mode: ~100 batches (each batch ~200 microbatches).
+            '--save-interval', '1' if multi_lora_slots > 0 else '20000',
         ]
 
         if multi_lora_slots > 0:

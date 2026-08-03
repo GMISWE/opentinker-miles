@@ -55,6 +55,38 @@ def find_hf_adapter(checkpoint_root: str) -> Optional[str]:
     return None
 
 
+PEFT_PREFIX = "base_model.model."
+
+
+def _write_peft_keyed(weights_src: str, weights_dst: str) -> None:
+    """Copy the adapter weights, normalizing state-dict keys to the PEFT
+    convention (`base_model.model.<module>.lora_{A,B}.weight`).
+
+    Miles/Megatron-Bridge exports bare module paths (`model.layers.0...`).
+    `PeftModel.from_pretrained` matches those against nothing, WARNS about
+    missing adapter keys, and returns the base model — a silent zero-delta
+    load. Measured 2026-08-03: unkeyed round-trip corr 0.806 / gap 0.986
+    nats vs 0.99964 / 0.0033 after normalization.
+    """
+    try:
+        from safetensors.torch import load_file, save_file
+    except ImportError:
+        logger.warning("safetensors unavailable; publishing adapter keys unmodified")
+        shutil.copy2(weights_src, weights_dst)
+        return
+
+    state = load_file(weights_src)
+    if any(k.startswith(PEFT_PREFIX) for k in state):
+        shutil.copy2(weights_src, weights_dst)   # already PEFT-keyed: keep bytes
+        return
+    logger.info("Re-keying %d adapter tensors to the PEFT convention", len(state))
+    save_file(
+        {f"{PEFT_PREFIX}{k}": v for k, v in state.items()},
+        weights_dst,
+        metadata={"format": "pt"},
+    )
+
+
 def export_hf_adapter(src_dir: str, checkpoint_root: str) -> Optional[str]:
     """Publish an adapter a backend just wrote into the interchange dir.
 
@@ -72,7 +104,7 @@ def export_hf_adapter(src_dir: str, checkpoint_root: str) -> Optional[str]:
     tmp = dest + ".tmp"
     shutil.rmtree(tmp, ignore_errors=True)
     os.makedirs(tmp, exist_ok=True)
-    shutil.copy2(weights_src, os.path.join(tmp, ADAPTER_WEIGHTS_FILE))
+    _write_peft_keyed(weights_src, os.path.join(tmp, ADAPTER_WEIGHTS_FILE))
 
     config_src = os.path.join(src_dir, ADAPTER_CONFIG_FILE)
     if os.path.isfile(config_src):

@@ -11,6 +11,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import ray
@@ -27,13 +28,18 @@ logger = logging.getLogger(__name__)
 _ADAPTER_CHECKPOINT_BASE = os.path.join(CHECKPOINT_BASE, "adapters")
 
 
-def _adapter_save_dir(adapter_name: str) -> str:
+def _adapter_save_dir(adapter_name: str) -> Path:
     """Per-tenant dir miles writes adapter checkpoints into. Without it
-    (config.save=None) miles skips per-adapter checkpoints entirely."""
-    return os.path.join(_ADAPTER_CHECKPOINT_BASE, adapter_name)
+    (config.save=None) miles skips per-adapter checkpoints entirely.
+
+    Path, not str: TinkerAdapterConfig.save is annotated `str | Path | None`
+    but miles only ever does `config.save / "checkpoints"` — a str explodes
+    at adapter registration (declared type wider than the honored one).
+    """
+    return Path(_ADAPTER_CHECKPOINT_BASE) / adapter_name
 
 
-def _publish_adapter(adapter_save_dir: str, checkpoint_path: str, adapter_name: Optional[str]) -> None:
+def _publish_adapter(adapter_save_dir: Path, checkpoint_path: str, adapter_name: Optional[str]) -> None:
     """Copy the newest per-adapter HF PEFT pair miles wrote into the
     cross-backend interchange dir (specs/007 §2.1)."""
     ckpt_root = os.path.join(adapter_save_dir, "checkpoints")
@@ -88,7 +94,7 @@ class MilesHandle(BackendHandle):
     adapter_slot: Optional[int] = None
     # Where miles writes this adapter's per-step checkpoints (Megatron shard +
     # HF PEFT pair); source of the cross-backend interchange export.
-    adapter_save_dir: Optional[str] = None
+    adapter_save_dir: Optional[Path] = None
     # Weight version = successful optim steps applied. Sampler registration
     # snapshots it (routers/checkpoints.py) so a sampler saved before any
     # step pins v0. v0 == base model only for fresh-init LoRA (B=0 at init),
@@ -1018,12 +1024,20 @@ class MilesBackend(TrainingBackend):
                 logger.info("Skipping save_model (offload_train=True)")
                 return checkpoint_path
 
-            # Pool mode: save_due_adapter_checkpoints gates on
-            # step % save_interval == 0, so interval 1 makes the CLIENT's
-            # save_state the trigger (a save_state at step 0 still writes
-            # nothing — miles skips adapters that never stepped).
-            if h.adapter_slot is not None and h.args is not None:
-                h.args.save_interval = 1
+            # Pool mode: save_due_adapter_checkpoints only writes adapters with
+            # registry step > 0 at a save-interval multiple (interval is 1 at
+            # pool boot, slime_builder). The registry step is miles' own
+            # training-loop counter and nothing advances it here — the CLIENT
+            # owns the loop — so publish our weight version (= applied optimizer
+            # steps) as the step this checkpoint represents.
+            if h.adapter_slot is not None and h.controller is not None:
+                if h.weight_version <= 0:
+                    logger.info(
+                        "Adapter %s has taken no optimizer step; nothing to checkpoint",
+                        h.adapter_name,
+                    )
+                    return checkpoint_path
+                await h.controller.set_adapter_step.remote(h.adapter_name, h.weight_version)
 
             await h.train_group.save_model(step_id if step_id is not None else 0)
 
