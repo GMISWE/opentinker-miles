@@ -17,6 +17,13 @@ rotate the server between runs (models are not auto-reaped).
 | `g5_pinned_v0.py` | G5 pinned-v0 + sampler routing | v0 sampler == base, bit-stable across training; live != base; per-tenant routing (B live == base while A live differs) |
 | `g6_batch_invariance.py` | G6 batch-invariance (M3, AC1) | same tenant data solo vs co-batched with different co-tenant mixes ⇒ bit-identical per-tenant grad_norm + logprobs (needs `TINKERCLOUD_MILES_COBATCH_MAX_SAMPLES>=16`) |
 
+| `g9_adapter_interchange.py` | G9a adapter round-trip / G9b seam continuity | `export`: exported `hf_adapter/` reproduces the training engine's logprobs under fp32 HF+peft (corr > 0.999, gap < 0.03 nats). `import`: a model created FROM that checkpoint on another backend matches the source's logprobs on the same frozen probe batch |
+
+G9 is the Q5 migration seam gate (specs/007-q5-migration). Run `export` on
+the source pod, `kubectl cp` `/data/checkpoints/<run_id>/<name>` to the
+destination pod at the same path, then run `import` there with the
+exporter's JSON as `--reference`.
+
 G4/G5 need a pool-mode server (`TINKERCLOUD_MILES_MULTILORA_SLOTS>0`). The
 per-tenant E₂ gate is two `g3_sl_basic.py` runs launched concurrently
 against the same pool-mode server (each creates its own tenant).

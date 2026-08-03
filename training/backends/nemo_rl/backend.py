@@ -18,6 +18,11 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ..base import BackendError, BackendHandle, TrainingBackend
+from ..checkpoint_interchange import (
+    export_hf_adapter,
+    resolve_checkpoint_root,
+    stage_hf_adapter,
+)
 
 if TYPE_CHECKING:
     from .generation import NemoRLBatchAccumulator
@@ -134,10 +139,19 @@ class NemoRLBackend(TrainingBackend):
             )
             logger.info("[%s] NeMo RL config built, hf_path=%s", request_id, hf_path)
 
+            # Policy(weights_path=...) goes straight to the checkpoint
+            # manager's load_checkpoint, so it needs the resolved <root>/weights
+            # dir — not the tinker:// URI — and a foreign adapter staged into
+            # the layout that loader sniffs.
+            init_weights_path = (
+                _stage_foreign_adapter(_resolve_checkpoint_path(checkpoint_path))
+                if checkpoint_path else None
+            )
+
             policy, policy_generation, cluster, tokenizer, loss_fn = await asyncio.to_thread(
                 _init_nemo_rl_components,
                 config_dict=config_dict,
-                checkpoint_path=checkpoint_path,
+                checkpoint_path=init_weights_path,
                 debug_train_only=debug_train_only,
             )
 
@@ -621,6 +635,12 @@ class NemoRLBackend(TrainingBackend):
                 checkpointing_cfg=checkpointing_cfg,
             )
 
+            # LoRA runs write the PEFT pair under <weights>/model; publish it
+            # as the cross-backend interchange artifact (specs/007 §2.1).
+            await asyncio.to_thread(
+                export_hf_adapter, f"{weights_path}/model", local_path,
+            )
+
             logger.info("NeMo RL checkpoint saved to %s", local_path)
             return checkpoint_path  # Return original URI for metadata consistency
 
@@ -640,7 +660,7 @@ class NemoRLBackend(TrainingBackend):
         h: NemoRLHandle = handle  # type: ignore[assignment]
         try:
             local_path = _resolve_checkpoint_path(checkpoint_path)
-            weights_path = f"{local_path}/weights"
+            weights_path = _stage_foreign_adapter(local_path)
             optimizer_path = f"{local_path}/optimizer"
             # Only load optimizer state if it exists (checkpoint may be weights-only)
             if not os.path.exists(optimizer_path):
@@ -897,27 +917,19 @@ async def _ensure_generation_ready(handle) -> None:
 # Internal helper functions (called via asyncio.to_thread)
 # ---------------------------------------------------------------------------
 
-_CHECKPOINT_BASE = "/data/checkpoints"
-
-
 def _resolve_checkpoint_path(path: str) -> str:
-    """Convert tinker:// URI to local filesystem path.
+    """tinker://<run_id>/weights/<name> -> /data/checkpoints/<run_id>/<name>."""
+    return resolve_checkpoint_root(path, create=True)
 
-    checkpoint_service generates: tinker://<run_id>/weights/<name>
-    We map this to: /data/checkpoints/<run_id>/<name>
 
-    Plain filesystem paths are returned as-is.
-    """
-    if path.startswith("tinker://"):
-        parts = path[len("tinker://"):].split("/")
-        # parts: [model_id, "weights", checkpoint_name]
-        run_id = parts[0]
-        name = parts[-1] if len(parts) > 2 else "default"
-        import os
-        local = os.path.join(_CHECKPOINT_BASE, run_id, name)
-        os.makedirs(local, exist_ok=True)
-        return local
-    return path
+def _stage_foreign_adapter(local_path: str) -> str:
+    """Return the weights_path to load, materializing an interchange adapter
+    written by ANOTHER backend into the layout automodel's loader sniffs
+    (<weights>/model/adapter_model.safetensors). No-op for our own saves."""
+    weights_path = f"{local_path}/weights"
+    stage_hf_adapter(local_path, f"{weights_path}/model")
+    return weights_path
+
 
 def _init_nemo_rl_components(
     config_dict: Dict[str, Any],
