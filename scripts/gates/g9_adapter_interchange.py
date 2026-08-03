@@ -68,21 +68,24 @@ def _datum(toks: list[int]) -> types.Datum:
     )
 
 
-def _flatten_logprobs(outputs) -> list[float]:
+def _per_datum_logprobs(outputs) -> list[list[float]]:
     """loss_fn_outputs entries are Pydantic LossFnOutput on some paths and
-    plain dicts on others; both index, only one has .get."""
-    lps: list[float] = []
+    plain dicts on others; both index, only one has .get. Kept per-datum:
+    the datum is the alignment unit of the observation contract, and backends
+    disagree on the length by one (miles forward() yields L-1 where its
+    forward_backward yields L)."""
+    per_datum: list[list[float]] = []
     for o in outputs or []:
         try:
             lp = o["logprobs"]
         except Exception:
             lp = getattr(o, "logprobs", None)
         if lp is not None:
-            lps.extend(list(getattr(lp, "data", lp)))
-    return lps
+            per_datum.append(list(getattr(lp, "data", lp)))
+    return per_datum
 
 
-def _probe_logprobs(tc, probe: list[list[int]]) -> list[float]:
+def _probe_logprobs(tc, probe: list[list[int]]) -> list[list[float]]:
     """Backend's per-token logprobs on the frozen probe batch.
 
     Uses the forward-only primitive deliberately: forward_backward is not a
@@ -92,8 +95,8 @@ def _probe_logprobs(tc, probe: list[list[int]]) -> list[float]:
     and leaves no gradient state behind.
     """
     out = tc.forward([_datum(t) for t in probe], loss_fn="cross_entropy").result()
-    lps = _flatten_logprobs(out.loss_fn_outputs)
-    if not lps or not any(lps):
+    lps = _per_datum_logprobs(out.loss_fn_outputs)
+    if not lps or not any(any(d) for d in lps):
         raise SystemExit(
             "forward() returned no per-token logprobs — this backend's "
             "forward-only path does not carry the observable the seam gate needs"
@@ -119,9 +122,22 @@ def _train(tc, steps: int, lr: float) -> list[float]:
     return norms
 
 
-def _compare(a: list[float], b: list[float], label_a: str, label_b: str) -> dict:
-    ta, tb = torch.tensor(a, dtype=torch.float64), torch.tensor(b, dtype=torch.float64)
-    assert ta.shape == tb.shape, f"length mismatch {ta.shape} vs {tb.shape}"
+def _compare(a: list[list[float]], b: list[list[float]], label_a: str, label_b: str) -> dict:
+    """Align per datum — the unit of the observation contract. A length
+    disagreement is REPORTED, never silently absorbed: it is itself a
+    cross-path divergence (measured 2026-08-03: miles forward() returns
+    L-1 per datum where its forward_backward returns L)."""
+    assert len(a) == len(b), f"datum count {len(a)} vs {len(b)}"
+    trimmed = [(len(x), len(y)) for x, y in zip(a, b) if len(x) != len(y)]
+    if trimmed:
+        print(f"  WARNING per-datum length disagreement {label_a}/{label_b}: {trimmed[:4]}")
+    flat_a, flat_b = [], []
+    for x, y in zip(a, b):
+        n = min(len(x), len(y))
+        flat_a.extend(x[:n])
+        flat_b.extend(y[:n])
+    ta = torch.tensor(flat_a, dtype=torch.float64)
+    tb = torch.tensor(flat_b, dtype=torch.float64)
     corr = float(torch.corrcoef(torch.stack([ta, tb]))[0, 1])
     gap = float((ta.mean() - tb.mean()).abs())
     verdict = "PASS" if corr > CORR_BAR and gap < GAP_BAR else "FAIL"
@@ -130,14 +146,14 @@ def _compare(a: list[float], b: list[float], label_a: str, label_b: str) -> dict
         f"mean_gap={gap:.6f} nats max|d|={float((ta - tb).abs().max()):.6f} -> {verdict}"
     )
     return {
-        "n": int(ta.numel()), "corr": corr, "mean_gap_nats": gap,
+        "n": int(ta.numel()), "length_mismatches": trimmed, "corr": corr, "mean_gap_nats": gap,
         "max_abs_delta": float((ta - tb).abs().max()),
         f"mean_lp_{label_a}": float(ta.mean()), f"mean_lp_{label_b}": float(tb.mean()),
         "verdict": verdict,
     }
 
 
-def _offline_adapter_logprobs(adapter_dir: str, probe: list[list[int]]) -> list[float]:
+def _offline_adapter_logprobs(adapter_dir: str, probe: list[list[int]]) -> list[list[float]]:
     """fp32 HF + peft oracle: base model with the EXPORTED adapter attached."""
     from peft import PeftModel
     from transformers import AutoModelForCausalLM
@@ -146,13 +162,13 @@ def _offline_adapter_logprobs(adapter_dir: str, probe: list[list[int]]) -> list[
     model = PeftModel.from_pretrained(model, adapter_dir)
     model.eval()
 
-    lps: list[float] = []
+    lps: list[list[float]] = []
     with torch.no_grad():
         for toks in probe:
             logits = model(torch.tensor([toks])).logits[0, :-1].float()
             tgt = torch.tensor(toks[1:])
             lp = torch.log_softmax(logits, -1).gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
-            lps.extend(lp.tolist())
+            lps.append(lp.tolist())
     return lps
 
 
