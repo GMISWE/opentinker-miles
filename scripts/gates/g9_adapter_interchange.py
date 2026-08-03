@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""G9: cross-backend LoRA adapter interchange gates (Q5 migration seams).
+
+Two modes, both against a live TinkerCloud server plus a local fp32 HF oracle:
+
+  export  train N steps, snapshot the observable on a frozen probe batch,
+          save_state, then load the PUBLISHED hf_adapter/ into plain
+          HF+peft (fp32) and compare logprobs.
+          -> **G9a adapter round-trip fidelity**: does the exported adapter
+          reproduce the training engine's own distribution? Independently
+          checks rank slicing, alpha scaling, target-module coverage and
+          state-dict key naming (specs/007 §3 open risk (a)).
+
+  import  create a model FROM that checkpoint on a second backend, run the
+          same frozen probe batch, and compare to the exporter's JSON.
+          -> **G9b seam continuity**: the quantity the Q5 figure rests on.
+
+PASS bar: E1 (corr > 0.999 and |mean logprob gap| < 0.03 nats) — the
+cross-engine envelope measured in 006 (G_lp 0.004, G8a 0.031).
+
+Usage:
+  python3 -B scripts/gates/g9_adapter_interchange.py export \
+      --steps 3 --name g9-seam --out /data/g9_export_<backend>.json
+  # kubectl cp /data/checkpoints/<run_id>/<name> to the destination pod
+  python3 -B scripts/gates/g9_adapter_interchange.py import \
+      --resume tinker://<run_id>/weights/g9-seam \
+      --reference /data/g9_export_<backend>.json --out /data/g9_import_<backend>.json
+"""
+import argparse
+import json
+import os
+import sys
+
+os.environ.setdefault("TINKER_BASE_URL", "http://localhost:8000")
+os.environ.setdefault("TINKER_API_KEY", "tml-dev-key")
+
+import torch
+
+import tinker
+from tinker import types
+
+BASE_MODEL = os.environ.get("G9_BASE_MODEL", "Qwen/Qwen2.5-0.5B")
+RANK = int(os.environ.get("G9_RANK", "32"))
+SEQ = 64
+N_TRAIN = 4          # datums per training step
+PROBE_SEED = 20260803
+CORR_BAR, GAP_BAR = 0.999, 0.03
+
+
+def _tokens(seed: int, n: int, length: int) -> list[list[int]]:
+    """Deterministic token batches — identical on every backend and in the
+    offline oracle (no cookbook/dataset dependency in the seam gate)."""
+    g = torch.Generator().manual_seed(seed)
+    return torch.randint(100, 40000, (n, length), generator=g).tolist()
+
+
+def _datum(toks: list[int]) -> types.Datum:
+    inp, tgt = toks[:-1], toks[1:]
+    return types.Datum(
+        model_input=types.ModelInput.from_ints(inp),
+        loss_fn_inputs={
+            "weights": types.TensorData.from_torch(torch.ones(len(inp), dtype=torch.float32)),
+            "target_tokens": types.TensorData.from_torch(torch.tensor(tgt, dtype=torch.long)),
+        },
+    )
+
+
+def _probe_logprobs(tc, probe: list[list[int]]) -> list[float]:
+    """Backend's per-token logprobs on the frozen probe batch. forward_backward
+    accumulates grads but applies nothing — the observable is read-only as long
+    as no optim_step follows before the snapshot is taken."""
+    out = tc.forward_backward([_datum(t) for t in probe], loss_fn="cross_entropy").result()
+    lps: list[float] = []
+    for o in out.loss_fn_outputs:
+        lps.extend(list(o["logprobs"].data))
+    return lps
+
+
+def _train(tc, steps: int, lr: float) -> list[float]:
+    """Move the adapter off its B=0 init so the export carries real weights."""
+    norms = []
+    for step in range(steps):
+        batch = _tokens(PROBE_SEED + 1000 + step, N_TRAIN, SEQ)
+        fb = tc.forward_backward([_datum(t) for t in batch], loss_fn="cross_entropy")
+        st = tc.optim_step(types.AdamParams(learning_rate=lr))
+        fb.result()
+        res = st.result()
+        gn = getattr(res, "grad_norm", None)
+        norms.append(float(gn) if gn is not None else float("nan"))
+        print(f"  step {step}: grad_norm={norms[-1]}")
+    return norms
+
+
+def _compare(a: list[float], b: list[float], label_a: str, label_b: str) -> dict:
+    ta, tb = torch.tensor(a, dtype=torch.float64), torch.tensor(b, dtype=torch.float64)
+    assert ta.shape == tb.shape, f"length mismatch {ta.shape} vs {tb.shape}"
+    corr = float(torch.corrcoef(torch.stack([ta, tb]))[0, 1])
+    gap = float((ta.mean() - tb.mean()).abs())
+    verdict = "PASS" if corr > CORR_BAR and gap < GAP_BAR else "FAIL"
+    print(
+        f"{label_a} vs {label_b}: n={ta.numel()} corr={corr:.6f} "
+        f"mean_gap={gap:.6f} nats max|d|={float((ta - tb).abs().max()):.6f} -> {verdict}"
+    )
+    return {
+        "n": int(ta.numel()), "corr": corr, "mean_gap_nats": gap,
+        "max_abs_delta": float((ta - tb).abs().max()),
+        f"mean_lp_{label_a}": float(ta.mean()), f"mean_lp_{label_b}": float(tb.mean()),
+        "verdict": verdict,
+    }
+
+
+def _offline_adapter_logprobs(adapter_dir: str, probe: list[list[int]]) -> list[float]:
+    """fp32 HF + peft oracle: base model with the EXPORTED adapter attached."""
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype=torch.float32)
+    model = PeftModel.from_pretrained(model, adapter_dir)
+    model.eval()
+
+    lps: list[float] = []
+    with torch.no_grad():
+        for toks in probe:
+            logits = model(torch.tensor([toks])).logits[0, :-1].float()
+            tgt = torch.tensor(toks[1:])
+            lp = torch.log_softmax(logits, -1).gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+            lps.extend(lp.tolist())
+    return lps
+
+
+def _resolve_local(path: str) -> str:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+    from training.backends.checkpoint_interchange import find_hf_adapter, resolve_checkpoint_root
+
+    root = resolve_checkpoint_root(path)
+    adapter = find_hf_adapter(root)
+    if adapter is None:
+        raise SystemExit(
+            f"G9a FAIL: no hf_adapter/ under {root} — this backend published no "
+            f"interchange artifact, so the checkpoint cannot migrate."
+        )
+    return adapter
+
+
+def run_export(args) -> dict:
+    probe = _tokens(PROBE_SEED, N_TRAIN, SEQ)
+    sc = tinker.ServiceClient()
+    tc = sc.create_lora_training_client(base_model=BASE_MODEL, rank=RANK)
+
+    print(f"training {args.steps} steps (lr={args.lr})")
+    norms = _train(tc, args.steps, args.lr)
+
+    lp_backend = _probe_logprobs(tc, probe)
+    saved = tc.save_state(args.name).result()
+    path = getattr(saved, "path", None) or args.name
+    print(f"saved: {path}")
+
+    adapter_dir = _resolve_local(path)
+    print(f"interchange adapter: {adapter_dir}")
+    with open(os.path.join(adapter_dir, "adapter_config.json")) as f:
+        adapter_cfg = json.load(f)
+    print(f"adapter_config: r={adapter_cfg.get('r')} alpha={adapter_cfg.get('lora_alpha')}")
+
+    lp_oracle = _offline_adapter_logprobs(adapter_dir, probe)
+    g9a = _compare(lp_backend, lp_oracle, "backend", "hf_peft_oracle")
+
+    return {
+        "gate": "G9a_adapter_roundtrip", "mode": "export",
+        "base_model": BASE_MODEL, "rank": RANK, "steps": args.steps, "lr": args.lr,
+        "checkpoint_path": path, "adapter_dir": adapter_dir, "adapter_config": adapter_cfg,
+        "grad_norms": norms, "probe_seed": PROBE_SEED,
+        "logprobs_backend": lp_backend, "result": g9a,
+    }
+
+
+def run_import(args) -> dict:
+    probe = _tokens(PROBE_SEED, N_TRAIN, SEQ)
+    with open(args.reference) as f:
+        ref = json.load(f)
+
+    sc = tinker.ServiceClient()
+    tc = sc.create_lora_training_client(
+        base_model=ref["base_model"], rank=ref["rank"], checkpoint_path=args.resume,
+    )
+    lp_dest = _probe_logprobs(tc, probe)
+
+    g9b = _compare(ref["logprobs_backend"], lp_dest, "source_backend", "dest_backend")
+    return {
+        "gate": "G9b_seam_continuity", "mode": "import",
+        "base_model": ref["base_model"], "rank": ref["rank"],
+        "resume_path": args.resume, "reference": args.reference,
+        "source_checkpoint": ref.get("checkpoint_path"),
+        "logprobs_backend": lp_dest, "result": g9b,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("mode", choices=["export", "import"])
+    ap.add_argument("--steps", type=int, default=3)
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--name", default="g9-seam")
+    ap.add_argument("--resume")
+    ap.add_argument("--reference")
+    ap.add_argument("--out")
+    args = ap.parse_args()
+
+    if args.mode == "import" and not (args.resume and args.reference):
+        ap.error("import mode needs --resume and --reference")
+
+    result = run_export(args) if args.mode == "export" else run_import(args)
+
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(result, f, indent=2)
+        print(f"wrote {args.out}")
+    print(f"{result['gate']}: {result['result']['verdict']}")
+    return 0 if result["result"]["verdict"] == "PASS" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

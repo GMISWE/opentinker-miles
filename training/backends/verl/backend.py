@@ -26,6 +26,12 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from ..base import BackendError, BackendHandle, TrainingBackend, UnsupportedFeatureError
+from ..checkpoint_interchange import (
+    HF_ADAPTER_DIRNAME,
+    find_hf_adapter,
+    read_adapter_config,
+    resolve_checkpoint_root,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +124,19 @@ class VerlBackend(TrainingBackend):
                 parallelism=parallelism, rl_config=rl_config,
                 rollout_config=rollout_config, max_seq_len=max_seq_len,
             )
+
+            # A checkpoint carrying an interchange adapter (written by another
+            # backend, or by us) is attached at model build time — verl's PEFT
+            # path wraps the module BEFORE FSDP, so it cannot be a post-boot
+            # load_checkpoint. Native verl shards still resume that way.
+            adapter_dir = None
+            if checkpoint_path:
+                ckpt_root = resolve_checkpoint_root(checkpoint_path)
+                adapter_dir = find_hf_adapter(ckpt_root)
+                if adapter_dir:
+                    cfg["model"]["lora_adapter_path"] = adapter_dir
+                    _adopt_adapter_shape(ckpt_root, cfg["model"])
+
             enable_rollout = not debug_train_only
             boot = await asyncio.to_thread(
                 _boot_worker_group, cfg, model_id, enable_rollout,
@@ -140,11 +159,11 @@ class VerlBackend(TrainingBackend):
                 rollout_synced_version=0 if enable_rollout else -1,
                 lora_rank=int(cfg["model"]["lora_rank"] or 0),
             )
-            if checkpoint_path:
+            if checkpoint_path and adapter_dir is None:
                 await self.load_checkpoint(handle, checkpoint_path)
             logger.info(
-                "[%s] verl model %s created (dp=%d, rollout=%s)",
-                request_id, model_id, handle.dp_size, enable_rollout,
+                "[%s] verl model %s created (dp=%d, rollout=%s, adapter=%s)",
+                request_id, model_id, handle.dp_size, enable_rollout, adapter_dir,
             )
             return handle
         except BackendError:
@@ -277,9 +296,19 @@ class VerlBackend(TrainingBackend):
         async with h._lock:
             try:
                 await self._quiesce_samplers(h)
+                local_path = resolve_checkpoint_root(checkpoint_path, create=True)
                 await asyncio.to_thread(
-                    h.worker_group.save_checkpoint, checkpoint_path, None, step_id or h.weight_version,
+                    h.worker_group.save_checkpoint, local_path, None, step_id or h.weight_version,
                 )
+                if h.lora_rank > 0:
+                    # verl writes FSDP-sharded .pt only; no PEFT export path
+                    # yet (specs/007 §3.5) — say so rather than leaving a
+                    # silently unmigratable checkpoint behind.
+                    logger.warning(
+                        "verl checkpoint %s has no %s/ (verl PEFT export unimplemented): "
+                        "usable for verl resume, not for cross-backend migration",
+                        local_path, HF_ADAPTER_DIRNAME,
+                    )
                 return checkpoint_path
             except Exception as e:
                 raise BackendError(str(e), backend="verl", operation="save_checkpoint", original_error=e) from e
@@ -289,7 +318,16 @@ class VerlBackend(TrainingBackend):
         async with h._lock:
             try:
                 await self._quiesce_samplers(h)
-                await asyncio.to_thread(h.worker_group.load_checkpoint, checkpoint_path)
+                local_path = resolve_checkpoint_root(checkpoint_path)
+                if find_hf_adapter(local_path):
+                    # PeftModel.from_pretrained wraps pre-FSDP: only create_model
+                    # can attach an interchange adapter.
+                    raise BackendError(
+                        "verl imports an interchange adapter at create_model "
+                        "(lora_adapter_path), not via load_checkpoint",
+                        backend="verl", operation="load_checkpoint",
+                    )
+                await asyncio.to_thread(h.worker_group.load_checkpoint, local_path)
             except Exception as e:
                 raise BackendError(str(e), backend="verl", operation="load_checkpoint", original_error=e) from e
 
@@ -589,6 +627,33 @@ def _to_vllm_sampling_params(sampling_params: Optional[Dict[str, Any]]) -> Dict[
     return out
 
 
+def _adopt_adapter_shape(checkpoint_root: str, model_cfg: Dict[str, Any]) -> None:
+    """Adopt the interchange adapter's r/alpha over the request's.
+
+    PeftModel.from_pretrained honors adapter_config.json, but verl's rollout
+    LoRA plumbing reads model.lora_rank/lora_alpha — leaving them disagreeing
+    changes the effective alpha/r scaling on one side only (silent rescale at
+    the migration seam; specs/007 §1.3).
+    """
+    cfg = read_adapter_config(checkpoint_root)
+    if not cfg:
+        logger.warning(
+            "Interchange adapter at %s has no adapter_config.json; keeping requested "
+            "rank=%s alpha=%s", checkpoint_root, model_cfg.get("lora_rank"), model_cfg.get("lora_alpha"),
+        )
+        return
+    for key, cfg_key in (("lora_rank", "r"), ("lora_alpha", "lora_alpha")):
+        want = cfg.get(cfg_key)
+        if want is None:
+            continue
+        have = model_cfg.get(key)
+        if have != want:
+            logger.warning(
+                "Interchange adapter %s=%s overrides requested %s=%s", cfg_key, want, key, have,
+            )
+            model_cfg[key] = want
+
+
 def _compose_actor_rollout_config(cfg: Dict[str, Any]):
     """Assemble a trainer-shaped OmegaConf for ActorRolloutRefWorker +
     LLMServerManager from verl's packaged ppo_trainer defaults."""
@@ -614,6 +679,10 @@ def _compose_actor_rollout_config(cfg: Dict[str, Any]):
         f"actor_rollout_ref.model.lora_rank={model['lora_rank']}",
         f"actor_rollout_ref.model.lora_alpha={model['lora_alpha']}",
         f"actor_rollout_ref.model.target_modules={tm_override}",
+        *(
+            [f"actor_rollout_ref.model.lora_adapter_path={model['lora_adapter_path']}"]
+            if model.get("lora_adapter_path") else []
+        ),
         f"actor_rollout_ref.actor.strategy={engine['strategy']}",
         f"actor_rollout_ref.actor.ulysses_sequence_parallel_size={engine['ulysses_sequence_parallel_size']}",
         f"actor_rollout_ref.actor.use_dynamic_bsz={engine['use_dynamic_bsz']}",
@@ -738,6 +807,7 @@ def _boot_worker_group(cfg: Dict[str, Any], model_id: str, enable_rollout: bool 
         lora_rank=model["lora_rank"],
         lora_alpha=model["lora_alpha"],
         target_modules=model["target_modules"],
+        lora_adapter_path=model.get("lora_adapter_path"),
     )
     engine_config = FSDPEngineConfig(
         forward_only=False,

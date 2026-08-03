@@ -16,8 +16,38 @@ from typing import Any, Dict, List, Optional
 import ray
 
 from ..base import BackendError, BackendHandle, TrainingBackend
+from ..checkpoint_interchange import (
+    CHECKPOINT_BASE,
+    export_hf_adapter,
+    resolve_checkpoint_root,
+)
 
 logger = logging.getLogger(__name__)
+
+_ADAPTER_CHECKPOINT_BASE = os.path.join(CHECKPOINT_BASE, "adapters")
+
+
+def _adapter_save_dir(adapter_name: str) -> str:
+    """Per-tenant dir miles writes adapter checkpoints into. Without it
+    (config.save=None) miles skips per-adapter checkpoints entirely."""
+    return os.path.join(_ADAPTER_CHECKPOINT_BASE, adapter_name)
+
+
+def _publish_adapter(adapter_save_dir: str, checkpoint_path: str, adapter_name: Optional[str]) -> None:
+    """Copy the newest per-adapter HF PEFT pair miles wrote into the
+    cross-backend interchange dir (specs/007 §2.1)."""
+    ckpt_root = os.path.join(adapter_save_dir, "checkpoints")
+    if not os.path.isdir(ckpt_root):
+        logger.warning("Adapter %s: no checkpoints under %s to publish", adapter_name, ckpt_root)
+        return
+    steps = [d for d in os.listdir(ckpt_root) if d.startswith("step_") and d[5:].isdigit()]
+    if not steps:
+        logger.warning("Adapter %s: no step_* checkpoint in %s", adapter_name, ckpt_root)
+        return
+    latest = max(steps, key=lambda d: int(d[5:]))
+    export_hf_adapter(
+        os.path.join(ckpt_root, latest), resolve_checkpoint_root(checkpoint_path, create=True),
+    )
 
 
 def _model_input_lens(data: List[Any]) -> List[int]:
@@ -56,6 +86,9 @@ class MilesHandle(BackendHandle):
     controller: Any = None            # MultiLoRAController (named Ray actor)
     adapter_name: Optional[str] = None
     adapter_slot: Optional[int] = None
+    # Where miles writes this adapter's per-step checkpoints (Megatron shard +
+    # HF PEFT pair); source of the cross-backend interchange export.
+    adapter_save_dir: Optional[str] = None
     # Weight version = successful optim steps applied. Sampler registration
     # snapshots it (routers/checkpoints.py) so a sampler saved before any
     # step pins v0. v0 == base model only for fresh-init LoRA (B=0 at init),
@@ -240,9 +273,11 @@ class MilesBackend(TrainingBackend):
         rank = int(lora_config.get("rank", 0))
         alpha = int(lora_config.get("alpha") or rank)
         adapter_name = re.sub(r"[^A-Za-z0-9._-]", "-", model_id)
+        adapter_save_dir = _adapter_save_dir(adapter_name)
         try:
             registration = await pool.controller.register_adapter.remote(
-                adapter_name, TinkerAdapterConfig(rank=rank, alpha=alpha)
+                adapter_name,
+                TinkerAdapterConfig(rank=rank, alpha=alpha, save=adapter_save_dir),
             )
         except Exception as e:
             # Registry errors (slots full, name colliding/cleaning-up,
@@ -297,6 +332,7 @@ class MilesBackend(TrainingBackend):
             controller=pool.controller,
             adapter_name=adapter_name,
             adapter_slot=adapter_slot,
+            adapter_save_dir=adapter_save_dir,
             lock=pool.lock,
         )
 
@@ -378,6 +414,7 @@ class MilesBackend(TrainingBackend):
             controller = None
             adapter_name = None
             adapter_slot = None
+            adapter_save_dir = None
             if multi_lora:
                 # Mirror the upstream driver boot: router -> controller
                 # (named actor; reconcile on the actors resolves it by name).
@@ -393,9 +430,12 @@ class MilesBackend(TrainingBackend):
                 await controller.start.remote()
 
                 adapter_name = re.sub(r"[^A-Za-z0-9._-]", "-", model_id)
+                adapter_save_dir = _adapter_save_dir(adapter_name)
                 registration = await controller.register_adapter.remote(
                     adapter_name,
-                    TinkerAdapterConfig(rank=args.lora_rank, alpha=args.lora_alpha),
+                    TinkerAdapterConfig(
+                        rank=args.lora_rank, alpha=args.lora_alpha, save=adapter_save_dir,
+                    ),
                 )
                 adapter_slot = registration["slot"]
                 logger.info(
@@ -462,6 +502,7 @@ class MilesBackend(TrainingBackend):
                 controller=controller,
                 adapter_name=adapter_name,
                 adapter_slot=adapter_slot,
+                adapter_save_dir=adapter_save_dir,
                 created_from_checkpoint=bool(checkpoint_path),
             )
 
@@ -977,7 +1018,19 @@ class MilesBackend(TrainingBackend):
                 logger.info("Skipping save_model (offload_train=True)")
                 return checkpoint_path
 
+            # Pool mode: save_due_adapter_checkpoints gates on
+            # step % save_interval == 0, so interval 1 makes the CLIENT's
+            # save_state the trigger (a save_state at step 0 still writes
+            # nothing — miles skips adapters that never stepped).
+            if h.adapter_slot is not None and h.args is not None:
+                h.args.save_interval = 1
+
             await h.train_group.save_model(step_id if step_id is not None else 0)
+
+            if h.adapter_save_dir:
+                await asyncio.to_thread(
+                    _publish_adapter, h.adapter_save_dir, checkpoint_path, h.adapter_name,
+                )
             return checkpoint_path
 
         try:
