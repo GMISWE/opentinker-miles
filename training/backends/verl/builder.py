@@ -33,7 +33,11 @@ class VerlArgumentBuilder(ArgumentBuilder):
 
         # request payloads carry explicit None values — coalesce, don't .get()-default
         lora_rank = int(lora_config.get("rank") or lora_config.get("lora_rank") or 0)
+        # verl's structured config types lora_alpha as int (omegaconf rejects
+        # 32.0 at the vLLM server-side merge); keep integral alphas as int
         lora_alpha = float(lora_config.get("alpha") or lora_config.get("lora_alpha") or 32)
+        if lora_alpha.is_integer():
+            lora_alpha = int(lora_alpha)
         target_modules = lora_config.get("target_modules") or "all-linear"
 
         cfg: Dict[str, Any] = {
