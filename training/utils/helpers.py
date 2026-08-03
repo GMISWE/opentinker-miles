@@ -303,6 +303,10 @@ def find_model_with_rollout_manager(training_clients: Dict[str, Dict[str, Any]])
         if handle is not None and getattr(handle, "backend_type", None) == "nemo_rl":
             logger.debug(f"Found model with NemoRL backend: {model_id}")
             return model_id
+        # verl M2: handle carries its own rollout state (vLLM server replicas)
+        if handle is not None and getattr(handle, "has_rollout", False):
+            logger.debug(f"Found model with rollout-enabled handle: {model_id}")
+            return model_id
 
     logger.warning("No model with RolloutManager or NemoRL backend found")
     return None

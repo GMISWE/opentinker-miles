@@ -220,6 +220,9 @@ class SamplingParams(BaseModel):
     max_tokens: int = Field(default=256, ge=1, le=4096, description="Maximum tokens to generate")
     stop: Optional[List[str]] = Field(default=None, description="Stop sequences")
     stop_token_ids: Optional[List[int]] = Field(default=None, description="Stop token IDs")
+    # SDK SamplingParams carries seed; without this field pydantic silently
+    # drops it and seeded sampling is non-reproducible (found in verl M2 G8)
+    seed: Optional[int] = Field(default=None, description="Random seed for reproducible generation")
 
     @model_validator(mode="before")
     def convert_integer_stop_to_token_ids(cls, values):

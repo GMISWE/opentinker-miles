@@ -227,7 +227,7 @@ class VerlBackend(TrainingBackend):
         async with h._lock:
             try:
                 await asyncio.to_thread(self._ensure_training_ready, h)
-                td = await asyncio.to_thread(self._to_tensordict, h, data, "cross_entropy")
+                td = await asyncio.to_thread(self._to_tensordict, h, data, "cross_entropy", True)
                 from verl.utils import tensordict_utils as tu
                 tu.assign_non_tensor(td, compute_loss=False)
                 # rollout worker exposes the actor's infer path as compute_log_prob
@@ -350,10 +350,16 @@ class VerlBackend(TrainingBackend):
                 max_tokens = vllm_sp.get("max_tokens")
 
                 async def _one(i: int):
+                    sp_i = dict(vllm_sp)
+                    if sp_i.get("seed") is not None:
+                        # vLLM seeds per request; a fixed seed across the
+                        # num_samples fanout would return identical samples.
+                        # Derive per-sample seeds (deterministic across reruns).
+                        sp_i["seed"] = int(sp_i["seed"]) + i
                     out = await h.llm_client.generate(
                         f"{request_id}_{i}",
                         prompt_ids=list(prompt_tokens),
-                        sampling_params=dict(vllm_sp),
+                        sampling_params=sp_i,
                     )
                     return out
 
@@ -426,7 +432,7 @@ class VerlBackend(TrainingBackend):
         _ = get_loss_fn(loss_fn)  # validate name eagerly
         h.loss_fn_name = loss_fn
 
-    def _to_tensordict(self, h: VerlHandle, data: List[Dict], loss_fn: str):
+    def _to_tensordict(self, h: VerlHandle, data: List[Dict], loss_fn: str, infer: bool = False):
         from tensordict import TensorDict
         from verl.utils import tensordict_utils as tu
         from verl.workers.utils.padding import left_right_2_no_padding
@@ -435,8 +441,10 @@ class VerlBackend(TrainingBackend):
 
         # Divisibility: engine needs per-DP-rank count % micro_batch_size == 0.
         # Pad with zero-weight clones (pure-sum => zero grad, E0-safe)
-        # instead of rejecting or trimming.
-        micro_bs = int(h.config.get("engine", {}).get("micro_batch_size_per_gpu", 1) or 1)
+        # instead of rejecting or trimming. The infer path (compute_log_prob)
+        # partitions by infer_micro_batch_size_per_gpu, not the train one.
+        mb_key = "infer_micro_batch_size_per_gpu" if infer else "micro_batch_size_per_gpu"
+        micro_bs = int(h.config.get("engine", {}).get(mb_key, 1) or 1)
         multiple = h.dp_size * micro_bs
         b = padded["input_ids"].shape[0]
         remainder = b % multiple
@@ -475,9 +483,15 @@ def _loss_dispatch(config=None, model_output=None, data=None, dp_group=None, los
 
 
 def _wg_call(method, td):
-    """Blocking worker-group data call: resolve DataProtoFuture if non-blocking."""
+    """Blocking worker-group data call: resolve DataProtoFuture if non-blocking.
+
+    Blocking dispatches (e.g. compute_log_prob) return the TensorDict directly;
+    TensorDict also has .get(key), so type-check instead of duck-typing.
+    """
+    from tensordict import TensorDictBase
+
     out = method(td)
-    if hasattr(out, "get"):
+    if not isinstance(out, TensorDictBase) and hasattr(out, "get"):
         out = out.get()
     return out
 
@@ -524,8 +538,9 @@ def _to_vllm_sampling_params(sampling_params: Optional[Dict[str, Any]]) -> Dict[
         "logprobs": True,
     }
     top_k = sp.get("top_k")
-    if top_k not in (None, 0):
-        out["top_k"] = int(top_k)
+    # explicit -1 (disabled) when unset: never inherit engine/generation-config
+    # truncation the client didn't ask for
+    out["top_k"] = -1 if top_k in (None, 0, -1) else int(top_k)
     max_tokens = sp.get("max_tokens") or sp.get("max_new_tokens")
     if max_tokens:
         out["max_tokens"] = int(max_tokens)
@@ -584,6 +599,11 @@ def _compose_actor_rollout_config(cfg: Dict[str, Any]):
         f"actor_rollout_ref.rollout.enforce_eager={rollout['enforce_eager']}",
         "actor_rollout_ref.rollout.calculate_log_probs=True",
         "actor_rollout_ref.rollout.free_cache_engine=True",
+        # Tinker logprob provenance: sampler must report RAW model logprobs
+        # (training engine computes untempered); verl's default
+        # processed_logprobs returns post-processing renormalized values
+        # (measured ~1.3 nats off HF fp32 on Qwen2.5-0.5B, 2026-08-02)
+        "actor_rollout_ref.rollout.logprobs_mode=raw_logprobs",
         f"actor_rollout_ref.rollout.log_prob_use_dynamic_bsz={engine['use_dynamic_bsz']}",
         f"actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu={engine['infer_micro_batch_size_per_gpu']}",
         f"actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu={engine['infer_max_token_len_per_gpu']}",
@@ -626,23 +646,38 @@ def _boot_worker_group(cfg: Dict[str, Any], model_id: str, enable_rollout: bool 
             process_on_nodes=[cfg["num_gpus"]], name_prefix=f"verl_{model_id}",
         )
         wg = RayWorkerGroup(resource_pool=resource_pool, ray_cls_with_init=ray_cls)
-        wg.init_model()
+        try:
+            wg.init_model()
 
-        # KNOWN LIMIT: vLLM server actors are Ray-named per replica rank
-        # (manager doesn't thread name_suffix), so at most ONE rollout-enabled
-        # verl model per Ray cluster; a second create_model fails loudly on
-        # the actor name. delete_model frees the names.
-        llm_manager = LLMServerManager.create(config=full, worker_group=wg)
-        ckpt_manager = CheckpointEngineManager(
-            config=omega_conf_to_dataclass(full.actor_rollout_ref.rollout.checkpoint_engine),
-            actor_wg=wg,
-            replicas=llm_manager.get_replicas(),
-        )
-        # canonical boot order (agent-loop harness): sleep -> sync -> sleep;
-        # vLLM never serves dummy weights, training starts with GPUs free
-        ckpt_manager.sleep_replicas()
-        ckpt_manager.update_weights(global_steps=0)
-        ckpt_manager.sleep_replicas()
+            # KNOWN LIMIT: vLLM server actors are Ray-named per replica rank
+            # (manager doesn't thread name_suffix), so at most ONE rollout-enabled
+            # verl model per Ray cluster; a second create_model fails loudly on
+            # the actor name. delete_model frees the names.
+            llm_manager = LLMServerManager.create(config=full, worker_group=wg)
+            ckpt_manager = CheckpointEngineManager(
+                config=omega_conf_to_dataclass(full.actor_rollout_ref.rollout.checkpoint_engine),
+                actor_wg=wg,
+                replicas=llm_manager.get_replicas(),
+            )
+            # canonical boot order (agent-loop harness): sleep -> sync -> sleep;
+            # vLLM never serves dummy weights, training starts with GPUs free
+            ckpt_manager.sleep_replicas()
+            ckpt_manager.update_weights(global_steps=0)
+            ckpt_manager.sleep_replicas()
+        except Exception:
+            # boot failure must not leak live actors/PG: the next create_model
+            # would hang forever on placement-group resources (runbook footgun 2)
+            for w in getattr(wg, "workers", []) or []:
+                try:
+                    ray.kill(w)
+                except Exception:
+                    pass
+            for pg in getattr(resource_pool, "pgs", None) or []:
+                try:
+                    ray.util.remove_placement_group(pg)
+                except Exception:
+                    pass
+            raise
 
         sp = cfg["engine"]["ulysses_sequence_parallel_size"]
         dp_size = max(cfg["num_gpus"] // max(sp, 1), 1)
