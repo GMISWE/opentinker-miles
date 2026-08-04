@@ -58,24 +58,35 @@ class RequestValidator:
                 f"Suggestion: Send {self.dp_size}, {self.dp_size * 2}, or {self.dp_size * 4} samples."
             )
 
-        # Check 2: DP divisibility (samples must distribute evenly across DP workers)
+        # Check 2: DP divisibility. NOT waivable by allow_partial_batches.
+        #
+        # An indivisible batch does not merely run inefficiently -- it HANGS.
+        # Miles derives num_steps_per_rollout per rank from that rank's local
+        # sample count (miles data.py, "dynamic global_batch_size"), so an
+        # unbalanced split gives the ranks different micro-step counts and they
+        # deadlock on the per-step collective: every rank enters
+        # forward_backward_only, none returns, the future polls forever, and the
+        # actors stay wedged until the server restarts. Measured 2026-08-04 with
+        # 3 samples at dp=2 (rank0 num_steps=2, rank1 num_steps=1); see
+        # specs/008-q3-abstraction-tax/HANDOFF.md.
+        #
+        # ALLOW_PARTIAL_BATCHES previously waived this and logged that Miles
+        # "will rely on dynamic global batch scaling" -- it is exactly that
+        # scaling that diverges per rank. The flag still governs the genuinely
+        # partial cases below (global-batch-size and RL group alignment), where
+        # the consequence is normalization, not liveness.
         if num_samples % self.dp_size != 0:
-            if self.allow_partial_batches:
-                logger.warning(
-                    "ALLOW_PARTIAL_BATCHES enabled: proceeding with %s samples (dp=%s). "
-                    "Miles will rely on dynamic global batch scaling.",
-                    num_samples,
-                    self.dp_size,
-                )
-            else:
-                next_valid = ((num_samples // self.dp_size) + 1) * self.dp_size
-                prev_valid = (num_samples // self.dp_size) * self.dp_size
-                return (
-                    f"Invalid sample count: Received {num_samples} samples but "
-                    f"data parallel size is {self.dp_size}.\n"
-                    f"Required: Sample count must be divisible by {self.dp_size}.\n"
-                    f"Suggestion: Use {prev_valid} or {next_valid} samples instead."
-                )
+            next_valid = ((num_samples // self.dp_size) + 1) * self.dp_size
+            prev_valid = (num_samples // self.dp_size) * self.dp_size
+            return (
+                f"Invalid sample count: Received {num_samples} samples but "
+                f"data parallel size is {self.dp_size}.\n"
+                f"Required: Sample count must be divisible by {self.dp_size} -- "
+                f"an unbalanced split makes the DP ranks derive different "
+                f"micro-step counts and deadlock on the gradient collective, "
+                f"so this is rejected rather than attempted.\n"
+                f"Suggestion: Use {prev_valid} or {next_valid} samples instead."
+            )
 
         # Check 3: Global batch size divisibility
         if num_samples % self.global_batch_size != 0:
