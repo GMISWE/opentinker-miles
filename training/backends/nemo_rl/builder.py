@@ -164,10 +164,40 @@ class NemoRLArgumentBuilder(ArgumentBuilder):
             model_parallel = tp_size * pp_size * cp_size
             dp_size = max(1, num_gpus // model_parallel)
 
-        # GBS = samples per train() call; MBS=1 minimizes activation memory
-        # (NeMo RL convention); grad-accum steps = GBS / (MBS * DP) bridge the gap.
+        # GBS = samples per train() call; grad-accum steps = GBS / (MBS * DP)
+        # bridge the gap. MBS=1 (the old default) is a measured perf bug at
+        # scale (specs/013 A5: 128 sequential single-sequence micro-batches
+        # at global-pad width, 5.6x padding inflation, 103 s/step at 8B/TP2).
+        # Default is NeMo RL dynamic batching (length-sorted, token-budgeted,
+        # per-micro-batch length trim). The budget is a MEMORY constant, not
+        # max_seq_len: activations run ~9 MB/token at 8B/TP2 without
+        # checkpointing, so a budget that tracks a 32k context packs 32k-token
+        # micro-batches and OOMs an H200 (measured, A5 sweep). 8192 tokens
+        # (~74 GB at 8B/TP2) is the validated default; the backend raises it
+        # per-batch to the longest actual sample before each train/logprob
+        # call (backend._ensure_dyn_mb_budget), so a long sample degrades to
+        # exactly the old MBS=1 worst case instead of tripping NeMo RL's
+        # sample-exceeds-budget assert.
+        # NEMORL_TRAIN_MB_TOKENS: override base budget; 0 disables dynamic
+        # batching; NEMORL_TRAIN_MBS then sets the static micro-batch size.
         train_global_batch_size = max_batch_size
-        train_micro_batch_size = 1
+        train_micro_batch_size = int(os.environ.get("NEMORL_TRAIN_MBS", "1"))
+        dyn_env = os.environ.get("NEMORL_TRAIN_MB_TOKENS")
+        # VLMs keep the static path: dynamic batching's slice/truncate is
+        # unvalidated against multimodal kwargs (same conservatism as the
+        # sequence_packing/cp guards above).
+        dyn_default = 0 if is_vlm else min(max_seq_len, 8192)
+        dyn_mb_tokens = int(dyn_env) if dyn_env is not None else dyn_default
+        dynamic_batching_cfg = (
+            {
+                "enabled": True,
+                "train_mb_tokens": dyn_mb_tokens,
+                "logprob_mb_tokens": dyn_mb_tokens,
+                "sequence_length_round": 64,
+            }
+            if dyn_mb_tokens > 0
+            else {"enabled": False}
+        )
 
         # Policy config (maps to NeMo RL PolicyConfig TypedDict)
         policy_config = {
@@ -197,9 +227,7 @@ class NemoRLArgumentBuilder(ArgumentBuilder):
             "megatron_cfg": {
                 "enabled": False,
             },
-            "dynamic_batching": {
-                "enabled": False,
-            },
+            "dynamic_batching": dynamic_batching_cfg,
             "sequence_packing": {
                 "enabled": False,
             },

@@ -64,6 +64,7 @@ class NemoRLHandle(BackendHandle):
     ref_logprob_accumulator: Any = None  # Lazy _RefLogprobAccumulator (BUG-015)
     staleness_k: int = 0                 # Declared max sampler staleness (A4, specs/012)
     generation_synced_version: int = 0   # ver(S): weight version the inference engine holds
+    dyn_mb_base: int = 0                 # Base dynamic-batching token budget (A5, specs/013)
 
 
 class NemoRLBackend(TrainingBackend):
@@ -241,6 +242,7 @@ class NemoRLBackend(TrainingBackend):
             # in pipelined SFT. train vs eval mode gives identical logprobs (no dropout).
             await asyncio.to_thread(h.policy.prepare_for_training)
 
+            _ensure_dyn_mb_budget(h, batched_data)
             result = await asyncio.to_thread(h.policy.get_logprobs, batched_data)
 
             # No refit after forward(): read-only pass, inference weights already in
@@ -517,6 +519,7 @@ class NemoRLBackend(TrainingBackend):
                     if h.loss_fn_name != "cross_entropy" and "prev_logprobs" in all_data:
                         if h.staleness_k == 0:
                             logger.info("Computing prev_logprobs via DTensor forward pass (BUG-011)")
+                            _ensure_dyn_mb_budget(h, all_data)
                             logprob_result = await asyncio.to_thread(
                                 h.policy.get_logprobs, all_data,
                             )
@@ -542,6 +545,7 @@ class NemoRLBackend(TrainingBackend):
 
                     # Pass gbs=actual size so NeMo RL shards correctly instead of
                     # defaulting to config train_global_batch_size.
+                    _ensure_dyn_mb_budget(h, all_data)
                     train_result = await asyncio.to_thread(
                         h.policy.train,
                         data=all_data,
@@ -906,6 +910,7 @@ class NemoRLBackend(TrainingBackend):
             if h.policy_generation is not None and h.colocated_inference:
                 await asyncio.to_thread(h.policy_generation.finish_generation)
             await asyncio.to_thread(h.policy.prepare_for_training)
+            _ensure_dyn_mb_budget(h, data)
             out = await asyncio.to_thread(h.policy.get_reference_policy_logprobs, data)
 
         ref = out["reference_logprobs"]  # [B_padded, S]; row t = logprob(token_t | <t)
@@ -1264,6 +1269,37 @@ class _RefLogprobAccumulator:
             async with self._lock:
                 if not self._pending:
                     return
+
+
+def _ensure_dyn_mb_budget(h: "NemoRLHandle", data) -> None:
+    """Raise the dynamic-batching token budgets to admit this batch (A5).
+
+    The builder sets a memory-sized base budget (default 8192 tokens);
+    NeMo RL asserts every sample fits its micro-batch budget after
+    sequence_length_round padding. Setting max(base, longest sample)
+    before each train/logprob call keeps short-sequence packing bounded
+    while a long sample degrades to its own micro-batch — the old MBS=1
+    worst case — instead of a hard assert. Non-ratcheting: a long batch
+    does not inflate the budget for later short batches.
+    """
+    policy = h.policy
+    dyn = getattr(policy, "cfg", {}).get("dynamic_batching") if policy else None
+    if not dyn or not dyn.get("enabled"):
+        return
+    lengths = data.get("input_lengths") if hasattr(data, "get") else None
+    if lengths is None or len(lengths) == 0:
+        return
+    if h.dyn_mb_base <= 0:
+        h.dyn_mb_base = int(dyn.get("train_mb_tokens", 0))
+    rounded = -(-int(lengths.max()) // 64) * 64  # sequence_length_round
+    budget = max(h.dyn_mb_base, rounded)
+    for key in ("train_mb_tokens", "logprob_mb_tokens"):
+        if dyn.get(key) != budget:
+            logger.info(
+                "dynamic batching %s: %s -> %d (longest sample %d, base %d)",
+                key, dyn.get(key), budget, int(lengths.max()), h.dyn_mb_base,
+            )
+            dyn[key] = budget
 
 
 def _maybe_pad_batch(batch, dp_size: int, mbs: int, image_preprocessor=None):
