@@ -11,6 +11,24 @@ from ..base import DataConverter
 from ...core.data_converter import TinkerDataConverter
 
 
+def _zero_like(x: Any) -> Any:
+    """A same-shaped zero of x: torch tensor, nested list, or scalar."""
+    if hasattr(x, "new_zeros"):  # torch.Tensor without importing torch here
+        return x.new_zeros(x.shape)
+    if isinstance(x, list):
+        return [_zero_like(e) for e in x]
+    return type(x)(0) if isinstance(x, (int, float)) else 0
+
+
+def _copy_like(x: Any) -> Any:
+    """A detached copy of x, so a pad never aliases a real sample's storage."""
+    if hasattr(x, "clone"):  # torch.Tensor
+        return x.clone()
+    if isinstance(x, list):
+        return [_copy_like(e) for e in x]
+    return x
+
+
 class MilesDataConverter(DataConverter):
     """Adapter: TinkerDataConverter → DataConverter ABC."""
 
@@ -63,6 +81,52 @@ class MilesDataConverter(DataConverter):
         rollout_data["_loss_norm_total"] = 1
         if adapter_slot is not None:
             rollout_data["adapter_slots"] = [adapter_slot] * num_samples
+
+    @staticmethod
+    def pad_rollout_data_to_dp(rollout_data: Any, dp_size: int) -> int:
+        """Append inert samples so the batch divides evenly across DP ranks.
+
+        Miles derives num_steps_per_rollout per rank from that rank's local
+        sample count, so an unbalanced split makes the ranks disagree on how
+        many micro-steps to run and they deadlock on the gradient collective
+        (specs/008 §5b). Padding to a multiple of dp_size removes the
+        disagreement without changing what is trained.
+
+        The pads are semantically inert, not merely masked-out: gradients are
+        pure-sum here (``_loss_norm_total=1``), so a sample whose loss mask and
+        advantages are zero contributes exactly zero to the gradient and to the
+        loss, for both the SFT and the RL loss. Nothing is renormalized by the
+        padded count.
+
+        Per-sample keys are identified exactly as
+        :meth:`merge_forward_backward_batches` identifies them --- a list whose
+        length equals ``dynamic_global_batch_size`` --- so the two cannot drift
+        apart. Pads are appended at the TAIL, which is what lets callers
+        recover the client's observables with a single slice.
+
+        Returns the number of pads appended (0 if none were needed). Callers
+        MUST truncate per-sample outputs back to the original count: a pad has
+        no observation key (Def. 2), so it must not surface to a client.
+        """
+        n = rollout_data.get("dynamic_global_batch_size")
+        if not n or dp_size <= 1 or n % dp_size == 0:
+            return 0
+        n_pad = dp_size - (n % dp_size)
+
+        # Zeroing these is what makes a pad inert; everything else is copied so
+        # the sample stays well-formed (valid token ids, consistent lengths).
+        zero_keys = {"loss_masks", "advantages", "log_probs", "rollout_log_probs",
+                     "returns", "values", "weights"}
+
+        for key, value in list(rollout_data.items()):
+            if not (isinstance(value, list) and len(value) == n):
+                continue
+            last = value[-1]
+            for _ in range(n_pad):
+                value.append(_zero_like(last) if key in zero_keys else _copy_like(last))
+
+        rollout_data["dynamic_global_batch_size"] = n + n_pad
+        return n_pad
 
     @staticmethod
     def merge_forward_backward_batches(batches: List[Any]) -> Any:

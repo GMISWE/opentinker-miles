@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 _ADAPTER_CHECKPOINT_BASE = os.path.join(CHECKPOINT_BASE, "adapters")
 
 
+def _dp_size(args: Any) -> int:
+    """Data-parallel width the actors will split a batch across."""
+    return int(getattr(args, "data_parallel_size", 1) or 1)
+
+
 def _adapter_save_dir(adapter_name: str) -> Path:
     """Per-tenant dir miles writes adapter checkpoints into. Without it
     (config.save=None) miles skips per-adapter checkpoints entirely.
@@ -704,6 +709,15 @@ class MilesBackend(TrainingBackend):
         merged = self.converter.merge_forward_backward_batches(
             [o.rollout_data for o in batch]
         )
+        # Pad AFTER merging, never per request: pads must sit at the tail of
+        # what is actually dispatched, or the per-request offsets below would
+        # slice across them. See converter.pad_rollout_data_to_dp.
+        n_pad = self.converter.pad_rollout_data_to_dp(merged, _dp_size(pool.args))
+        if n_pad:
+            logger.info(
+                "Padded co-batched fb with %d inert sample(s) to align with dp=%d",
+                n_pad, _dp_size(pool.args),
+            )
         if len(batch) > 1:
             logger.info(
                 "Co-batched fb: %d requests / %d samples / tenants %s",
@@ -730,10 +744,16 @@ class MilesBackend(TrainingBackend):
 
         logprobs_list = merge_dp_sample_outputs(results or [], key="log_probs")
         expected = sum(o.num_samples for o in batch)
+        # Drop the alignment pads before anything client-visible: a pad has no
+        # observation key, so it must not reach a caller. Pads are at the tail
+        # by construction, so this is a slice, and the equality check below
+        # still guards the real per-request split.
+        if n_pad and len(logprobs_list) == expected + n_pad:
+            logprobs_list = logprobs_list[:expected]
         if len(logprobs_list) != expected:
             raise BackendError(
                 f"co-batched fb returned {len(logprobs_list)} per-sample "
-                f"outputs for {expected} samples",
+                f"outputs for {expected} samples (n_pad={n_pad})",
                 backend="miles", operation="forward_backward",
             )
 
@@ -832,9 +852,15 @@ class MilesBackend(TrainingBackend):
         config = get_config()
         allow_partial = getattr(config, "allow_partial_batches", False)
         validator = RequestValidator(h.args, allow_partial_batches=allow_partial)
-        validation_error = validator.validate_forward_backward_request(
-            data, is_rl=is_rl,
-        )
+        # Validate what will actually be DISPATCHED, not what arrived: the
+        # converter pads the batch up to a multiple of dp before it reaches the
+        # actors (pad_rollout_data_to_dp), so a client sending an indivisible
+        # count is legal and must not be refused. The validator's own
+        # divisibility rule stays strict as a backstop for any path that
+        # dispatches without padding.
+        dp = _dp_size(h.args)
+        padded = -(-len(data) // dp) * dp if dp > 1 else len(data)
+        validation_error = validator.validate_sample_count(padded, is_rl=is_rl)
         if validation_error:
             raise ValueError(
                 f"Request validation failed:\n{validation_error}\n\n"
@@ -880,6 +906,12 @@ class MilesBackend(TrainingBackend):
             rollout_data = self.converter.forward_backward_to_backend(
                 data, loss_fn, h.args, adapter_slot=h.adapter_slot,
             )
+            n_pad = self.converter.pad_rollout_data_to_dp(rollout_data, _dp_size(h.args))
+            if n_pad:
+                logger.info(
+                    "Padded fb with %d inert sample(s) to align with dp=%d",
+                    n_pad, _dp_size(h.args),
+                )
 
             results = await h.train_group.forward_backward_only(0, Box(ray.put(rollout_data)))
 
@@ -904,6 +936,16 @@ class MilesBackend(TrainingBackend):
             # computes NLL from these).
             from miles.ray.tinker_group import merge_dp_sample_outputs
             logprobs_list = merge_dp_sample_outputs(results or [], key="log_probs")
+            # Alignment pads carry no observation key — drop them before the
+            # client sees anything (they are at the tail by construction).
+            if n_pad:
+                if len(logprobs_list) != len(data) + n_pad:
+                    raise BackendError(
+                        f"fb returned {len(logprobs_list)} per-sample outputs for "
+                        f"{len(data)} samples + {n_pad} pads",
+                        backend="miles", operation="forward_backward",
+                    )
+                logprobs_list = logprobs_list[:len(data)]
             loss_fn_outputs = [
                 {"logprobs": {"data": lp.tolist(), "shape": [len(lp)], "dtype": "float32"}}
                 for lp in logprobs_list
