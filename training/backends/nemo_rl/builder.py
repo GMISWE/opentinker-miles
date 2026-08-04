@@ -136,9 +136,24 @@ class NemoRLArgumentBuilder(ArgumentBuilder):
         cp_size = 1
         dp_size = num_gpus  # default: all GPUs for data parallelism
         if parallelism:
-            tp_size = parallelism.get("tensor_parallel", 1)
-            pp_size = parallelism.get("pipeline_parallel", 1)
-            cp_size = parallelism.get("context_parallel", 1)
+            # ParallelismConfig (models/requests.py) sends *_size keys; the
+            # bare spellings are kept for backward compat. Reading only the
+            # bare ones silently dropped every declared TP/PP (specs/009).
+            tp_size = parallelism.get(
+                "tensor_parallel_size", parallelism.get("tensor_parallel", 1)
+            )
+            pp_size = parallelism.get(
+                "pipeline_parallel_size", parallelism.get("pipeline_parallel", 1)
+            )
+            cp_size = parallelism.get(
+                "context_parallel_size", parallelism.get("context_parallel", 1)
+            )
+        # Explicit env override, mirroring miles' SLIME_DEFAULT_TP.
+        env_tp = os.environ.get("NEMORL_DEFAULT_TP")
+        if env_tp:
+            tp_size = int(env_tp)
+            logger.info("Using NEMORL_DEFAULT_TP override: TP=%d", tp_size)
+        if parallelism or env_tp:
             if is_vlm and cp_size > 1:
                 logger.warning(
                     "VLM models require cp_size=1 (NeMo RL workers assert empty "
@@ -253,6 +268,12 @@ class NemoRLArgumentBuilder(ArgumentBuilder):
                 "target_modules": target_modules,
                 "exclude_modules": [],
                 "lora_A_init": "kaiming",
+                # Read unconditionally by the TP>1 worker path
+                # (automodel/setup.py asserts `not use_triton`). False is
+                # PeftConfig.from_dict's default for a missing key, so this
+                # pins the kernel choice every banked run already used;
+                # triton LoRA is TP-incompatible upstream anyway.
+                "use_triton": False,
             }
         else:
             policy_config["dtensor_cfg"]["lora_cfg"] = {"enabled": False}
