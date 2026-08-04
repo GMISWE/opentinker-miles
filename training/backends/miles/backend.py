@@ -211,9 +211,18 @@ class MilesBackend(TrainingBackend):
         rlve_config: Optional[Dict[str, Any]] = None,
         wandb_config: Optional[Dict[str, Any]] = None,
         objective: str = "language_modeling",
+        staleness_k: int = 0,
         num_labels: Optional[int] = None,
         head_config: Optional[Dict[str, Any]] = None,
     ) -> MilesHandle:
+        if staleness_k > 0:
+            # A staleness declaration is a permission (served staleness <= k), so
+            # eager refit-every-step satisfies it trivially; carried, unexploited.
+            logger.info(
+                "[%s] staleness_k=%d declared; miles refits eagerly — "
+                "declaration accepted but unexploited (served staleness always 0)",
+                request_id, staleness_k,
+            )
         boot_kwargs = dict(
             model_id=model_id, request_id=request_id, base_model=base_model,
             num_gpus=num_gpus, lora_config=lora_config, parallelism=parallelism,

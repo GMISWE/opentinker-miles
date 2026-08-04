@@ -114,6 +114,12 @@ class CreateModelRequest(BaseModel):
     rlve_config: Optional[RLVEConfig] = Field(default=None, description="RLVE training configuration")
     wandb_config: Optional[WandbConfig] = Field(default=None, description="Wandb logging configuration")
 
+    # Staleness declaration (A4): max sampler weight-version staleness the tenant
+    # accepts. 0 (default) = strict on-policy; k>0 licenses the service to defer
+    # inference-engine refits while latest - synced <= k. ver(S) is certified per
+    # sample response. See specs/012-a4-staleness.
+    staleness_k: int = Field(default=0, ge=0, description="Max sampler weight-version staleness the tenant declares acceptable (0 = strict)")
+
     # Objective axis (feature 004). Defaults keep the language-modeling path unchanged.
     # See specs/004-bionemo-classification/plan.md.
     objective: str = Field(default="language_modeling", description="language_modeling | sequence_classification | token_classification")

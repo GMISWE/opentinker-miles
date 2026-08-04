@@ -62,6 +62,7 @@ class TrainingBackend(ABC):
         max_seq_len: int = 2048,
         rlve_config: Optional[Dict[str, Any]] = None,
         wandb_config: Optional[Dict[str, Any]] = None,
+        staleness_k: int = 0,
         objective: str = "language_modeling",
         num_labels: Optional[int] = None,
         head_config: Optional[Dict[str, Any]] = None,

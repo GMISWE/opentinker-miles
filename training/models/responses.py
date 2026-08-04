@@ -123,6 +123,14 @@ class SampleResult(BaseModel):
         default=None,
         description="Prompt log probabilities (None for first token)"
     )
+    # ver(S) certificate (A4, specs/012): version actually served vs latest.
+    # None on backends that don't stamp versions.
+    weight_version: Optional[int] = Field(
+        default=None, description="Weight version the sampler served (ver(S))"
+    )
+    latest_weight_version: Optional[int] = Field(
+        default=None, description="Latest trained weight version at serve time"
+    )
 
 
 class SpecialTokens(BaseModel):

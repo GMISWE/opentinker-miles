@@ -72,6 +72,7 @@ class MegatronBridgeBackend(TrainingBackend):
         max_seq_len: int = 2048,
         rlve_config: Optional[Dict[str, Any]] = None,
         wandb_config: Optional[Dict[str, Any]] = None,
+        staleness_k: int = 0,  # vacuous: no generation engine to go stale
         objective: str = Objective.SEQUENCE_CLASSIFICATION.value,
         num_labels: Optional[int] = None,
         head_config: Optional[Dict[str, Any]] = None,

@@ -132,7 +132,9 @@ async def asample(
         sequences = [SamplingSequence(**seq) for seq in result_dict["sequences"]]
         return SampleResult(
             sequences=sequences,
-            prompt_logprobs=result_dict.get("prompt_logprobs")
+            prompt_logprobs=result_dict.get("prompt_logprobs"),
+            weight_version=result_dict.get("weight_version"),
+            latest_weight_version=result_dict.get("latest_weight_version"),
         )
 
     # Create async task
