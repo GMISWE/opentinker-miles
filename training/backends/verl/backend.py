@@ -109,10 +109,19 @@ class VerlBackend(TrainingBackend):
         max_seq_len: int = 2048,
         rlve_config: Optional[Dict[str, Any]] = None,
         wandb_config: Optional[Dict[str, Any]] = None,
+        staleness_k: int = 0,
         objective: str = "language_modeling",
         num_labels: Optional[int] = None,
         head_config: Optional[Dict[str, Any]] = None,
     ) -> VerlHandle:
+        if staleness_k > 0:
+            # verl's sync is already lazy but version-gated to staleness 0 at
+            # sample time; the declaration is accepted but unexploited.
+            logger.info(
+                "[%s] staleness_k=%d declared; verl serves staleness 0 "
+                "(lazy sync, version-gated) — declaration unexploited",
+                request_id, staleness_k,
+            )
         if objective != "language_modeling":
             raise BackendError(
                 f"verl is a language-modeling backend; objective {objective!r} unsupported",

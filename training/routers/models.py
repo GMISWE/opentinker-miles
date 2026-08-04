@@ -165,6 +165,7 @@ async def create_model(
             training_runs_metadata=training_runs_metadata,
             rlve_config=request.rlve_config.dict() if request.rlve_config else None,
             wandb_config=request.wandb_config.dict() if request.wandb_config else None,
+            staleness_k=request.staleness_k,
             objective=request.objective,
             num_labels=request.num_labels,
             head_config=request.head_config,

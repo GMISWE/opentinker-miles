@@ -62,6 +62,8 @@ class NemoRLHandle(BackendHandle):
     _training_lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # Serialize optim_step GPU lifecycle
     weight_version: int = 0              # Optim steps applied; BUG-015 sampler pinning
     ref_logprob_accumulator: Any = None  # Lazy _RefLogprobAccumulator (BUG-015)
+    staleness_k: int = 0                 # Declared max sampler staleness (A4, specs/012)
+    generation_synced_version: int = 0   # ver(S): weight version the inference engine holds
 
 
 class NemoRLBackend(TrainingBackend):
@@ -109,6 +111,7 @@ class NemoRLBackend(TrainingBackend):
         max_seq_len: int = 2048,
         rlve_config: Optional[Dict[str, Any]] = None,
         wandb_config: Optional[Dict[str, Any]] = None,
+        staleness_k: int = 0,
         objective: str = "language_modeling",
         num_labels: Optional[int] = None,
         head_config: Optional[Dict[str, Any]] = None,
@@ -171,7 +174,14 @@ class NemoRLBackend(TrainingBackend):
                 created_at=datetime.now().isoformat(),
                 training_run_id=model_id,
                 debug_train_only=debug_train_only,
+                staleness_k=staleness_k,
             )
+            if staleness_k > 0:
+                logger.info(
+                    "[%s] staleness_k=%d declared: inference-engine refit deferred "
+                    "while latest - synced <= k; ver(S) certified per sample",
+                    request_id, staleness_k,
+                )
 
 
             # Detect VLM via config (cheap — only reads config.json)
@@ -500,14 +510,25 @@ class NemoRLBackend(TrainingBackend):
                     # precision/kernels), causing IS ratio ~0.003 instead of ~1.0.
                     # By computing prev_logprobs here with the same DTensor path used
                     # for curr_logprobs during training, the ratio starts at ~1.0.
+                    # A4: only legal at staleness 0 — the recompute uses CURRENT
+                    # policy weights, so under a staleness declaration it would
+                    # silently erase the off-policy correction (the sampler's own
+                    # logprobs ARE the behavior policy; keep them).
                     if h.loss_fn_name != "cross_entropy" and "prev_logprobs" in all_data:
-                        logger.info("Computing prev_logprobs via DTensor forward pass (BUG-011)")
-                        logprob_result = await asyncio.to_thread(
-                            h.policy.get_logprobs, all_data,
-                        )
-                        if hasattr(logprob_result, "get") and logprob_result.get("logprobs") is not None:
-                            all_data["prev_logprobs"] = logprob_result["logprobs"]
-                            logger.info("prev_logprobs replaced with DTensor-computed values")
+                        if h.staleness_k == 0:
+                            logger.info("Computing prev_logprobs via DTensor forward pass (BUG-011)")
+                            logprob_result = await asyncio.to_thread(
+                                h.policy.get_logprobs, all_data,
+                            )
+                            if hasattr(logprob_result, "get") and logprob_result.get("logprobs") is not None:
+                                all_data["prev_logprobs"] = logprob_result["logprobs"]
+                                logger.info("prev_logprobs replaced with DTensor-computed values")
+                        else:
+                            logger.info(
+                                "staleness_k=%d: keeping sampler-provided prev_logprobs "
+                                "(behavior-policy version; BUG-011 recompute skipped)",
+                                h.staleness_k,
+                            )
 
                     if h.loss_fn_name == "cross_entropy":
                         # Pure-sum CE (Tinker contract), not NeMo RL's mean-normalized
@@ -541,13 +562,35 @@ class NemoRLBackend(TrainingBackend):
                     h.weight_version += 1
 
                     if h.policy_generation is not None and not h.debug_train_only:
-                        logger.info("Refitting policy generation for %s", h.model_id)
-                        await asyncio.to_thread(
-                            _refit_policy_generation,
-                            h.policy,
-                            h.policy_generation,
-                            h.colocated_inference,
-                        )
+                        # A4 staleness-k: refit only when the engine would exceed
+                        # the declared bound; otherwise wake it with the (stale)
+                        # weights its level-1 sleep backed up. k=0 == old behavior.
+                        staleness = h.weight_version - h.generation_synced_version
+                        if staleness > h.staleness_k:
+                            logger.info(
+                                "Refitting policy generation for %s (engine v%d -> v%d)",
+                                h.model_id, h.generation_synced_version, h.weight_version,
+                            )
+                            await asyncio.to_thread(
+                                _refit_policy_generation,
+                                h.policy,
+                                h.policy_generation,
+                                h.colocated_inference,
+                            )
+                            h.generation_synced_version = h.weight_version
+                        else:
+                            logger.info(
+                                "ver(S): refit deferred for %s — engine stays at v%d, "
+                                "latest v%d (staleness %d <= k=%d)",
+                                h.model_id, h.generation_synced_version,
+                                h.weight_version, staleness, h.staleness_k,
+                            )
+                            await asyncio.to_thread(
+                                _wake_generation_stale,
+                                h.policy,
+                                h.policy_generation,
+                                h.colocated_inference,
+                            )
 
                     # Transition back to generation_ready — sampling can now
                     # call generate() directly without offload/refit overhead.
@@ -583,6 +626,9 @@ class NemoRLBackend(TrainingBackend):
                 "model_id": h.model_id,
                 "metrics": result.get("metrics", {}),
                 "loss_fn_outputs": loss_fn_outputs,
+                # A4 ver(S): post-step version state for driver-side accounting
+                "weight_version": h.weight_version,
+                "generation_synced_version": h.generation_synced_version,
             }
 
         except BackendError:
@@ -781,7 +827,7 @@ class NemoRLBackend(TrainingBackend):
         accumulator = self._batch_accumulators.setdefault(
             h.model_id, NemoRLBatchAccumulator()
         )
-        return await accumulator.submit(
+        result = await accumulator.submit(
             handle=h,
             request_id=request_id,
             prompt_tokens=prompt_tokens,
@@ -789,6 +835,22 @@ class NemoRLBackend(TrainingBackend):
             sampling_params=sampling_params or {},
             prompt_logprobs=prompt_logprobs,
         )
+        # ver(S) monitor (A4): certify the version actually served against the
+        # declared bound, and stamp it into the response. Versions are read
+        # post-serve; a concurrent optim_step could bump weight_version between
+        # flush and here, but ops on one model are FIFO-serialized upstream.
+        served_v = h.generation_synced_version
+        latest_v = h.weight_version
+        if latest_v - served_v > h.staleness_k:
+            raise BackendError(
+                f"ver(S) certificate violation: served v{served_v}, latest "
+                f"v{latest_v}, staleness {latest_v - served_v} > declared "
+                f"k={h.staleness_k}",
+                backend="nemo_rl", operation="sample",
+            )
+        result["weight_version"] = served_v
+        result["latest_weight_version"] = latest_v
+        return result
 
     async def _reference_prompt_logprobs(
         self, h: "NemoRLHandle", prompt_tokens: List[int],
@@ -908,6 +970,7 @@ async def _ensure_generation_ready(handle) -> None:
             handle.policy_generation,
             handle.colocated_inference,
         )
+        handle.generation_synced_version = handle.weight_version
 
         async with handle._generation_state_lock:
             handle.generation_state = "generation_ready"
@@ -1089,6 +1152,16 @@ def _refit_policy_generation(policy, policy_generation, colocated_inference: boo
     if colocated_inference:
         policy.offload_after_refit()
         policy_generation.prepare_for_generation(tags=["kv_cache"])
+
+
+def _wake_generation_stale(policy, policy_generation, colocated_inference: bool):
+    """Restore generation WITHOUT streaming new weights (A4 staleness-k skip
+    path): vLLM's level-1 sleep backed its weights up to CPU, so a plain wake
+    restores the pre-training (stale) version. Legal only under a declared
+    staleness_k > 0 — the caller gates on the ver(S) bound."""
+    if colocated_inference:
+        policy.offload_after_refit()
+        policy_generation.prepare_for_generation()
 
 
 def _warn_on_adam_mismatch(h: "NemoRLHandle", adam_params: Dict[str, Any]) -> None:
