@@ -503,7 +503,18 @@ class MilesBackend(TrainingBackend):
                 router_ip = getattr(args, "sglang_router_ip", None)
                 router_port = getattr(args, "sglang_router_port", None)
                 if not router_ip:
-                    logger.error("[%s] SGLang router address missing from args", request_id)
+                    # Upstream create_rollout_manager does not publish the
+                    # router address into args on the single-tenant path
+                    # (pool mode fetches it explicitly); ask the manager.
+                    try:
+                        router_ip, router_port = (
+                            await rollout_manager.get_router_address.remote()
+                        )
+                    except Exception:
+                        logger.error(
+                            "[%s] SGLang router address missing from args",
+                            request_id,
+                        )
 
             handle = MilesHandle(
                 model_id=model_id,
