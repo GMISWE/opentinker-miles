@@ -153,6 +153,7 @@ class SlimeArgumentBuilder:
             wandb_config=wandb_config,
             multi_lora_slots=multi_lora_slots,
             rollout_gpus=rollout_gpus,
+            max_seq_len=max_seq_len,
         )
 
         return args, hf_model_path
@@ -354,6 +355,7 @@ class SlimeArgumentBuilder:
         wandb_config: Optional[Dict[str, Any]] = None,
         multi_lora_slots: int = 0,
         rollout_gpus: int = 0,
+        max_seq_len: int = 2048,
     ) -> Namespace:
         """Configure model-specific argument overrides."""
         # Check if RLVE mode is enabled
@@ -455,9 +457,20 @@ class SlimeArgumentBuilder:
         args.tokenizer_type = "HuggingFaceTokenizer"
         args.model_name = "qwen2.5"
 
-        # Dynamic batch size - disabled for simplicity to avoid reordering complexity
-        args.use_dynamic_batch_size = False
-        args.max_tokens_per_gpu = 4096
+        # Dynamic batch size: ON by default. miles' regrouping is order-safe
+        # (gather_log_data un-permutes by micro_batch_indices; DP merge keys on
+        # partition_indices), verified bit-level in specs/013 M-fix: per-token
+        # logprobs identical across groupings, 30-step endpoint within 2x the
+        # rerun envelope, 27.3 -> 5.3 s/step at 8B/TP2DP2. Budget is the
+        # client-declared max_seq_len (floor 8192): packed peak activation ==
+        # the old mbs=1 worst case (one full-length sample), so no new OOM
+        # surface; not the model's native context (specs/013 A5 lesson).
+        args.use_dynamic_batch_size = (
+            os.environ.get("SLIME_DYN_BATCH", "1") == "1"
+        )
+        args.max_tokens_per_gpu = int(
+            os.environ.get("SLIME_MAX_TOKENS_PER_GPU", str(max(8192, max_seq_len)))
+        )
 
         # Features
         args.colocate = multi_lora_slots == 0
