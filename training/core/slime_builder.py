@@ -266,10 +266,13 @@ class SlimeArgumentBuilder:
         else:
             # Memory management: colocate SGLang with Megatron, enable offload
             # These MUST be set here because parse_args() sets defaults based on them
-            minimal_args.extend([
-                '--colocate',
-                '--offload',  # Equivalent to --offload-train + --offload-rollout
-            ])
+            # Attribution-arm override (specs/013 stack-residual): SLIME_NO_OFFLOAD=1
+            # drops both flags; default unchanged.
+            if os.environ.get('SLIME_NO_OFFLOAD') != '1':
+                minimal_args.extend([
+                    '--colocate',
+                    '--offload',  # Equivalent to --offload-train + --offload-rollout
+                ])
 
         # Add kv-channels if model has explicit head_dim (e.g., Qwen3)
         if model_config.get('kv_channels'):
