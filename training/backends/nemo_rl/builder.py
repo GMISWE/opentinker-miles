@@ -378,6 +378,11 @@ class NemoRLArgumentBuilder(ArgumentBuilder):
                     "sgd_momentum": 0.9,
                     "use_distributed_optimizer": True,
                     "use_precision_aware_optimizer": True,
+                    # Read unconditionally by the pod's nemo-rl rev
+                    # (validate_and_set_config), absent from the older
+                    # RL submodule checkout — supply both.
+                    "optimizer_cpu_offload": False,
+                    "optimizer_offload_fraction": 0.0,
                     "clip_grad": 1.0,
                 },
                 "scheduler": {
