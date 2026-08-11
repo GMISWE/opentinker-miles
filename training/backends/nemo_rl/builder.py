@@ -337,7 +337,8 @@ class NemoRLArgumentBuilder(ArgumentBuilder):
                     "alpha": lora_config.get("alpha") or lora_config.get("rank", 8),
                     "dropout": lora_config.get("dropout", 0.0),
                     "dropout_position": "post",
-                    "lora_A_init_method": "xavier",
+                    "lora_A_init_method": os.environ.get(
+                        "NEMORL_MEGATRON_A_INIT", "xavier"),
                     "lora_B_init_method": "zero",
                     "a2a_experimental": False,
                     "lora_dtype": None,
@@ -385,7 +386,9 @@ class NemoRLArgumentBuilder(ArgumentBuilder):
                     "adam_eps": 1.0e-8,
                     "sgd_momentum": 0.9,
                     "use_distributed_optimizer": True,
-                    "use_precision_aware_optimizer": True,
+                    "use_precision_aware_optimizer": (
+                        os.environ.get("NEMORL_MEGATRON_PRECISION_AWARE", "1")
+                        == "1"),
                     # Read unconditionally by the pod's nemo-rl rev
                     # (validate_and_set_config), absent from the older
                     # RL submodule checkout — supply both.
