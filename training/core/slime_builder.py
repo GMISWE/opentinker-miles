@@ -116,6 +116,10 @@ class SlimeArgumentBuilder:
         tp_size = parallel['tp']
         pp_size = parallel['pp']
         cp_size = parallel['cp']
+        # Attribution-arm override (specs/013 stack-residual): explicit env,
+        # default = auto-detect.
+        if os.environ.get('SLIME_TP'):
+            tp_size = int(os.environ['SLIME_TP'])
 
         # Build parallel_config dict for compatibility
         parallel_config = {
@@ -394,6 +398,12 @@ class SlimeArgumentBuilder:
         if not lora_config or lora_config.get("train_mlp", True):
             target_modules += ["linear_fc1", "linear_fc2"]
         args.target_modules = target_modules
+        # Attribution-arm override (specs/013 stack-residual): miles' bridge
+        # fork defaults lora_A_init_method="xavier" (multi_lora_utils/
+        # lora_utils getattr fallback); expose it so the init term measured on
+        # the NeMo megatron path (0.076) can be tested on this stack.
+        if os.environ.get('SLIME_LORA_A_INIT'):
+            args.lora_A_init_method = os.environ['SLIME_LORA_A_INIT']
         # Upstream only injects megatron-side LoRA adapters on the bridge path
         # (model.py: is_lora_enabled and megatron_to_hf_mode == "bridge");
         # without this the model silently builds as full-finetune and LoRA
