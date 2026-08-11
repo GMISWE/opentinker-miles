@@ -306,6 +306,98 @@ class NemoRLArgumentBuilder(ArgumentBuilder):
         else:
             policy_config["dtensor_cfg"]["lora_cfg"] = {"enabled": False}
 
+        # E2 arm (specs/013 round-6): lower the same declaration onto NeMo RL's
+        # Megatron path — LoRA attaches to the FUSED linear_qkv/linear_fc1
+        # modules, the other side of the lowering partition. Explicit opt-in
+        # (NEMORL_MEGATRON=1); default path is unchanged. The Megatron worker
+        # has no set_learning_rate, so the client's per-step LR is reproduced
+        # server-side by the scheduler (linear lr0*(1-t/T), matching
+        # q5_conv_migration.lr_at); verify delivered lr in train metrics.
+        if os.environ.get("NEMORL_MEGATRON") == "1":
+            meg_lr = float(os.environ.get("NEMORL_MEGATRON_LR", "2e-4"))
+            meg_iters = int(os.environ.get("NEMORL_MEGATRON_LR_DECAY_ITERS", "222"))
+            policy_config["dtensor_cfg"] = {"enabled": False}
+            if lora_config and lora_config.get("rank", 0) > 0:
+                meg_peft = {
+                    "enabled": True,
+                    # Megatron module names: qkv and gate/up are fused — the
+                    # lowering under test. Coverage mirrors all-linear.
+                    "target_modules": ["linear_qkv", "linear_proj",
+                                       "linear_fc1", "linear_fc2"],
+                    "exclude_modules": [],
+                    "dim": lora_config.get("rank", 8),
+                    "alpha": lora_config.get("alpha") or lora_config.get("rank", 8),
+                    "dropout": lora_config.get("dropout", 0.0),
+                    "dropout_position": "post",
+                    "lora_A_init_method": "xavier",
+                    "lora_B_init_method": "zero",
+                    "a2a_experimental": False,
+                    "lora_dtype": None,
+                }
+            else:
+                meg_peft = {"enabled": False}
+            policy_config["megatron_cfg"] = {
+                "enabled": True,
+                "empty_unused_memory_level": 1,
+                "activation_checkpointing": False,
+                "converter_type": "Qwen2ForCausalLM",
+                "tensor_model_parallel_size": tp_size,
+                "expert_tensor_parallel_size": 1,
+                "expert_model_parallel_size": 1,
+                "pipeline_model_parallel_size": pp_size,
+                "num_layers_in_first_pipeline_stage": None,
+                "num_layers_in_last_pipeline_stage": None,
+                "context_parallel_size": cp_size,
+                "pipeline_dtype": "bfloat16",
+                "sequence_parallel": False,
+                "freeze_moe_router": False,  # ValueError with PEFT; model is dense
+                "moe_router_dtype": "fp64",
+                "moe_router_load_balancing_type": "none",
+                "moe_router_bias_update_rate": 0.0,
+                "moe_permute_fusion": False,
+                "moe_enable_deepep": False,
+                "moe_token_dispatcher_type": "allgather",
+                "moe_shared_expert_overlap": False,
+                "moe_per_layer_logging": False,
+                "apply_rope_fusion": True,
+                "bias_activation_fusion": True,
+                "defer_fp32_logits": False,
+                "train_iters": meg_iters,
+                "peft": meg_peft,
+                "optimizer": {
+                    "optimizer": "adam",
+                    "lr": meg_lr,
+                    "min_lr": 0.0,
+                    "weight_decay": 0.0,
+                    "bf16": True,
+                    "fp16": False,
+                    "params_dtype": "float32",
+                    "adam_beta1": 0.9,
+                    "adam_beta2": 0.95,
+                    "adam_eps": 1.0e-8,
+                    "sgd_momentum": 0.9,
+                    "use_distributed_optimizer": True,
+                    "use_precision_aware_optimizer": True,
+                    "clip_grad": 1.0,
+                },
+                "scheduler": {
+                    "start_weight_decay": 0.0,
+                    "end_weight_decay": 0.0,
+                    "weight_decay_incr_style": "constant",
+                    "lr_decay_style": "linear",
+                    "lr_decay_iters": meg_iters,
+                    "lr_warmup_iters": 0,
+                    "lr_warmup_init": 0.0,
+                },
+                "distributed_data_parallel_config": {
+                    "grad_reduce_in_fp32": False,
+                    "overlap_grad_reduce": True,
+                    "overlap_param_gather": True,
+                    "use_custom_fsdp": False,
+                    "data_parallel_sharding_strategy": "optim_grads_params",
+                },
+            }
+
         # Loss function config (ClippedPGLossConfig for GRPO/PPO)
         loss_fn_config = {
             "reference_policy_kl_penalty": 0.001,
