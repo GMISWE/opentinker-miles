@@ -317,6 +317,14 @@ class NemoRLArgumentBuilder(ArgumentBuilder):
             meg_lr = float(os.environ.get("NEMORL_MEGATRON_LR", "2e-4"))
             meg_iters = int(os.environ.get("NEMORL_MEGATRON_LR_DECAY_ITERS", "222"))
             policy_config["dtensor_cfg"] = {"enabled": False}
+            # The bridge scheduler converts lr_decay_iters to SAMPLE units by
+            # multiplying with config train_global_batch_size at init, while
+            # the worker steps it by the ACTUAL per-call batch. Pin the config
+            # gbs to the actual per-step batch so decay is exact (measured:
+            # 4096 vs 128 slowed decay 32x — delivered lr 1.99972e-4 vs
+            # declared 1.99099e-4 at step 1).
+            policy_config["train_global_batch_size"] = int(
+                os.environ.get("NEMORL_MEGATRON_GBS", "128"))
             if lora_config and lora_config.get("rank", 0) > 0:
                 meg_peft = {
                     "enabled": True,
