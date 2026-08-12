@@ -17,9 +17,10 @@ cd /tmp && tar xzf code.tar.gz
 mkdir -p /app /work /data/metadata /data/trajectories /data/.cache/huggingface
 
 # TinkerCloud server -> /app (run via PYTHONPATH=/app python3 -m training)
-rm -rf /app/training /app/tests /app/scripts /work/tinker_gmi /work/tinker-cookbook
+rm -rf /app/training /app/tests /app/gates /app/scripts /work/tinker_gmi /work/tinker-cookbook
 mv /tmp/tinker-cloud/training /app/training
 mv /tmp/tinker-cloud/tests /app/tests
+[ -d /tmp/tinker-cloud/gates ] && mv /tmp/tinker-cloud/gates /app/gates
 [ -d /tmp/tinker-cloud/scripts/evo2 ] && { mkdir -p /app/scripts; mv /tmp/tinker-cloud/scripts/evo2 /app/scripts/evo2; }
 
 if [ "$PROFILE" = bionemo ]; then
@@ -83,6 +84,11 @@ elif [ "$PROFILE" = miles ]; then
   fi
   python3 -c 'import miles; print("miles fork overlaid OK ('"$MILES_REF"')")'
 fi
+
+# server editable install: Ray workers import training.* by module path
+# (e.g. nemo_rl losses), and PYTHONPATH=/app does not reach them (BUG-015)
+[ -f /tmp/tinker-cloud/pyproject.toml ] && cp /tmp/tinker-cloud/pyproject.toml /app/pyproject.toml
+[ -f /app/pyproject.toml ] && pip install -e /app --no-deps -q
 
 # SDK + cookbook editable installs
 mv /tmp/tinker_gmi /work/tinker_gmi
