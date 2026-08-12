@@ -16,4 +16,9 @@ requires-python = ">=3.10"
 # image already provides everything. This entry only creates the import path.
 
 [tool.setuptools.packages.find]
-include = ["training*"]
+# gates ships with the service: the suite must version with the server it
+# certifies (specs/014 design S6 Q1).
+include = ["training*", "gates*"]
+
+[tool.setuptools.package-data]
+gates = ["verdicts/*.json"]
