@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "tinkercloud-gates-verdict",
+  "title": "Gate verdict",
+  "description": "Uniform result of one gate = invariant x trace x arm. History in, certificate-bearing verdict out (Elle-shaped; specs/014 design S3.4).",
+  "type": "object",
+  "required": [
+    "gate",
+    "invariant",
+    "claimed_level",
+    "arm",
+    "trace",
+    "outcome",
+    "verdict",
+    "passed",
+    "delta",
+    "threshold",
+    "observations",
+    "artifacts",
+    "meta"
+  ],
+  "properties": {
+    "gate": {
+      "type": "string",
+      "description": "invariant_id.trace_name, e.g. SPLIT_INV.seg_sweep"
+    },
+    "invariant": {
+      "type": "string",
+      "description": "id in gates/invariants.py REGISTRY"
+    },
+    "claimed_level": { "enum": ["E0", "E1", "E2"] },
+    "arm": {
+      "type": "object",
+      "required": ["tag"],
+      "properties": {
+        "tag": {
+          "type": "string",
+          "description": "backend/parallelism label, e.g. nemo_rl_tp2"
+        },
+        "expect": {
+          "type": ["string", "null"],
+          "description": "predicted outcome for this arm, if graded against one"
+        }
+      }
+    },
+    "trace": {
+      "type": "object",
+      "required": ["name", "params"],
+      "properties": {
+        "name": { "type": "string" },
+        "params": { "type": "object" }
+      }
+    },
+    "outcome": {
+      "type": "string",
+      "description": "trace-specific outcome code, e.g. E0_ARBITRARY"
+    },
+    "verdict": {
+      "type": "string",
+      "description": "human-readable one-liner (probe-compatible phrasing)"
+    },
+    "passed": {
+      "type": ["boolean", "null"],
+      "description": "strict verdict at claimed_level; null = inconclusive. When arm.expect is set, pass of outcome==expect is reported in expect_met."
+    },
+    "expect_met": { "type": ["boolean", "null"] },
+    "delta": {
+      "type": ["number", "null"],
+      "description": "max observed deviation (relative for E0/E1)"
+    },
+    "threshold": {
+      "type": ["number", "null"],
+      "description": "E1 bar / E2 envelope half-width; null for E0"
+    },
+    "observations": {
+      "type": "array",
+      "items": { "type": "object" },
+      "description": "per-arm observation rows as returned by trace.execute"
+    },
+    "detail": {
+      "type": "object",
+      "description": "trace-specific verdict fields (e.g. determinism_ok)"
+    },
+    "artifacts": {
+      "type": "object",
+      "required": ["observations_sha256", "trace_sha256"],
+      "properties": {
+        "observations_sha256": { "type": "string" },
+        "trace_sha256": { "type": "string" }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "required": ["timestamp", "gates_version"],
+      "properties": {
+        "timestamp": { "type": "string" },
+        "base_url": { "type": "string" },
+        "gates_version": { "type": "string" }
+      }
+    }
+  }
+}
