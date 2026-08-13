@@ -231,6 +231,12 @@ class SlimeArgumentBuilder:
             # probes/bi_fc2_bisect.py on a new model shape or GPU.
             '--data-pad-size-multiplier',
             os.environ.get('SLIME_DATA_PAD_MULT', '512'),
+            # The client's declared seed, which decides the LoRA initializer.
+            # Megatron's own default is 1234, so omitting this was reproducible
+            # by accident while silently ignoring whatever the client asked for
+            # -- the API accepted the field and nothing read it. On the CLI, not
+            # the post-parse namespace: that never reaches the Ray actors.
+            '--seed', str((lora_config or {}).get('seed') or 1234),
             '--global-batch-size', str(global_batch_size),
             # RL algorithm
             '--advantage-estimator', os.environ.get('SLIME_ADVANTAGE_ESTIMATOR', 'grpo'),
