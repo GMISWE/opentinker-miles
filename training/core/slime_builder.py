@@ -215,6 +215,22 @@ class SlimeArgumentBuilder:
             # Training config
             '--seq-length', '512',
             '--micro-batch-size', '1',
+            # Pack length must clear the kernel's batch-invariance threshold.
+            # get_batch rounds each microbatch's packed stream up to a multiple
+            # of tp_size * this value. linear_fc2 (K=4864 -> N=896, the only
+            # large-K GEMM) picks a different cuBLAS K-reduction below M=352,
+            # so at the stock 128 a client's segmentation selects the kernel:
+            # fb(3) packs to 256 (one kernel), fb(5) to 384 (another), and a
+            # datum's own returned logprobs move up to 0.38 nats with how the
+            # client chunked its round. 512 is the smallest power of two above
+            # the threshold and divides the 8192-token dynamic budget exactly,
+            # so production-sized packs gain no padding at all. Measured:
+            # 5.169e-02 -> 2.882e-07 on SPLIT_INV (specs/014-gate-suite
+            # INVESTIGATION-miles-split.md). 352 is a property of this GEMM on
+            # this GPU and cuBLAS, not a constant — re-measure with
+            # probes/bi_fc2_bisect.py on a new model shape or GPU.
+            '--data-pad-size-multiplier',
+            os.environ.get('SLIME_DATA_PAD_MULT', '512'),
             '--global-batch-size', str(global_batch_size),
             # RL algorithm
             '--advantage-estimator', os.environ.get('SLIME_ADVANTAGE_ESTIMATOR', 'grpo'),
