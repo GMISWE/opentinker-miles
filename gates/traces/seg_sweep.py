@@ -89,6 +89,8 @@ class SegSweep:
         default_factory=lambda: list(DEFAULT_ARMS)
     )
     name: str = "seg_sweep"
+    # models this trace created; the runner deletes them when the gate ends
+    created_models: list[str] = field(default_factory=list)
 
     def params(self) -> dict:
         return {
@@ -115,6 +117,7 @@ class SegSweep:
             max_seq_len=self.max_seq_len,
             debug_train_only=self.debug_train_only,
         )
+        self.created_models.append(tc.model_id)
         rows = []
         for arm, sizes in self.arms:
             t0 = time.time()

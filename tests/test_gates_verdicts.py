@@ -177,3 +177,58 @@ class TestRunner:
         )
         assert doc["passed"] is False
         assert doc["expect_met"] is True
+
+
+class RecordingDriver(StubDriver):
+    """Driver that records delete_model calls (the cleanup contract)."""
+
+    def __init__(self):
+        self.deleted = []
+
+    def delete_model(self, model_id):
+        self.deleted.append(model_id)
+        return True
+
+
+class TestModelCleanup:
+    """A gate owns the models it creates: miles does not auto-reap them, and
+    a leftover model wedges the next gate's create_model in placement."""
+
+    def _trace(self, rows, models):
+        t = StubTrace(rows)
+        t.created_models = list(models)
+        return t
+
+    def test_models_released_after_run(self):
+        driver = RecordingDriver()
+        trace = self._trace(rows_for([3.0] * 6), ["model_a"])
+        runner.run(invariants.get("SPLIT_INV"), trace, tag="stub", driver=driver)
+        assert driver.deleted == ["model_a"]
+        assert trace.created_models == []
+
+    def test_models_released_even_when_trace_raises(self):
+        driver = RecordingDriver()
+        trace = self._trace(rows_for([3.0] * 6), ["model_b"])
+
+        def boom(_driver):
+            trace.created_models.append("model_c")
+            raise RuntimeError("arm exploded mid-sweep")
+
+        trace.execute = boom
+        with pytest.raises(RuntimeError, match="exploded"):
+            runner.run(invariants.get("SPLIT_INV"), trace, tag="stub", driver=driver)
+        assert driver.deleted == ["model_b", "model_c"]
+
+    def test_cleanup_failure_does_not_mask_verdict(self):
+        """A leaked model is an operational problem; losing the verdict that
+        cost a cluster run is worse. Cleanup warns and the result stands."""
+
+        class AngryDriver(StubDriver):
+            def delete_model(self, model_id):
+                raise RuntimeError("delete endpoint down")
+
+        trace = self._trace(rows_for([3.0] * 6), ["model_d"])
+        doc = runner.run(invariants.get("SPLIT_INV"), trace, tag="stub",
+                         driver=AngryDriver())
+        assert doc["outcome"] == "E0_ARBITRARY"
+        assert doc["passed"] is True

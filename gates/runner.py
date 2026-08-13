@@ -27,6 +27,21 @@ def _sha256(obj) -> str:
     ).hexdigest()
 
 
+def _release_models(trace, driver) -> None:
+    """Delete every model the trace created. Best-effort and never raises —
+    a failed cleanup must not turn a real verdict into an exception."""
+    models = getattr(trace, "created_models", None) or []
+    delete = getattr(driver, "delete_model", None)
+    if not models or delete is None:
+        return
+    for model_id in models:
+        try:
+            delete(model_id)
+        except Exception as e:  # noqa: BLE001 - a leaked model must not eat a verdict
+            print(f"WARNING: releasing {model_id} raised {e!r}", flush=True)
+    models.clear()
+
+
 def run(
     invariant: Invariant,
     trace,
@@ -39,7 +54,12 @@ def run(
     comparator = comparators.REGISTRY[invariant.comparator]
 
     print(f"[{tag}] gate {invariant.id}.{trace.name} ({invariant.level})", flush=True)
-    rows = trace.execute(driver)
+    try:
+        rows = trace.execute(driver)
+    finally:
+        # A gate owns the models it creates. miles does not auto-reap them, so
+        # skipping this wedges the next gate's create_model in placement.
+        _release_models(trace, driver)
     v = trace.verdict(rows, comparator)
 
     ref = rows[0]
