@@ -56,6 +56,30 @@ class SDKDriver:
         print(f"model_id: {tc.model_id} (boot {time.time() - t0:.1f}s)", flush=True)
         return tc
 
+    def delete_model(self, model_id: str) -> bool:
+        """Release the model's GPU resources. A gate MUST call this when it
+        finishes: miles does not auto-reap models, and a leftover model (plus
+        SGLang engines that outlive `ray stop`) wedges the next gate's
+        create_model in placement. Never raises — cleanup must not mask a
+        verdict."""
+        import requests
+
+        try:
+            r = requests.post(
+                f"{self.base_url}/api/v1/delete_model",
+                headers={"X-API-Key": self.api_key, "Content-Type": "application/json"},
+                json={"model_id": model_id},
+                timeout=300,
+            )
+            if r.status_code == 200:
+                print(f"deleted model {model_id}", flush=True)
+                return True
+            print(f"WARNING: delete_model {model_id} -> {r.status_code}: "
+                  f"{r.text[:300]}", flush=True)
+        except Exception as e:  # noqa: BLE001 - cleanup is best-effort
+            print(f"WARNING: delete_model {model_id} failed: {e}", flush=True)
+        return False
+
     def optim_step(self, model_id: str, lr: float = 0.0) -> dict:
         import requests
 
