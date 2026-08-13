@@ -442,7 +442,17 @@ class SlimeArgumentBuilder:
         args.context_parallel_size = cp_size
         args.virtual_pipeline_model_parallel_size = None
         args.sequence_parallel = cp_size > 1  # Enable sequence parallel with CP>1
-        args.use_distributed_optimizer = False
+        # use_distributed_optimizer is deliberately NOT set here. miles derives
+        # the DDP config's copy of it independently (bridge_lora_helpers.py:
+        # "muon" not in args.optimizer), so pinning it False made the two
+        # disagree: DDP reduce-scattered the grad buffer while the optimizer was
+        # the non-distributed one, which needs a full all-reduce. Each rank then
+        # held the summed gradient only on its own 1/dp shard and its own
+        # UNREDUCED gradient everywhere else, and stepped the whole parameter set
+        # with it -- so the ranks diverged and the gradient depended on which
+        # rank a datum landed on and on the DP width. Letting the engine own the
+        # flag keeps its derivations from drifting apart.
+        # specs/014-gate-suite/INVESTIGATION-miles-split.md §DEFECT 2.
         args.num_gpus_per_node = num_gpus
         args.actor_num_gpus_per_node = num_gpus
         args.actor_num_nodes = 1
