@@ -93,3 +93,13 @@ def test_builder_does_not_pass_the_flag_on_the_cli(builder_src):
     # actors (unlike post-parse args.X), so it would be just as wrong.
     assert "--use-distributed-optimizer" not in builder_src
     assert "--no-use-distributed-optimizer" not in builder_src
+
+
+def test_client_seed_rides_the_cli(builder_src):
+    # LoraConfig.seed was accepted by the API and read by nobody. Megatron's own
+    # default is 1234, so miles was reproducible by accident while ignoring
+    # whatever the client declared. specs/014-gate-suite §THE nemo_rl PEER PROBE.
+    assert "'--seed'" in builder_src, "the client's seed must reach the engine"
+    assert "lora_config or {}).get('seed')" in builder_src, (
+        "--seed must carry the client's declared value, not a constant"
+    )

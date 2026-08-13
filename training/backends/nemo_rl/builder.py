@@ -278,6 +278,17 @@ class NemoRLArgumentBuilder(ArgumentBuilder):
             },
         }
 
+        # The client's declared seed. The DTensor worker builds the model and
+        # applies LoRA under torch's process-global RNG and never seeds it, so
+        # without this two creations at the same seed start from different
+        # weights -- measured: pre-step sum-logprobs -887.7514 / -887.3088 /
+        # -887.2706 for one seed (specs/014-gate-suite §THE nemo_rl PEER PROBE).
+        # Carried as config rather than an env var so it is per-model and does
+        # not race between concurrent creates. The worker must read it; see
+        # probes/fix_nemorl_seed.py for the engine-side half.
+        if lora_config and lora_config.get("seed") is not None:
+            policy_config["seed"] = int(lora_config["seed"])
+
         if lora_config and lora_config.get("rank", 0) > 0:
             # All-linear coverage (attention + MLP) to match hosted Tinker
             # semantics — per the Tinker LoRA primer, attention-only LoRA
