@@ -30,6 +30,10 @@ DEFAULT_ARMS: list[tuple[str, list[int]]] = [
 
 OUTCOME_VERDICTS = {
     "INCONCLUSIVE": "INCONCLUSIVE: backend is not run-to-run deterministic (A2 != A1)",
+    "NO_NONALIGNED_ARM": (
+        "INCONCLUSIVE: the sweep contains no non-aligned segmentation, so it "
+        "cannot distinguish E0 under arbitrary splits from E0 only when aligned"
+    ),
     "E0_ARBITRARY": (
         "E0 UNDER ARBITRARY SEGMENTATION: every arm bit-identical "
         "(consistent with a segmentation-independent reduction order)"
@@ -172,10 +176,15 @@ def verdict(rows: list[dict], comparator) -> dict:
                     base["grad_norm"], r["grad_norm"]
                 ).passed
     all_nonalign_bit = all(r["bit_identical"] for r in nonalign)
-    max_rel = max(r["rel_diff"] for r in nonalign)
+    max_rel = max((r["rel_diff"] for r in nonalign), default=0.0)
 
     if not det:
         outcome = "INCONCLUSIVE"
+    elif not nonalign:
+        # Aligned arms alone cannot separate "invariant under every
+        # segmentation" from "invariant only where the split happens to
+        # match the engine's batching" — the sweep asked nothing.
+        outcome = "NO_NONALIGNED_ARM"
     elif all_nonalign_bit:
         outcome = "E0_ARBITRARY"
     elif aligned:
@@ -186,8 +195,13 @@ def verdict(rows: list[dict], comparator) -> dict:
     return {
         "outcome": outcome,
         "verdict": OUTCOME_VERDICTS[outcome].format(max_rel=max_rel),
-        # strict SPLIT_INV@E0; None = inconclusive (determinism control failed)
-        "passed": None if outcome == "INCONCLUSIVE" else outcome == "E0_ARBITRARY",
+        # strict SPLIT_INV@E0; None = the sweep could not decide (determinism
+        # control failed, or no non-aligned arm was submitted)
+        "passed": (
+            None
+            if outcome in ("INCONCLUSIVE", "NO_NONALIGNED_ARM")
+            else outcome == "E0_ARBITRARY"
+        ),
         "delta": max_rel,
         "determinism_ok": det,
         "aligned_bit_identical": aligned,

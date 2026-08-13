@@ -232,3 +232,30 @@ class TestModelCleanup:
                          driver=AngryDriver())
         assert doc["outcome"] == "E0_ARBITRARY"
         assert doc["passed"] is True
+
+
+class TestAlignedOnlySweep:
+    """A sweep of only aligned arms asks nothing about split-invariance and
+    must say so rather than crashing on an empty max()."""
+
+    def test_no_nonaligned_arm_is_inconclusive(self):
+        rows = [
+            {"arm": "A1", "segmentation": [8], "grad_norm": 3.0},
+            {"arm": "ALIGNED", "segmentation": [4, 4], "grad_norm": 3.0},
+            {"arm": "A2", "segmentation": [8], "grad_norm": 3.0},
+        ]
+        v = verdict(rows, E0)
+        assert v["outcome"] == "NO_NONALIGNED_ARM"
+        assert v["passed"] is None
+        assert v["delta"] == 0.0
+        assert "cannot distinguish" in v["verdict"]
+
+    def test_still_reports_a_failed_determinism_control(self):
+        rows = [
+            {"arm": "A1", "segmentation": [8], "grad_norm": 3.0},
+            {"arm": "ALIGNED", "segmentation": [4, 4], "grad_norm": 3.0},
+            {"arm": "A2", "segmentation": [8], "grad_norm": 3.5},
+        ]
+        v = verdict(rows, E0)
+        assert v["outcome"] == "INCONCLUSIVE"
+        assert v["passed"] is None
