@@ -28,7 +28,25 @@ python -m gates.runner seg_sweep --tag miles --segmentations '8;4,4;2,6;6,2;2,6;
     --expect E0_ALIGNED_ONLY   # miles deadlocks on rank-imbalanced splits at dp>1
 python -m gates.runner seg_sweep --tag nemo_rl_tp2 --model Qwen/Qwen3-8B-Base \
     --max-seq-len 8192 --debug-train-only --expect E0_ARBITRARY
+
+# PARTITION_INV: one call, only the submission order changes (--debug-train-only
+# is required on miles below NUM_GPUS=4 -- start_engines dies on
+# reordered_gpu_ids[gpu_index] at NUM_GPUS=2)
+python -m gates.runner order_perm --tag miles_dp4 --seed 7 --debug-train-only \
+    --expect INVARIANT
+python -m gates.runner order_perm --tag nemo_rl_dp4 --seed 7 --debug-train-only \
+    --expect PARTITION_INVARIANT_ORDER_SENSITIVE
+
+# SEED_REPRO: does the backend read LoraConfig.seed at all
+python -m gates.runner seed_repro --tag nemo_rl_dp4 --debug-train-only \
+    --expect SEED_HONORED
 ```
+
+**DP width is not an arm anywhere in this suite.** Width is fixed by the
+server's `NUM_GPUS` at launch, so one gate process cannot sweep it: run the
+gate once per server configuration and diff the verdict JSONs. On a
+buffered backend the width comparison is not certifiable through the API at
+all — LoRA `B` is zero-initialized, so no step-0 observable can see `A`.
 
 Exit code 0 iff `passed` (strict invariant at its claimed level) or, when
 `--expect` is given, the outcome matches the prediction. Verdict JSONs
@@ -57,6 +75,8 @@ results JSONs under `specs/*/probes/results/` remain comparable.
 | Gate | Invariant | Source | Status |
 |---|---|---|---|
 | G1b segmentation sweep (0.5B + 8B) | SPLIT_INV | `specs/008 probes/g1b_segmentation.py`, `specs/013 probes/g1b_8b.py` | **migrated** → `traces/seg_sweep.py` |
+| Order permutation (partition sensitivity) | PARTITION_INV | `specs/014 probes/order_perm_probe.py` | **migrated** → `traces/order_perm.py` |
+| Seed reproducibility | SEED_REPRO | (none — found by hand, tinker-cloud `995945e` + `GavinZhu-GMI/RL` `faba0bfc3`) | **new** → `traces/seed_repro.py` |
 | G1 grad-accum split | SPLIT_INV | `scripts/gates/g1_seam_parity.py` | pending (subsumed by seg_sweep default arms) |
 | G1c admission sweep | SPLIT_INV (admission clause) | `specs/008 probes/g1c_admission_sweep.py` | pending |
 | G2 client-order / pipelined | DEFER_OBS | `scripts/gates/g2_client_order.py`, `g2_pipelined.py` | pending |

@@ -39,6 +39,34 @@ REGISTRY: dict[str, Invariant] = {
             paper_ref="inv:split",
         ),
         Invariant(
+            id="PARTITION_INV",
+            statement=(
+                "the round's gradient does not depend on which datums share a "
+                "data-parallel rank: permuting the submission order of a "
+                "single fb call leaves optim_step's gradient unchanged"
+            ),
+            level="E0",
+            comparator="e0_bitwise",
+            tolerance_source="exact",
+            # strictly stronger than SPLIT_INV -- the DP-reduction defect
+            # (tinker-cloud 39add0a) was invisible at SPLIT_INV's aligned arm
+            # yet caught by a single permuted call. The manuscript has no
+            # dedicated partition label yet; inv:split is the nearest.
+            paper_ref="inv:split (no dedicated partition label; see HANDOFF 0-NEXT19)",
+        ),
+        Invariant(
+            id="SEED_REPRO",
+            statement=(
+                "two models created with the same client-supplied seed give "
+                "the same gradient on the same data, and a different seed "
+                "gives a different one -- the seed is read, not defaulted"
+            ),
+            level="E0",
+            comparator="e0_bitwise",
+            tolerance_source="exact",
+            paper_ref="sec:model:obs (client-supplied seed; no dedicated label)",
+        ),
+        Invariant(
             id="DEFER_OBS",
             statement=(
                 "deferring fb execution to optim_step is the identity on obs: "

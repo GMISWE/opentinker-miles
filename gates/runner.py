@@ -8,6 +8,10 @@ ad hoc verdict/result formats.
              max_seq_len=8192, debug_train_only=True), tag="nemo_rl_tp2")
 
 CLI: python -m gates.runner seg_sweep --tag nemo_rl [--model ...] --out results
+
+DP width is not an arm anywhere in this suite: it is fixed by the server's
+NUM_GPUS at launch, so a width comparison means invoking the runner once per
+server configuration and diffing the verdict JSONs.
 """
 
 import argparse
@@ -131,7 +135,42 @@ def _build_seg_sweep(args) -> tuple[Invariant, object]:
     return invariants.get("SPLIT_INV"), trace
 
 
-TRACES = {"seg_sweep": _build_seg_sweep}
+def _build_order_perm(args) -> tuple[Invariant, object]:
+    from gates.traces.order_perm import OrderPerm, default_arms
+
+    trace = OrderPerm(
+        model=args.model,
+        rank=args.rank,
+        seq=args.seq,
+        n=args.n,
+        seed=args.seed,
+        max_seq_len=args.max_seq_len,
+        debug_train_only=args.debug_train_only,
+    )
+    trace.arms = default_arms(trace.n)
+    return invariants.get("PARTITION_INV"), trace
+
+
+def _build_seed_repro(args) -> tuple[Invariant, object]:
+    from gates.traces.seed_repro import DEFAULT_SEED, SeedRepro
+
+    return invariants.get("SEED_REPRO"), SeedRepro(
+        model=args.model,
+        rank=args.rank,
+        seq=args.seq,
+        n=args.n,
+        seed=args.seed if args.seed is not None else DEFAULT_SEED,
+        contrast_seed=args.contrast_seed,
+        max_seq_len=args.max_seq_len,
+        debug_train_only=args.debug_train_only,
+    )
+
+
+TRACES = {
+    "order_perm": _build_order_perm,
+    "seed_repro": _build_seed_repro,
+    "seg_sweep": _build_seg_sweep,
+}
 
 
 def main():
@@ -143,7 +182,12 @@ def main():
     ap.add_argument("--model", default="Qwen/Qwen2.5-0.5B")
     ap.add_argument("--rank", type=int, default=32)
     ap.add_argument("--seq", type=int, default=64)
-    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--n", type=int, default=8,
+                    help="datums per round (order_perm needs it even)")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="fix LoRA init so runs at different dp are comparable")
+    ap.add_argument("--contrast-seed", type=int, default=99,
+                    help="seed_repro: the different-seed arm")
     ap.add_argument("--max-seq-len", type=int, default=None)
     ap.add_argument("--debug-train-only", action="store_true",
                     help="no inference engine (8B sweeps run this way)")
