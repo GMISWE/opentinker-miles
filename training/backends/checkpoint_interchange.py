@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 CHECKPOINT_BASE = "/data/checkpoints"
 HF_ADAPTER_DIRNAME = "hf_adapter"
 ADAPTER_WEIGHTS_FILE = "adapter_model.safetensors"
+ADAPTER_WEIGHTS_TORCH_FILE = "adapter_model.bin"
 ADAPTER_CONFIG_FILE = "adapter_config.json"
 
 
@@ -87,6 +88,30 @@ def _write_peft_keyed(weights_src: str, weights_dst: str) -> None:
     )
 
 
+def _write_peft_keyed_from_torch(weights_src: str, weights_dst: str) -> None:
+    """Convert a torch-serialized adapter (`adapter_model.bin`) to the
+    interchange safetensors, normalizing keys as `_write_peft_keyed` does.
+
+    Miles falls back to `.bin` because its fused-QKV export aliases the
+    shared lora_A across q/k/v and safetensors refuses shared storage;
+    tensors are cloned here so the file is loadable everywhere downstream.
+    """
+    import torch
+    from safetensors.torch import save_file
+
+    state = torch.load(weights_src, map_location="cpu", weights_only=True)
+    logger.info("Converting %d torch-serialized adapter tensors to safetensors", len(state))
+    save_file(
+        {
+            (k if k.startswith(PEFT_PREFIX) else f"{PEFT_PREFIX}{k}"):
+                v.detach().clone().contiguous()
+            for k, v in state.items()
+        },
+        weights_dst,
+        metadata={"format": "pt"},
+    )
+
+
 def export_hf_adapter(src_dir: str, checkpoint_root: str) -> Optional[str]:
     """Publish an adapter a backend just wrote into the interchange dir.
 
@@ -95,8 +120,12 @@ def export_hf_adapter(src_dir: str, checkpoint_root: str) -> Optional[str]:
     fine-tune, or a save that predates the first optimizer step).
     """
     weights_src = os.path.join(src_dir, ADAPTER_WEIGHTS_FILE)
-    if not os.path.isfile(weights_src):
-        logger.info("No %s under %s; skipping interchange export", ADAPTER_WEIGHTS_FILE, src_dir)
+    weights_torch_src = os.path.join(src_dir, ADAPTER_WEIGHTS_TORCH_FILE)
+    if not os.path.isfile(weights_src) and not os.path.isfile(weights_torch_src):
+        logger.info(
+            "No %s or %s under %s; skipping interchange export",
+            ADAPTER_WEIGHTS_FILE, ADAPTER_WEIGHTS_TORCH_FILE, src_dir,
+        )
         return None
 
     dest = hf_adapter_dir(checkpoint_root)
@@ -104,7 +133,10 @@ def export_hf_adapter(src_dir: str, checkpoint_root: str) -> Optional[str]:
     tmp = dest + ".tmp"
     shutil.rmtree(tmp, ignore_errors=True)
     os.makedirs(tmp, exist_ok=True)
-    _write_peft_keyed(weights_src, os.path.join(tmp, ADAPTER_WEIGHTS_FILE))
+    if os.path.isfile(weights_src):
+        _write_peft_keyed(weights_src, os.path.join(tmp, ADAPTER_WEIGHTS_FILE))
+    else:
+        _write_peft_keyed_from_torch(weights_torch_src, os.path.join(tmp, ADAPTER_WEIGHTS_FILE))
 
     config_src = os.path.join(src_dir, ADAPTER_CONFIG_FILE)
     if os.path.isfile(config_src):

@@ -61,6 +61,32 @@ def _publish_adapter(adapter_save_dir: Path, checkpoint_path: str, adapter_name:
     )
 
 
+def _publish_native_adapter(args, checkpoint_path: str) -> None:
+    """Single-tenant publish: miles' save_model writes the PEFT pair only into
+    its native `<args.save>/iter_*/adapter` dir (as `adapter_model.bin` — the
+    fused-QKV lora_A aliasing makes safetensors refuse), and nothing exported
+    the interchange copy since the publish hook moved onto the pool-mode
+    `adapter_save_dir`. Pick the adapter dir the save just wrote (newest
+    mtime; the numeric iter suffix is miles' own counter, monotone per save)
+    and export it. Runs under the handle's lock right after save_model, so
+    newest-mtime is the one this save produced."""
+    save_root = getattr(args, "save", None) if args else None
+    if not save_root or not os.path.isdir(save_root):
+        logger.warning("No miles save root at %r; skipping interchange publish", save_root)
+        return
+    candidates = [
+        os.path.join(save_root, d, "adapter")
+        for d in os.listdir(save_root)
+        if d.startswith("iter_")
+    ]
+    candidates = [c for c in candidates if os.path.isdir(c)]
+    if not candidates:
+        logger.warning("No iter_*/adapter under %s; nothing to publish", save_root)
+        return
+    latest = max(candidates, key=os.path.getmtime)
+    export_hf_adapter(latest, resolve_checkpoint_root(checkpoint_path, create=True))
+
+
 def _model_input_lens(data: List[Any]) -> List[int]:
     """Per-datum model_input token lengths (the observation-contract unit:
     fb logprobs are datum-aligned to these, NOT to rollout tokens which
@@ -1107,6 +1133,8 @@ class MilesBackend(TrainingBackend):
                 await asyncio.to_thread(
                     _publish_adapter, h.adapter_save_dir, checkpoint_path, h.adapter_name,
                 )
+            else:
+                await asyncio.to_thread(_publish_native_adapter, h.args, checkpoint_path)
             return checkpoint_path
 
         try:
