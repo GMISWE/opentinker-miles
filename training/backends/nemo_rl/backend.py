@@ -13,6 +13,7 @@ forward + backward + optimizer.step() in a single call.
 """
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -65,6 +66,10 @@ class NemoRLHandle(BackendHandle):
     staleness_k: int = 0                 # Declared max sampler staleness (A4, specs/012)
     generation_synced_version: int = 0   # ver(S): weight version the inference engine holds
     dyn_mb_base: int = 0                 # Base dynamic-batching token budget (A5, specs/013)
+    training_resident: bool = False      # model+optimizer GPU-resident in train mode; when
+                                         # True the per-step prepare_for_training (BUG-005,
+                                         # ~0.35 s/call, Q3-R2 phase decomposition) is skipped.
+                                         # Invalidated by every offload path (refit, ckpt load).
 
 
 class NemoRLBackend(TrainingBackend):
@@ -240,7 +245,9 @@ class NemoRLBackend(TrainingBackend):
             # Use prepare_for_training(), not prepare_for_lp_inference(): the latter
             # offloads the optimizer, deadlocking a concurrent apply_optimizer_step
             # in pipelined SFT. train vs eval mode gives identical logprobs (no dropout).
-            await asyncio.to_thread(h.policy.prepare_for_training)
+            if not h.training_resident:
+                await asyncio.to_thread(h.policy.prepare_for_training)
+                h.training_resident = True
 
             _ensure_dyn_mb_budget(h, batched_data)
             result = await asyncio.to_thread(h.policy.get_logprobs, batched_data)
@@ -435,7 +442,10 @@ class NemoRLBackend(TrainingBackend):
                 num_buffered = len(buffered_batches)
 
             # Concatenate outside the lock (CPU-bound, no contention needed)
+            phases: Dict[str, float] = {}  # Q3-R2 per-step cost decomposition
+            _t = time.time()
             all_data = await asyncio.to_thread(_concatenate_batches, buffered_batches)
+            phases["concat"] = time.time() - _t
 
             # CHK027: Warn if buffered sample count doesn't match train_global_batch_size
             # (check BEFORE padding so the warning reflects actual data volume)
@@ -503,8 +513,16 @@ class NemoRLBackend(TrainingBackend):
                     # model.train(). Without this, the model stays on CPU after
                     # generation's offload_after_refit() and loss.backward() fails
                     # with "element 0 of tensors does not require grad".
-                    logger.info("Preparing policy for training (CPU→CUDA + train mode)")
-                    await asyncio.to_thread(h.policy.prepare_for_training)
+                    if not h.training_resident:
+                        logger.info("Preparing policy for training (CPU→CUDA + train mode)")
+                        _t = time.time()
+                        await asyncio.to_thread(h.policy.prepare_for_training)
+                        phases["prepare"] = time.time() - _t
+                        h.training_resident = True
+                    else:
+                        # Q3-R2 adoption fix: nothing offloaded since the last train
+                        # call, so the BUG-005 invariant already holds.
+                        phases["prepare"] = 0.0
 
                     # BUG-011 fix: For RL loss functions, recompute prev_logprobs
                     # using DTensor forward pass (like native GRPO grpo.py:1530-1532).
@@ -546,6 +564,7 @@ class NemoRLBackend(TrainingBackend):
                     # Pass gbs=actual size so NeMo RL shards correctly instead of
                     # defaulting to config train_global_batch_size.
                     _ensure_dyn_mb_budget(h, all_data)
+                    _t = time.time()
                     train_result = await asyncio.to_thread(
                         h.policy.train,
                         data=all_data,
@@ -553,6 +572,7 @@ class NemoRLBackend(TrainingBackend):
                         eval_mode=False,
                         gbs=all_data.size,
                     )
+                    phases["train"] = time.time() - _t
 
                     logger.info(
                         "policy.train() result: loss=%s, grad_norm=%s, keys=%s, mb_metrics=%s",
@@ -582,6 +602,7 @@ class NemoRLBackend(TrainingBackend):
                                 h.colocated_inference,
                             )
                             h.generation_synced_version = h.weight_version
+                            h.training_resident = False  # refit offloaded the policy
                         else:
                             logger.info(
                                 "ver(S): refit deferred for %s — engine stays at v%d, "
@@ -619,8 +640,14 @@ class NemoRLBackend(TrainingBackend):
             # Extract per-sample training logprobs from curr_logprobs [B, S-1].
             # curr_logprobs are computed on pre-optimizer weights (correct KL semantics).
             # Use token_mask to extract response-only logprobs matching Miles format.
+            _t = time.time()
             loss_fn_outputs = _extract_loss_fn_outputs(
                 train_result.get("curr_logprobs"), all_data, original_size,
+            )
+            phases["extract"] = time.time() - _t
+            logger.info(
+                "optim_step phases (s): %s",
+                {k: round(v, 3) for k, v in phases.items()},
             )
 
             return {
@@ -653,6 +680,7 @@ class NemoRLBackend(TrainingBackend):
                     h.policy_generation,
                     h.colocated_inference,
                 )
+                h.training_resident = False  # refit offloaded the policy
                 async with h._generation_state_lock:
                     h.generation_state = "generation_ready"
         except Exception as e:
@@ -721,6 +749,7 @@ class NemoRLBackend(TrainingBackend):
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
             )
+            h.training_resident = False  # loaded state may not be GPU-resident
 
             if h.policy_generation is not None and not h.debug_train_only:
                 logger.info("Refitting policy generation after checkpoint load for %s", h.model_id)
@@ -975,6 +1004,7 @@ async def _ensure_generation_ready(handle) -> None:
             handle.policy_generation,
             handle.colocated_inference,
         )
+        handle.training_resident = False  # refit offloaded the policy
         handle.generation_synced_version = handle.weight_version
 
         async with handle._generation_state_lock:
