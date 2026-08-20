@@ -6,6 +6,7 @@ Thin HTTP layer for:
 2. Cleaning up old futures
 3. No business logic - just storage access
 """
+import asyncio
 import logging
 import time
 from datetime import datetime
@@ -17,6 +18,15 @@ from ..models.requests import CleanupFuturesRequest, RetrieveFutureRequest
 from ..models.responses import CleanupResult
 from ..storage import FuturesStorage
 from ..core.dependencies import verify_api_key_dep
+from ..core.task_manager import TaskManager
+
+# Hold a pending retrieve on the operation's task instead of answering 408
+# immediately. The SDK's retrieve cycle costs ~450 ms client-side, so an
+# immediate 408 turns completion discovery into a half-cycle latency tax
+# (~0.2-0.3 s per training step, measured 2026-08-20); the SDK's HTTP timeout
+# for retrieve is 300 s, so a held response is transparent to it, and 408
+# after the hold window keeps the protocol unchanged.
+LONG_POLL_HOLD_S = 30.0
 
 logger = logging.getLogger(__name__)
 
@@ -102,21 +112,19 @@ async def retrieve_future(
         else:
             raise HTTPException(status_code=404, detail=f"Future {request_id} not found")
 
-    # Return appropriate HTTP status code based on future status
-    if future["status"] == "completed":
-        # Log completion
-        if request_id in poll_tracking:
-            stats = poll_tracking.pop(request_id)
-            duration = time.time() - stats["start_time"]
-            logger.info(
-                f"[retrieve_future] {request_id} completed: "
-                f"{stats['count']} polls over {duration:.2f}s"
-            )
-        # Return 200 with result data only (matching original API)
-        return JSONResponse(content=future.get("result", {}))
+    def _respond(fut: Dict[str, Any]):
+        """Terminal-status dispatch (completed -> 200, failed -> 400)."""
+        if fut["status"] == "completed":
+            if request_id in poll_tracking:
+                stats = poll_tracking.pop(request_id)
+                duration = time.time() - stats["start_time"]
+                logger.info(
+                    f"[retrieve_future] {request_id} completed: "
+                    f"{stats['count']} polls over {duration:.2f}s"
+                )
+            # Return 200 with result data only (matching original API)
+            return JSONResponse(content=fut.get("result", {}))
 
-    elif future["status"] == "failed":
-        # Log failure
         if request_id in poll_tracking:
             stats = poll_tracking.pop(request_id)
             duration = time.time() - stats["start_time"]
@@ -126,19 +134,35 @@ async def retrieve_future(
             )
         # Extract error message
         error = None
-        result = future.get("result")
+        result = fut.get("result")
         if result and isinstance(result, dict) and "error" in result:
             error = result["error"]
-        elif "error" in future:
-            error = future["error"]
+        elif "error" in fut:
+            error = fut["error"]
         # Terminal failure -> 4xx: the SDK treats 408 and all 5xx as
         # retryable, so 500 here turns a dead op into an infinite client
         # poll loop (observed 2026-07-31, G6 blocker probe).
         raise HTTPException(status_code=400, detail=error or "Operation failed")
 
-    else:  # status == "pending"
-        # Return 408 (Request Timeout) while pending
-        raise HTTPException(status_code=408, detail="Operation still in progress")
+    if future["status"] != "pending":
+        return _respond(future)
+
+    # Pending: long-poll on the operation's task, then re-check once. The
+    # registry is class-level, so a fresh TaskManager sees tasks created by
+    # the training router. get_task returning None means the task finished
+    # (or predates a restart) — the re-read below covers that race.
+    task = TaskManager(futures_storage).get_task(request_id)
+    if task is not None:
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=LONG_POLL_HOLD_S)
+        except asyncio.TimeoutError:
+            pass
+        except Exception:
+            pass  # task errors are recorded in storage as status=failed
+    refreshed = futures_storage.get_future(request_id)
+    if refreshed and refreshed["status"] != "pending":
+        return _respond(refreshed)
+    raise HTTPException(status_code=408, detail="Operation still in progress")
 
 
 @router.post("/api/v1/retrieve_future")

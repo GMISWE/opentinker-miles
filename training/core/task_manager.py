@@ -42,6 +42,12 @@ class TaskManager:
         )
     """
 
+    # Process-global task registry. TaskManager is constructed per-request
+    # via Depends, so an instance-level dict would make get_task/cancel_task
+    # from any OTHER router a silent no-op (the futures router's long-poll
+    # needs to find tasks created by the training router).
+    _active_tasks: Dict[str, asyncio.Task] = {}
+
     def __init__(self, futures_storage: FuturesStorage):
         """
         Initialize task manager.
@@ -50,7 +56,6 @@ class TaskManager:
             futures_storage: Storage backend for task status tracking
         """
         self.futures_storage = futures_storage
-        self._active_tasks: Dict[str, asyncio.Task] = {}
 
     def create_task(
         self,

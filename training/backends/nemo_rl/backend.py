@@ -307,10 +307,12 @@ class NemoRLBackend(TrainingBackend):
                 }
 
             # Convert data to NeMo RL BatchedDataDict (outside lock — CPU-bound)
+            _t_conv = time.time()
             batched_data = self.converter.forward_backward_to_backend(
                 data, loss_fn, h.config,
                 image_preprocessor=h.image_preprocessor,
             )
+            _dt_conv = time.time() - _t_conv
 
             # CHK018: Acquire lock for buffer access (concurrent requests)
             async with h._buffer_lock:
@@ -376,6 +378,11 @@ class NemoRLBackend(TrainingBackend):
                 placeholder_outputs.append({
                     "logprobs": {"data": [0.0] * n, "shape": [n], "dtype": "float32"},
                 })
+            logger.info(
+                "fb phases (s): {'convert': %.3f} samples=%d placeholder_zeros=%d",
+                _dt_conv, len(data),
+                sum(len(p["logprobs"]["data"]) for p in placeholder_outputs),
+            )
             return {
                 "loss_fn_output_type": loss_fn,
                 "metrics": {},
