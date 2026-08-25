@@ -123,8 +123,13 @@ class TrainingBackend(ABC):
             - "metrics": {} (empty dict — no training has occurred)
             - "loss_fn_outputs": [] (empty list — logprobs not yet computed)
             - "deferred": True
+            The EMPTY loss_fn_outputs list is the deferred signal as seen by
+            clients — the "deferred" flag itself does not cross the wire, so
+            a backend must not return placeholder logprobs when deferring.
             Real metrics and logprobs are returned by apply_optimizer_step()
-            as a single batch covering all buffered forward_backward calls.
+            as a single batch covering all buffered forward_backward calls
+            (the aggregate loss arrives as metrics["total_loss"] there, which
+            clients prefer when fb returned no logprobs).
 
         Logprobs resolution (CHK011):
             NeMo RL computes training logprobs at optim_step time, not
@@ -185,6 +190,13 @@ class TrainingBackend(ABC):
 
         Returns:
             {"success": bool, "grad_norm": float, "metrics": {...}}
+
+            Client-visibility rule: any value SDK clients must see goes in
+            "metrics" — the SDK's response models follow the upstream tinker
+            shapes and silently drop unknown TOP-LEVEL fields (top level
+            reaches raw-HTTP callers only). The service layer mirrors
+            grad_norm into metrics; a backend adding a new client-facing
+            value must put it in metrics itself.
         """
         ...
 
