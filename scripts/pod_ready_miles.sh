@@ -47,7 +47,10 @@ fi
 
 echo "==> [4/6] torch_dist conversion"
 if ! EX "ls /data/.cache/huggingface/${MODEL}_torch_dist/iter_* >/dev/null 2>&1 || test -f /data/.cache/huggingface/${MODEL}_torch_dist/latest_checkpointed_iteration.txt"; then
-  MODEL_SH=$(echo "$MODEL" | tr '[:upper:]' '[:lower:]' | sed 's/^qwen/qwen/')
+  # scripts/models/ names keep the size capitalized (qwen3-8B.sh) and have
+  # no -Base suffix; full lowercasing never matched (latent until the first
+  # fresh-pod 8B conversion, 2026-08-25).
+  MODEL_SH=$(echo "$MODEL" | sed 's/-Base$//; s/^Qwen/qwen/')
   EX "set -u; export HF_HOME=/data/.cache/huggingface PYTHONDONTWRITEBYTECODE=1
       cd /root/miles && source scripts/models/${MODEL_SH}.sh
       PYTHONPATH=/root/Megatron-LM torchrun --nproc-per-node 1 \
