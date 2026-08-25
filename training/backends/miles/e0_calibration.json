@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "entries": [
+    {
+      "model": "Qwen2.5-0.5B",
+      "tp": 1,
+      "dp": 2,
+      "threshold_tokens_per_rank": 512,
+      "measured_range_tokens_per_rank": [189, 1512],
+      "measured": {
+        "date": "2026-08-21",
+        "gpu": "H200",
+        "rank": 32,
+        "image": "miles_tinker_seam:20260730",
+        "note": "bit-identity boundary located in [508, 566]; 23/23 pairs, 7/7 out-of-sample predictions"
+      }
+    },
+    {
+      "model": "Qwen3-8B-Base",
+      "tp": 2,
+      "dp": 1,
+      "threshold_tokens_per_rank": null,
+      "measured_range_tokens_per_rank": [189, 1512],
+      "measured": {
+        "date": "2026-08-24",
+        "gpu": "H200",
+        "rank": 32,
+        "image": "miles_tinker_seam:20260730",
+        "note": "all merges bit-identical across the swept range, including every boundary-crossing arm"
+      }
+    }
+  ]
+}
