@@ -588,9 +588,24 @@ class MilesBackend(TrainingBackend):
                 pool.cobatch_reorder = bool(int(
                     os.environ.get("TINKERCLOUD_MILES_COBATCH_REORDER", "0") or 0
                 ))
-                pool.cobatch_e0_tokens = int(
-                    os.environ.get("TINKERCLOUD_MILES_COBATCH_E0_TOKENS", "512") or 0
-                )
+                if pool.cobatch_max_samples > 0:
+                    # The guard threshold is a measured per-(model x parallel
+                    # config) constant, resolved from the calibration registry
+                    # (env override wins; an uncalibrated config gets no
+                    # merging at all). See e0_registry.
+                    from .e0_registry import resolve_e0
+                    res = resolve_e0(
+                        base_model,
+                        tp=int(getattr(args, "tensor_model_parallel_size", 1) or 1),
+                        dp=_dp_size(args),
+                    )
+                    pool.cobatch_e0_tokens = res.threshold
+                    if res.disable_cobatch:
+                        pool.cobatch_max_samples = 0
+                        logger.warning(
+                            "Pool co-batching requested but DISABLED: "
+                            "E0 calibration missing for this config"
+                        )
                 pool.dispatcher = asyncio.create_task(self._pool_dispatcher_loop(pool))
                 if pool.cobatch_max_samples > 0:
                     logger.info(
@@ -602,7 +617,8 @@ class MilesBackend(TrainingBackend):
                     logger.info(
                         "Pool co-batch E0 guard: %s",
                         f"refuse merges crossing {pool.cobatch_e0_tokens} tokens/rank"
-                        if pool.cobatch_e0_tokens > 0 else "OFF (merges may break E0)",
+                        if pool.cobatch_e0_tokens > 0
+                        else "open (no exactness boundary in the calibrated range)",
                     )
                 self._pool = pool
 
