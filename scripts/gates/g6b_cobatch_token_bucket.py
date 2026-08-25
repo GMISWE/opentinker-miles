@@ -26,8 +26,12 @@ PASS requires both. Run against a pool-mode server with merging on:
   python3 g6b_cobatch_token_bucket.py                 # guard on (expect PASS)
   python3 g6b_cobatch_token_bucket.py --expect-band   # guard OFF: assert the
                                                       # band REAPPEARS (control)
+  python3 g6b_cobatch_token_bucket.py --emit-entry --tp 1   # guard OFF:
+      # calibration mode — no PASS/FAIL, prints an e0_calibration.json entry
+      # (human-reviewed before it lands in the registry)
 """
 import argparse
+import json
 import os
 import sys
 import time
@@ -97,6 +101,13 @@ def main():
     ap.add_argument("--ns", default="6,8,9,10,12,16,20,24")
     ap.add_argument("--expect-band", action="store_true",
                     help="guard OFF control: require the predicted band to FAIL")
+    ap.add_argument("--emit-entry", action="store_true",
+                    help="calibration mode (run with the guard OFF): derive an "
+                         "e0_calibration.json entry from the sweep instead of "
+                         "asserting PASS/FAIL")
+    ap.add_argument("--tp", type=int, default=1,
+                    help="tensor-parallel width of the pool under test "
+                         "(recorded in the emitted entry)")
     cli = ap.parse_args()
     tok = SEQ - 1
     ns = [int(x) for x in cli.ns.split(",")]
@@ -132,6 +143,8 @@ def main():
             rows.append((n, solo_t, co_t, safe, merged, identical, gn_solo, gn_co))
             if idx == 0:
                 continue                        # arm 0 absorbs kernel warm-up
+            if cli.emit_entry:
+                continue                        # calibration: no gate semantics
             if cli.expect_band:
                 if safe and not identical:
                     fails.append(f"n={n} is SAFE by the law but diverged")
@@ -159,6 +172,48 @@ def main():
     print(f"\n(A) all bit-identical : {all(r[5] for r in rows[1:])}")
     print(f"(B) safe arms merged  : {all(r[4] for r in rows[1:] if r[3])}  "
           f"(any merge at all: {merged_any})")
+
+    if cli.emit_entry:
+        # Calibration derivation over arms that actually merged (unmerged
+        # arms are vacuous: their "co" run executed solo). A divergent arm's
+        # boundary lies in (solo_t, co_t); emit the conservative lower edge
+        # and record the bracket for human review.
+        merged_rows = [r for r in rows[1:] if r[4]]
+        if not merged_rows:
+            print("\nEMIT-ENTRY INVALID: no arm merged — check the server has "
+                  "merging ON and the guard OFF, and rerun.")
+            return 1
+        totals = sorted({t for r in merged_rows for t in (r[1], r[2])})
+        divergent = [r for r in merged_rows if not r[5]]
+        if divergent:
+            lo = max(r[1] for r in divergent)
+            hi = min(r[2] for r in divergent)
+            threshold, note = lo, (
+                f"boundary bracketed in ({lo}, {hi}) tokens/rank; "
+                f"{len(divergent)}/{len(merged_rows)} merged arms diverged"
+            )
+        else:
+            threshold, note = None, (
+                f"all {len(merged_rows)} merged arms bit-identical across the "
+                f"swept range"
+            )
+        entry = {
+            "model": BASE_MODEL.rsplit("/", 1)[-1],
+            "tp": cli.tp,
+            "dp": cli.dp,
+            "threshold_tokens_per_rank": threshold,
+            "measured_range_tokens_per_rank": [totals[0], totals[-1]],
+            "measured": {
+                "date": time.strftime("%Y-%m-%d"),
+                "rank": RANK,
+                "note": note,
+            },
+        }
+        print("\nE0_CALIBRATION_ENTRY (review, then add to "
+              "training/backends/miles/e0_calibration.json):")
+        print(json.dumps(entry, indent=2))
+        return 0
+
     if not cli.expect_band and not merged_any:
         fails.append("no arm merged at all — the gate would pass vacuously")
 
