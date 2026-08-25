@@ -20,6 +20,12 @@ and asserts two things, because either alone is trivially satisfiable:
   (B) the arms the law says are SAFE still merge -- a guard that is switched
       off passes B
 
+Bit-identity is judged on TWO observables jointly: the fp32 grad-norm AND
+the per-sample response log-probs (repr-exact). Grad-norm alone is blunt --
+an fp32-rounded scalar hides ~1e-7 relative logit drift that per-token
+fp32 log-probs expose exactly (the 2026-08-25 G7 adjudication: merges
+grad-identical yet log-prob-divergent on the rebuilt image).
+
 PASS requires both. Run against a pool-mode server with merging on:
   TINKERCLOUD_MILES_MULTILORA_SLOTS>0, COBATCH_MAX_SAMPLES>=2048.
 
@@ -87,6 +93,10 @@ def step_lr0(model_id):
     sys.exit(2)
 
 
+def lps_of(fb_result):
+    return repr([o["logprobs"].to_torch().tolist() for o in fb_result.loss_fn_outputs])
+
+
 def per_rank(n, dp, tok):
     """Same arithmetic the server guard uses: pad to a dp multiple, then stride."""
     lengths = [tok] * n
@@ -116,21 +126,30 @@ def main():
     tc_a = sc.create_lora_training_client(base_model=BASE_MODEL, rank=RANK)
     tc_b = sc.create_lora_training_client(base_model=BASE_MODEL, rank=RANK)
     print(f"A={tc_a.model_id} B={tc_b.model_id}", flush=True)
-    blocker = make_datums(int(os.environ.get("G6B_BLOCKER", "2")), salt=9)
+    # The blocker must still be RUNNING when both fbs reach the queue, or the
+    # arm silently executes solo (2/8 arms merged on the 2026-08-25 build
+    # with the old 2-datum blocker + 0.2s settle — the build outran it).
+    blocker = make_datums(int(os.environ.get("G6B_BLOCKER", "256")), salt=9)
     rows, fails = [], []
 
     try:
-        make_datums(8, salt=99)  # warm-up shapes below
+        # Kernel-regime warm-up: the first larger-shape call permanently
+        # shifts the process's kernel selection (solo logprobs move 1-2 ulp
+        # once, then solo and merged are bit-stable — g7diag2_regime,
+        # 2026-08-25). Flip before any baseline; arm 0 additionally stays
+        # excluded from gate semantics as a second guard.
+        tc_a.forward(make_datums(256, salt=99), "cross_entropy").result()
         for idx, n in enumerate(ns):
             a_ds, b_ds = make_datums(n, salt=1), make_datums(n, salt=2)
             solo_t, co_t = per_rank(n, cli.dp, tok), per_rank(2 * n, cli.dp, tok)
             safe = (solo_t <= THRESHOLD) == (co_t <= THRESHOLD)
 
             r_solo = tc_a.forward_backward(a_ds, "cross_entropy").result()
+            lp_solo = lps_of(r_solo)
             gn_solo = step_lr0(tc_a.model_id).get("grad_norm")
 
             fut_blk = tc_a.forward(blocker, "cross_entropy")
-            time.sleep(float(os.environ.get("G6B_SETTLE", "0.2")))
+            time.sleep(float(os.environ.get("G6B_SETTLE", "0.1")))
             fut_a = tc_a.forward_backward(a_ds, "cross_entropy")
             fut_b = tc_b.forward_backward(b_ds, "cross_entropy")
             fut_blk.result()
@@ -139,20 +158,24 @@ def main():
             gn_co = step_lr0(tc_a.model_id).get("grad_norm")
             step_lr0(tc_b.model_id)
 
-            identical = repr(gn_solo) == repr(gn_co)
-            rows.append((n, solo_t, co_t, safe, merged, identical, gn_solo, gn_co))
+            gn_id = repr(gn_solo) == repr(gn_co)
+            lp_id = lps_of(r_co) == lp_solo
+            identical = gn_id and lp_id
+            rows.append((n, solo_t, co_t, safe, merged, identical, gn_id, lp_id))
             if idx == 0:
                 continue                        # arm 0 absorbs kernel warm-up
             if cli.emit_entry:
                 continue                        # calibration: no gate semantics
             if cli.expect_band:
                 if safe and not identical:
-                    fails.append(f"n={n} is SAFE by the law but diverged")
+                    fails.append(f"n={n} is SAFE by the law but diverged "
+                                 f"(grad_norm={gn_id}, logprobs={lp_id})")
                 if not safe and identical and merged:
                     fails.append(f"n={n} should straddle and diverge, but was identical")
             else:
                 if not identical:
-                    fails.append(f"n={n} NOT bit-identical ({gn_solo!r} vs {gn_co!r})")
+                    fails.append(f"n={n} NOT bit-identical "
+                                 f"(grad_norm={gn_id}, logprobs={lp_id})")
                 if safe and not merged:
                     fails.append(f"n={n} is safe but did NOT merge (guard too strict / merging off)")
     finally:
@@ -163,10 +186,11 @@ def main():
             except Exception as e:  # noqa: BLE001
                 print(f"DELETE FAILED {m}: {e}")
 
-    print(f"\n{'n':>4} {'solo/rk':>8} {'co/rk':>7} {'law':>7} {'merged':>7} {'bit-id':>7}")
-    for n, s, c, safe, merged, identical, _, _ in rows:
+    print(f"\n{'n':>4} {'solo/rk':>8} {'co/rk':>7} {'law':>7} {'merged':>7} "
+          f"{'bit-id':>7} {'gn-id':>6} {'lp-id':>6}")
+    for n, s, c, safe, merged, identical, gn_id, lp_id in rows:
         print(f"{n:>4} {s:>8} {c:>7} {'safe' if safe else 'STRADDLE':>8} "
-              f"{str(merged):>7} {str(identical):>7}")
+              f"{str(merged):>7} {str(identical):>7} {str(gn_id):>6} {str(lp_id):>6}")
 
     merged_any = any(r[4] for r in rows[1:])
     print(f"\n(A) all bit-identical : {all(r[5] for r in rows[1:])}")
@@ -185,13 +209,29 @@ def main():
             return 1
         totals = sorted({t for r in merged_rows for t in (r[1], r[2])})
         divergent = [r for r in merged_rows if not r[5]]
+        ident = [r for r in merged_rows if r[5]]
         if divergent:
-            lo = max(r[1] for r in divergent)
-            hi = min(r[2] for r in divergent)
-            threshold, note = lo, (
-                f"boundary bracketed in ({lo}, {hi}) tokens/rank; "
-                f"{len(divergent)}/{len(merged_rows)} merged arms diverged"
-            )
+            # A token-bucket law fits only if some T is crossed by EVERY
+            # divergent arm and by NO identical arm. Otherwise the config has
+            # no safe region a threshold can express (-1: co-batching off).
+            def crosses(r, t):
+                return (r[1] <= t) != (r[2] <= t)
+            candidates = [t for t in totals
+                          if all(crosses(r, t) for r in divergent)
+                          and not any(crosses(r, t) for r in ident)]
+            if candidates:
+                lo, hi = min(candidates), max(candidates)
+                threshold, note = lo, (
+                    f"boundary bracketed in [{lo}, {hi}] tokens/rank; "
+                    f"{len(divergent)}/{len(merged_rows)} merged arms diverged"
+                )
+            else:
+                threshold, note = -1, (
+                    f"NO safe region: {len(divergent)}/{len(merged_rows)} "
+                    f"merged arms diverged and no token-bucket boundary "
+                    f"separates them from the identical arms "
+                    f"(grad/logprob joint observable)"
+                )
         else:
             threshold, note = None, (
                 f"all {len(merged_rows)} merged arms bit-identical across the "

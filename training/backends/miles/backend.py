@@ -603,8 +603,10 @@ class MilesBackend(TrainingBackend):
                     if res.disable_cobatch:
                         pool.cobatch_max_samples = 0
                         logger.warning(
-                            "Pool co-batching requested but DISABLED: "
-                            "E0 calibration missing for this config"
+                            "Pool co-batching requested but DISABLED: %s",
+                            "calibration measured no safe region for this config"
+                            if res.source == "registry"
+                            else "E0 calibration missing for this config",
                         )
                 pool.dispatcher = asyncio.create_task(self._pool_dispatcher_loop(pool))
                 if pool.cobatch_max_samples > 0:

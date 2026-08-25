@@ -35,6 +35,9 @@ def registry(tmp_path):
             {"model": "ModelB", "tp": 2, "dp": 1,
              "threshold_tokens_per_rank": None,
              "measured_range_tokens_per_rank": [189, 1512]},
+            {"model": "ModelC", "tp": 1, "dp": 2,
+             "threshold_tokens_per_rank": -1,
+             "measured_range_tokens_per_rank": [189, 1512]},
         ],
     }))
     return p
@@ -62,6 +65,12 @@ def test_registry_null_means_guard_open(monkeypatch, registry):
     monkeypatch.delenv("TINKERCLOUD_MILES_COBATCH_E0_TOKENS", raising=False)
     res = resolve_e0("ModelB", tp=2, dp=1, registry_path=registry)
     assert (res.source, res.threshold, res.disable_cobatch) == ("registry", 0, False)
+
+
+def test_registry_no_safe_region_disables_cobatch(monkeypatch, registry):
+    monkeypatch.delenv("TINKERCLOUD_MILES_COBATCH_E0_TOKENS", raising=False)
+    res = resolve_e0("ModelC", tp=1, dp=2, registry_path=registry)
+    assert (res.source, res.threshold, res.disable_cobatch) == ("registry", 0, True)
 
 
 def test_parallel_shape_is_part_of_the_key(monkeypatch, registry):

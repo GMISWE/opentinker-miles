@@ -12,7 +12,7 @@
         "gpu": "H200",
         "rank": 32,
         "image": "miles_tinker_seam:20260730",
-        "note": "bit-identity boundary located in [508, 566]; 23/23 pairs, 7/7 out-of-sample predictions"
+        "note": "bit-identity boundary located in [508, 566]; 23/23 pairs, 7/7 out-of-sample predictions. Re-measured 2026-08-25 with the logprob-extended instrument after kernel-regime warm-up: grad boundary bracket [504, 567) — 512 stands; logprobs merge-invariant at every width"
       }
     },
     {
@@ -26,7 +26,7 @@
         "gpu": "H200",
         "rank": 32,
         "image": "miles_tinker_seam:20260730",
-        "note": "all merges bit-identical across the swept range, including every boundary-crossing arm"
+        "note": "all merges bit-identical across the swept range, including every boundary-crossing arm. Re-measured 2026-08-25 with the logprob-extended instrument: bit-identical on grads AND logprobs, range extended to [504, 3024] tokens/rank"
       }
     }
   ]
