@@ -17,6 +17,8 @@ rotate the server between runs (models are not auto-reaped).
 | `g5_pinned_v0.py` | G5 pinned-v0 + sampler routing | v0 sampler == base, bit-stable across training; live != base; per-tenant routing (B live == base while A live differs) |
 | `g6_batch_invariance.py` | G6 batch-invariance (M3, AC1) | same tenant data solo vs co-batched with different co-tenant mixes ⇒ bit-identical per-tenant grad_norm + logprobs (needs `TINKERCLOUD_MILES_COBATCH_MAX_SAMPLES>=16`) |
 
+| `g6b_cobatch_token_bucket.py` | G6b generalised co-batching E0 gate (the repair's gate) | sweeps `n` ACROSS the predicted band instead of sampling one point. Asserts BOTH that every arm is bit-identical AND that the arms the law calls safe still merge — either alone is trivially satisfiable. `--expect-band` is the control: with `TINKERCLOUD_MILES_COBATCH_E0_TOKENS=0` the band must REAPPEAR. Needs `COBATCH_MAX_SAMPLES>=2048`. |
+
 | `g9_adapter_interchange.py` | G9a adapter round-trip / G9b seam continuity | `export`: exported `hf_adapter/` reproduces the training engine's logprobs under fp32 HF+peft (corr > 0.999, gap < 0.03 nats). `import`: a model created FROM that checkpoint on another backend matches the source's logprobs on the same frozen probe batch |
 
 G9 is the Q5 migration seam gate (specs/007-q5-migration). Run `export` on
