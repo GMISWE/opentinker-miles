@@ -93,6 +93,14 @@ class TrainingService:
             handle, learning_rate=learning_rate, adam_params=adam_params_dict,
         )
 
+        # Mirror top-level grad_norm into the metrics dict: the SDK's
+        # OptimStepResponse carries only `metrics` (upstream shape), so a
+        # value left at top level is silently dropped at the client seam.
+        if result.get("grad_norm") is not None:
+            metrics = dict(result.get("metrics") or {})
+            metrics.setdefault("grad_norm", float(result["grad_norm"]))
+            result["metrics"] = metrics
+
         logger.info(
             "Optimizer step completed for %s: grad_norm=%s, success=%s",
             model_id,
