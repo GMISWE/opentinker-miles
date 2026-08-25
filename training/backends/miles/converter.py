@@ -129,6 +129,57 @@ class MilesDataConverter(DataConverter):
         return n_pad
 
     @staticmethod
+    def per_rank_token_totals(batches: List[Any], dp_size: int) -> List[int]:
+        """Per-rank packed-token totals for the call that would dispatch `batches`.
+
+        Mirrors the engine's own split so the guard below reasons about the
+        shape actually handed to the kernels: samples concatenate in request
+        order, the batch is padded to a multiple of ``dp_size`` (pads copy the
+        tail sample, so they carry its length — see
+        :meth:`pad_rollout_data_to_dp`), and rank *i* takes the strided slice
+        ``range(i, N, dp_size)`` (miles
+        ``ray/rollout/train_data_conversion.py:211``). The per-slot sort that
+        follows it reorders within a rank but does not move samples between
+        ranks, so it cannot change these totals.
+        """
+        dp = max(int(dp_size), 1)
+        lengths = [len(t) for b in batches for t in b.get("tokens", ())]
+        if not lengths:
+            return [0] * dp
+        if dp > 1 and len(lengths) % dp:
+            lengths = lengths + [lengths[-1]] * (dp - len(lengths) % dp)
+        return [sum(lengths[i::dp]) for i in range(dp)]
+
+    @staticmethod
+    def cobatch_preserves_token_bucket(
+        batches: List[Any], dp_size: int, threshold: int
+    ) -> bool:
+        """Whether merging `batches` keeps every constituent's per-rank token
+        bucket — the E0 admission test for co-batching.
+
+        Measured 2026-08-21 (23/23 pairs, 7/7 out-of-sample): a tenant's
+        gradient is bit-identical between solo and co-batched execution **iff
+        both calls' per-rank token totals fall on the same side of a threshold
+        near 512**. Merging adds the co-tenant's tokens to the rank, so it can
+        move the call across that boundary; refusing exactly those merges is
+        what keeps co-batching E0-exact. Everything else still merges.
+
+        Conservative by construction: a merge is admitted only when *every*
+        rank of *every* constituent, and every rank of the merged call, land in
+        the same bucket. ``threshold <= 0`` disables the guard.
+        """
+        if threshold <= 0 or len(batches) < 2:
+            return True
+        buckets = {t <= threshold
+                   for t in MilesDataConverter.per_rank_token_totals(batches, dp_size)}
+        for b in batches:
+            buckets |= {t <= threshold
+                        for t in MilesDataConverter.per_rank_token_totals([b], dp_size)}
+            if len(buckets) > 1:
+                return False
+        return len(buckets) == 1
+
+    @staticmethod
     def merge_forward_backward_batches(batches: List[Any]) -> Any:
         """Concatenate per-request rollout_data dicts into one mixed-slot
         batch (M3 co-batching). Per-sample list keys concatenate in request

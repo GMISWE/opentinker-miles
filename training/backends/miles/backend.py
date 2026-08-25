@@ -191,6 +191,10 @@ class MilesPool:
     # (cross-tenant order is not contractual; per-tenant FIFO is preserved
     # via the blocked-tenant rule). Off by default.
     cobatch_reorder: bool = False
+    # E0 admission guard: refuse a merge that would move the call's per-rank
+    # token total across this boundary. 0 disables. See
+    # converter.cobatch_preserves_token_bucket.
+    cobatch_e0_tokens: int = 512
 
 
 class MilesBackend(TrainingBackend):
@@ -584,6 +588,9 @@ class MilesBackend(TrainingBackend):
                 pool.cobatch_reorder = bool(int(
                     os.environ.get("TINKERCLOUD_MILES_COBATCH_REORDER", "0") or 0
                 ))
+                pool.cobatch_e0_tokens = int(
+                    os.environ.get("TINKERCLOUD_MILES_COBATCH_E0_TOKENS", "512") or 0
+                )
                 pool.dispatcher = asyncio.create_task(self._pool_dispatcher_loop(pool))
                 if pool.cobatch_max_samples > 0:
                     logger.info(
@@ -591,6 +598,11 @@ class MilesBackend(TrainingBackend):
                         " (reorder drain %s)",
                         pool.cobatch_max_samples,
                         "ON" if pool.cobatch_reorder else "off",
+                    )
+                    logger.info(
+                        "Pool co-batch E0 guard: %s",
+                        f"refuse merges crossing {pool.cobatch_e0_tokens} tokens/rank"
+                        if pool.cobatch_e0_tokens > 0 else "OFF (merges may break E0)",
                     )
                 self._pool = pool
 
@@ -715,6 +727,11 @@ class MilesBackend(TrainingBackend):
                     and nxt.loss_fn == op.loss_fn
                     and nxt.tenant not in blocked
                     and total + nxt.num_samples <= pool.cobatch_max_samples
+                    and self.converter.cobatch_preserves_token_bucket(
+                        [o.rollout_data for o in batch] + [nxt.rollout_data],
+                        _dp_size(pool.args),
+                        pool.cobatch_e0_tokens,
+                    )
                 ):
                     batch.append(nxt)
                     total += nxt.num_samples
