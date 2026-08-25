@@ -12,6 +12,9 @@ window microseconds after its fb (measured: 0 merges across a full
 2-tenant recipe arm). The reorder drain defers OTHER tenants' non-fb ops
 past the window — legal because only per-tenant submission order is
 contractual (isolation invariant, G4). This gate checks the relaxation:
+  P0: kernel-regime warm-up — one large forward, discarded. The first
+     larger-shape call shifts kernel selection once (1-2 ulp); baselines
+     must be captured post-flip or every later comparison false-fails.
   P1: tenants A and B on one pool.
   P2 solo baselines: fb alone + step(lr=0) per tenant -> grad_norm + logprobs.
   P3 pipelined+reordered: [fb_A, step_A, fb_B, step_B] submitted back-to-back
@@ -24,6 +27,14 @@ contractual (isolation invariant, G4). This gate checks the relaxation:
      — logprobs must stay bit-stable every round; merge count reported
      (timing-dependent, not asserted).
 PASS = every comparison bit-identical (repr equality).
+
+G7_EXPECT selects the calibrated mode (default "merge"):
+  merge  — the registry admits merges here: P3 must merge AND be bit-exact.
+  refuse — the registry measured no safe region (threshold -1) and disabled
+           co-batching: P3/P4 must NOT merge, and the reorder/carry machinery
+           must leave every solo result bit-identical to baseline.
+The expectation is an input, not auto-detected: a merge path that silently
+stopped merging must fail the merge mode, not pass as refusal.
 """
 import os, sys, time
 
@@ -96,9 +107,12 @@ def merged_flag(res):
 
 
 LR0 = types.AdamParams(learning_rate=0.0)
+EXPECT = os.environ.get("G7_EXPECT", "merge")
+assert EXPECT in ("merge", "refuse"), f"G7_EXPECT must be merge|refuse, got {EXPECT!r}"
 
 
 def main():
+    print(f"G7 mode: {EXPECT}", flush=True)
     sc = tinker.ServiceClient()
 
     print("P1: two tenants on one pool", flush=True)
@@ -109,6 +123,14 @@ def main():
     probe_a = make_datums(8, salt=1)
     probe_b = make_datums(8, salt=2)
     blocker = make_datums(2, salt=9)   # >= DP size (known gap, 003)
+
+    print("P0 kernel-regime warm-up (large forward, result discarded)", flush=True)
+    # The first larger-shape call permanently shifts the process's kernel
+    # selection: solo logprobs move 1-2 ulp ONCE, then everything — solo and
+    # merged alike — is bit-stable (g7diag2_regime, 2026-08-25). A baseline
+    # captured pre-flip fails every post-merge comparison, which is exactly
+    # how this gate false-failed. Flip the regime before any baseline.
+    tc_a.forward(make_datums(256, salt=8), "cross_entropy").result()
 
     print("P2 solo baselines", flush=True)
     ra = tc_a.forward_backward(probe_a, "cross_entropy").result()
@@ -128,9 +150,14 @@ def main():
     fut_blk.result()
     res_a, res_b = fut_a.result(), fut_b.result()
     fut_sa.result(), fut_sb.result()
-    check("P3 merge engaged (A)", merged_flag(res_a),
-          f"(metrics A={sorted((res_a.metrics or {}))})")
-    check("P3 merge engaged (B)", merged_flag(res_b))
+    if EXPECT == "merge":
+        check("P3 merge engaged (A)", merged_flag(res_a),
+              f"(metrics A={sorted((res_a.metrics or {}))})")
+        check("P3 merge engaged (B)", merged_flag(res_b))
+    else:
+        check("P3 merge refused (A)", not merged_flag(res_a),
+              f"(metrics A={sorted((res_a.metrics or {}))})")
+        check("P3 merge refused (B)", not merged_flag(res_b))
     check("P3 A logprobs pipelined==solo", lps_of(res_a) == lp_a_solo)
     check("P3 B logprobs pipelined==solo", lps_of(res_b) == lp_b_solo)
     # Post-round state probes: the deferred steps must have consumed exactly
@@ -154,6 +181,8 @@ def main():
         res_a, res_b = fut_a.result(), fut_b.result()
         fut_sa.result(), fut_sb.result()
         merges += int(merged_flag(res_a) and merged_flag(res_b))
+        if EXPECT == "refuse":
+            check(f"P4 r{rnd} no merge", not merged_flag(res_a) and not merged_flag(res_b))
         check(f"P4 r{rnd} A logprobs stable", lps_of(res_a) == lp_a_solo)
         check(f"P4 r{rnd} B logprobs stable", lps_of(res_b) == lp_b_solo)
     print(f"  natural-traffic merge rounds: {merges}/5 (informational)", flush=True)

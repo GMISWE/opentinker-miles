@@ -12,10 +12,20 @@ Resolution order:
      override (an operator decision; logged as such).
   2. Registry entry for (model basename, tp, dp) -> its measured threshold;
      ``null`` in the registry means "no boundary found in the measured
-     range" and resolves to guard-open (0).
+     range" and resolves to guard-open (0); ``-1`` means "measured: NO safe
+     region — some merge inside a single bucket already diverges" and
+     resolves to co-batching disabled (a measured verdict, unlike 3).
   3. No entry -> UNCALIBRATED: the caller must disable co-batching
      entirely. Merging a configuration whose exactness behavior was never
      measured would turn the guard into an assertion.
+
+The calibration observable is per-sample response LOG-PROBS compared
+bit-wise, jointly with the fp32 grad-norm. Grad-norm alone is too blunt:
+it is an fp32-rounded scalar (ulp ~7.6e-6 at magnitude 128), so ~1e-7
+relative logit drift under a changed batch layout is invisible in it while
+per-token fp32 log-probs expose the same drift exactly. An entry measured
+with the grad-only instrument can therefore admit merges that are not
+E0 over the full observable set.
 
 New entries come from the calibration sweep
 (`scripts/gates/g6b_cobatch_token_bucket.py --emit-entry`, guard off) and
@@ -38,7 +48,7 @@ _REGISTRY_PATH = Path(__file__).with_name("e0_calibration.json")
 class E0Resolution:
     source: str                    # "env" | "registry" | "uncalibrated"
     threshold: int                 # tokens/rank; 0 = guard open (no refusals)
-    disable_cobatch: bool          # True only for "uncalibrated"
+    disable_cobatch: bool          # "uncalibrated", or measured no-safe-region
 
 
 def _load_entries(path: Path = _REGISTRY_PATH) -> list:
@@ -84,6 +94,14 @@ def resolve_e0(base_model: str, tp: int, dp: int,
                 )
                 return E0Resolution(source="registry", threshold=0,
                                     disable_cobatch=False)
+            if int(thr) < 0:
+                logger.warning(
+                    "E0 calibration for (%s, tp=%d, dp=%d): measured NO safe "
+                    "region (%s) — co-batching DISABLED for this pool",
+                    basename, tp, dp, ent.get("measured", {}).get("note"),
+                )
+                return E0Resolution(source="registry", threshold=0,
+                                    disable_cobatch=True)
             logger.info(
                 "E0 calibration for (%s, tp=%d, dp=%d): threshold %d "
                 "tokens/rank (measured %s)",
