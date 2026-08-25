@@ -743,14 +743,21 @@ class MilesBackend(TrainingBackend):
                     and nxt.loss_fn == op.loss_fn
                     and nxt.tenant not in blocked
                     and total + nxt.num_samples <= pool.cobatch_max_samples
-                    and self.converter.cobatch_preserves_token_bucket(
+                ):
+                    if self.converter.cobatch_preserves_token_bucket(
                         [o.rollout_data for o in batch] + [nxt.rollout_data],
                         _dp_size(pool.args),
                         pool.cobatch_e0_tokens,
-                    )
-                ):
-                    batch.append(nxt)
-                    total += nxt.num_samples
+                    ):
+                        batch.append(nxt)
+                        total += nxt.num_samples
+                    else:
+                        # E0 guard refusal ENDS the merge window: deferring a
+                        # refused fb would convoy it behind blocked-tenant
+                        # bookkeeping and replay for no gain (the next window
+                        # re-evaluates it as head).
+                        carry = nxt
+                        break
                 elif (
                     pool.cobatch_reorder
                     and nxt.kind != "stop"
