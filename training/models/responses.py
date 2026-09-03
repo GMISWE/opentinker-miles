@@ -4,9 +4,9 @@ Response models for the training API.
 This module defines Pydantic models for all API response payloads,
 providing structured responses and documentation.
 """
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
 class AsyncOperationResponse(BaseModel):
@@ -63,29 +63,61 @@ class TensorData(BaseModel):
     dtype: str = Field(default="float32", description="Data type")
 
 
-class LossFnOutput(BaseModel):
-    """Loss function output for a single sample."""
-
-    loss: TensorData = Field(..., description="Loss value")
-    logprobs: Optional[TensorData] = Field(default=None, description="Log probabilities")
+# Per-sample loss function output: named tensors ("logprobs", "logits", ...),
+# exactly the SDK's LossFnOutput = Dict[str, TensorData].
+LossFnOutput = Dict[str, TensorData]
 
 
-class ForwardBackwardResult(BaseModel):
-    """Result from forward-backward pass."""
+class _Result(BaseModel):
+    """Base for async-operation results: required fields are what the SDK
+    requires; backend-specific extras (deferred, weight_version, ...) pass through."""
+
+    model_config = ConfigDict(extra="allow")
+
+
+class ForwardBackwardResult(_Result):
+    """Result from forward-backward pass (SDK ForwardBackwardOutput)."""
 
     loss_fn_output_type: str = Field(..., description="Loss function type")
     loss_fn_outputs: List[LossFnOutput] = Field(..., description="Per-sample outputs")
     metrics: Dict[str, float] = Field(default_factory=dict, description="Training metrics")
-    logprobs: Optional[TensorData] = Field(default=None, description="Batch log probabilities")
 
 
-class OptimStepResult(BaseModel):
-    """Result from optimizer step (new format)."""
+class ForwardResult(ForwardBackwardResult):
+    """Forward pass result (same shape, type='forward')."""
+
+    type: str = Field(default="forward", description="Operation type")
+
+
+class OptimStepResult(_Result):
+    """Result from optimizer step (SDK OptimStepResponse)."""
+
+    metrics: Dict[str, float] = Field(default_factory=dict, description="Step metrics (grad_norm mirrored here)")
+    loss_fn_outputs: Optional[List[LossFnOutput]] = Field(
+        default=None, description="Per-sample outputs when the backend defers them to the step")
+    grad_norm: Optional[float] = Field(default=None, description="Gradient norm")
     success: bool = Field(default=True, description="Whether step succeeded")
-    grad_norm: float = Field(..., description="Gradient norm")
-    learning_rates: Dict[str, float] = Field(default_factory=dict, description="Learning rates per param group")
-    status: str = Field(default="completed", description="Operation status")
-    step_num: Optional[int] = Field(default=None, description="Step number")
+
+
+class CreateModelResult(_Result):
+    """Result from create_model (SDK CreateModelResponse)."""
+
+    model_id: str = Field(..., description="Model ID")
+    type: Literal["create_model"] = "create_model"
+
+
+class SaveWeightsResult(_Result):
+    """Result from save_weights (SDK SaveWeightsResponse)."""
+
+    path: str = Field(..., description="tinker:// URI of the checkpoint")
+    type: Literal["save_weights"] = "save_weights"
+
+
+class LoadWeightsResult(_Result):
+    """Result from load_weights (SDK LoadWeightsResponse)."""
+
+    path: Optional[str] = Field(default=None, description="Path that was loaded")
+    type: Literal["load_weights"] = "load_weights"
 
 
 class CheckpointInfo(BaseModel):
@@ -97,17 +129,17 @@ class CheckpointInfo(BaseModel):
     type: str = Field(default="save_weights", description="Checkpoint type")
 
 
-class SamplingSequence(BaseModel):
-    """Generated sequence from sampling."""
+class SamplingSequence(_Result):
+    """Generated sequence from sampling (SDK SampledSequence)."""
 
     stop_reason: str = Field(..., description="Reason for stopping: stop or length")
     tokens: List[int] = Field(..., description="Generated token IDs")
-    logprobs: List[float] = Field(..., description="Log probabilities")
+    logprobs: Optional[List[float]] = Field(default=None, description="Log probabilities")
     text: Optional[str] = Field(default=None, description="Decoded text")
 
 
-class SampleResult(BaseModel):
-    """Result from sampling operation."""
+class SampleResult(_Result):
+    """Result from sampling operation (SDK SampleResponse)."""
 
     sequences: List[SamplingSequence] = Field(..., description="Generated sequences")
     type: str = Field(default="sample", description="Operation type")
@@ -208,7 +240,7 @@ class DeleteModelResponse(BaseModel):
     resources_freed: List[str] = Field(default_factory=list, description="List of freed resources")
 
 
-class UnloadModelResponse(BaseModel):
+class UnloadModelResponse(_Result):
     """Unload model response (Tinker SDK compatible).
 
     This is the Tinker-standard response for releasing model resources.
@@ -240,26 +272,16 @@ class TrainingRunResponse(BaseModel):
     last_sampler_checkpoint: Optional[CheckpointMetadata] = Field(default=None, description="Latest sampler checkpoint")
 
 
-# ============= Forward/Training Responses =============
-
-class ForwardResult(BaseModel):
-    """Forward pass result."""
-    type: str = Field(default="forward", description="Operation type")
-    loss_fn_output_type: str = Field(..., description="Loss function type")
-    loss_fn_outputs: List[LossFnOutput] = Field(..., description="Per-sample outputs")
-    metrics: Dict[str, float] = Field(default_factory=dict, description="Training metrics")
-
-
 # ============= Sampling Responses =============
 
-class CreateSamplingClientResult(BaseModel):
+class CreateSamplingClientResult(_Result):
     """Create sampling client result."""
     sampling_client_id: str = Field(..., description="Sampling client ID")
     model_path: str = Field(..., description="Model path")
     status: str = Field(default="ready", description="Client status")
 
 
-class SaveWeightsForSamplerResult(BaseModel):
+class SaveWeightsForSamplerResult(_Result):
     """Save weights for sampler result."""
     type: str = Field(default="save_weights_for_sampler", description="Response type")
     path: Optional[str] = Field(default=None, description="Tinker URI path (for persistent saves)")
@@ -326,3 +348,41 @@ class WeightsInfoResponse(BaseModel):
     base_model: str = Field(..., description="Base model path")
     is_lora: bool = Field(..., description="Whether LoRA is enabled")
     lora_rank: Optional[int] = Field(default=None, description="LoRA rank if enabled")
+
+
+# ============= Result validation at the futures boundary =============
+
+# operation name (TaskManager) -> model a completed result must satisfy
+RESULT_MODELS: Dict[str, type] = {
+    "create_model": CreateModelResult,
+    "forward": ForwardResult,
+    "forward_backward": ForwardBackwardResult,
+    "optim_step": OptimStepResult,
+    "save_weights": SaveWeightsResult,
+    "save_weights_for_sampler": SaveWeightsForSamplerResult,
+    "load_weights": LoadWeightsResult,
+    "sample": SampleResult,
+    "asample": SampleResult,
+    "create_sampling_client": CreateSamplingClientResult,
+    "unload_model": UnloadModelResponse,
+}
+
+
+class ResultShapeError(ValueError):
+    """A backend/service returned a result the operation's response model rejects."""
+
+
+def validate_result(operation: str, result: Any) -> Dict[str, Any]:
+    """Check `result` against the operation's response model and return it as a
+    plain dict. Only fields present in the input (plus coercions) are emitted,
+    so the wire shape is unchanged for a well-formed result. Operations without
+    a registered model pass through untouched."""
+    model = RESULT_MODELS.get(operation)
+    if model is None:
+        return result
+    try:
+        parsed = model.model_validate(result)
+    except ValidationError as e:
+        errs = "; ".join(f"{'.'.join(str(x) for x in err['loc']) or '<root>'}: {err['msg']}" for err in e.errors()[:5])
+        raise ResultShapeError(f"{operation} result does not match {model.__name__}: {errs}") from None
+    return parsed.model_dump(exclude_unset=True)
