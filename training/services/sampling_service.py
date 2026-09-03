@@ -11,7 +11,6 @@ import uuid
 from typing import Dict, Any, List, Optional
 
 from ..backends.base import BackendHandle, TrainingBackend
-from ..utils.helpers import find_model_with_rollout_manager
 
 logger = logging.getLogger(__name__)
 
@@ -25,19 +24,15 @@ class SamplingService:
     def _resolve_handle(
         self,
         training_clients: Dict[str, Dict[str, Any]],
-        model_id: Optional[str] = None,
+        model_id: Optional[str],
     ) -> BackendHandle:
-        """Return the target model's backend handle.
-
-        An explicit model_id (from the requesting sampler's session) wins:
-        find-first is only correct when a single model serves rollouts, and
-        a multi-LoRA pool has one per tenant."""
-        if model_id and model_id not in training_clients:
+        """Return the target model's backend handle. The router resolves the
+        model (sampler -> owning model, or tinker:// path); there is no
+        fallback to an arbitrary model."""
+        if not model_id:
+            raise RuntimeError("sampling request did not resolve to a model")
+        if model_id not in training_clients:
             raise RuntimeError(f"Sampler's model {model_id} no longer exists")
-        if not model_id:
-            model_id = find_model_with_rollout_manager(training_clients)
-        if not model_id:
-            raise RuntimeError("No model with RolloutManager found")
         handle = training_clients[model_id].get("backend_handle")
         if handle is None:
             raise RuntimeError(f"No backend handle for model {model_id}")
@@ -86,19 +81,16 @@ class SamplingService:
         prompts: List[List[int]],
         num_samples: int,
         sampling_params: Optional[Dict[str, Any]],
-        training_clients: Dict[str, Dict[str, Any]]
+        training_clients: Dict[str, Dict[str, Any]],
+        model_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Synchronous sampling over multiple prompts.
+        Synchronous sampling over multiple prompts on `model_id`.
 
         Returns:
             Dict with sequences list (num_samples per prompt, flattened)
-
-        Raises:
-            RuntimeError: If no model with RolloutManager found
-            BackendError: If the inference engine is unavailable
         """
-        handle = self._resolve_handle(training_clients)
+        handle = self._resolve_handle(training_clients, model_id)
         logger.info(f"[{request_id}] Sampling {num_samples} sequences")
 
         all_sequences = []
@@ -120,25 +112,17 @@ class SamplingService:
         self,
         request_id: str,
         model_path: Optional[str],
-        base_model: Optional[str],
-        training_clients: Dict[str, Dict[str, Any]]
+        training_clients: Dict[str, Dict[str, Any]],
+        model_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Create a sampling client bound to the serving model.
+        Create a sampling client bound to `model_id` (named by model_path).
 
         Returns:
             Dict with sampling_client_id, model_path, status
-
-        Raises:
-            ValueError: If neither model_path nor base_model provided
-            RuntimeError: If no model with RolloutManager found
-            BackendError: If the inference engine cannot be made ready
         """
-        resolved_model_path = model_path or base_model
-        if not resolved_model_path:
-            raise ValueError("Either model_path or base_model must be provided")
-
-        handle = self._resolve_handle(training_clients)
+        resolved_model_path = model_path or f"tinker://{model_id}"
+        handle = self._resolve_handle(training_clients, model_id)
         logger.info(f"[{request_id}] Creating sampling client for {resolved_model_path}")
 
         await self.backend.prepare_for_generation(handle)

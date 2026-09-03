@@ -11,6 +11,7 @@ Endpoints:
 """
 import logging
 import uuid
+from typing import Dict
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from ..models.requests import (
@@ -32,6 +33,13 @@ from ..services.session_service import SessionService
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["session"])
+
+
+def get_training_clients(request: Request) -> Dict:
+    runtime = getattr(request.app.state, "runtime", None)
+    if runtime is None:
+        raise RuntimeError("Training runtime state not initialized")
+    return runtime.training_clients
 
 
 def get_session_service(request: Request) -> SessionService:
@@ -98,7 +106,8 @@ async def session_heartbeat(
 async def create_sampling_session(
     request: CreateSamplingSessionRequest,
     _: None = Depends(verify_api_key_dep),
-    session_service: SessionService = Depends(get_session_service)
+    session_service: SessionService = Depends(get_session_service),
+    training_clients: Dict = Depends(get_training_clients),
 ):
     """
     Create a sampling session for inference.
@@ -113,6 +122,14 @@ async def create_sampling_session(
             detail=f"Session not found: {request.session_id}"
         )
 
+    # A sampler must name its owning model: a tinker:// model_path does; a bare
+    # base_model has no engine behind it.
+    from .sampling import resolve_target_model
+    model_id, _ = resolve_target_model(
+        training_clients, session_service,
+        model_path=request.model_path, base_model=request.base_model,
+    )
+
     # Generate sampling_session_id
     sampling_session_id = (
         f"{request.session_id}_{request.sampling_session_seq_id}_{uuid.uuid4().hex[:8]}"
@@ -122,8 +139,9 @@ async def create_sampling_session(
     session_service.add_sampling_session(
         session_id=request.session_id,
         sampling_session_id=sampling_session_id,
-        base_model=request.base_model,
-        model_path=request.model_path
+        base_model=request.base_model or training_clients[model_id].get("base_model"),
+        model_path=request.model_path,
+        model_id=model_id,
     )
 
     logger.info(
