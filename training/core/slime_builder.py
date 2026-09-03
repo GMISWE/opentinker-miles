@@ -246,6 +246,12 @@ class SlimeArgumentBuilder:
             '--eps-clip-high', os.environ.get('SLIME_EPS_CLIP_HIGH', '0.28'),
             # Entropy coefficient (0 = no entropy bonus, matches Miles native)
             '--entropy-coef', os.environ.get('SLIME_ENTROPY_COEF', '0.00'),
+        ]
+        # Per-request sampling seeds are honoured by SGLang only under
+        # deterministic inference (a boot-time engine mode with a throughput cost).
+        if os.environ.get('SLIME_SGLANG_DETERMINISTIC', '0') == '1':
+            minimal_args += ['--sglang-enable-deterministic-inference']
+        minimal_args += [
             # Weight decay - must be in minimal_args so Megatron's parse_args sees it
             # (Megatron defaults to 0.01; set to 0 for RL where weight decay fights policy updates)
             '--weight-decay', os.environ.get('SLIME_WEIGHT_DECAY', '0.0'),

@@ -870,20 +870,16 @@ class MilesBackend(TrainingBackend):
             lps = logprobs_list[offset:offset + o.num_samples]
             offset += o.num_samples
             # Observation contract: per-datum logprobs are datum-aligned —
-            # length == the datum's model_input token length (captured at
-            # submit; rollout tokens append the final target and are +1).
-            # The RL path computes one fewer (causal shift over a
-            # full-sequence response): front-pad, which keeps suffix
-            # (action-token) alignment. Longer than the datum is a layout
-            # error: refuse rather than guess (reassemble-or-refuse).
+            # exactly one per model_input token, entry k = logprob of target k
+            # (the converter appends the final target so the response covers
+            # all T targets). Any other length is a layout error: refuse
+            # rather than guess (reassemble-or-refuse).
             in_lens = o.input_lens or []
             outs = []
             for j, lp in enumerate(lps):
                 lp_list = lp.tolist()
                 full = in_lens[j] if j < len(in_lens) and in_lens[j] > 0 else len(lp_list)
-                if len(lp_list) < full:
-                    lp_list = [0.0] * (full - len(lp_list)) + lp_list
-                elif len(lp_list) > full:
+                if len(lp_list) != full:
                     raise BackendError(
                         f"sample {j}: {len(lp_list)} logprobs for "
                         f"{full}-token input",
@@ -1438,6 +1434,14 @@ class MilesBackend(TrainingBackend):
         sequences = []
         prompt_logprobs_result = None
         base_params = dict(sampling_params or {})
+        if base_params.get("seed") is not None and not getattr(h.args, "sglang_enable_deterministic_inference", False):
+            if not getattr(h, "_seed_warned", False):
+                h._seed_warned = True
+                logger.warning(
+                    "[%s] sampling seed given but SGLang was booted without deterministic "
+                    "inference: the seed is ignored. Set SLIME_SGLANG_DETERMINISTIC=1 before create_model.",
+                    request_id,
+                )
         for i in range(num_samples):
             params = dict(base_params)
             if params.get("seed") is not None:
