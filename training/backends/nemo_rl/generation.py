@@ -168,41 +168,42 @@ async def _batched_nemo_rl_generate(
         "input_lengths": input_lengths,
     })
 
-    # Extract sampling params from first request (batch assumes uniform params)
-    # For heterogeneous params, use per-sample _tinker_ fields
-    first_params = batch[0].sampling_params or {}
-    max_new_tokens = first_params.get("max_tokens", 256)
-    temperature = first_params.get("temperature", 0.7)
-    top_p = first_params.get("top_p", 0.9)
-    greedy = temperature <= 0.01
+    # Every sampling parameter is a per-row column: the vLLM worker builds one
+    # SamplingParams per row, so requests with different max_tokens, stop
+    # strings, seeds, ... share a batch without one request's values leaking
+    # into another's. Padding rows copy the last real row.
+    def row_params(i: int) -> Dict[str, Any]:
+        return expanded_params[min(i, actual_size - 1)] or {}
 
-    # Per-sample params via _tinker_ fields
-    data["_tinker_max_new_tokens"] = [
-        (expanded_params[i] or {}).get("max_tokens", max_new_tokens)
-        for i in range(actual_size)
-    ] + [max_new_tokens] * (padded_size - actual_size)
+    def row_stop_strings(i: int) -> List[str]:
+        raw = row_params(i).get("stop")
+        if isinstance(raw, str):
+            return [raw]
+        if isinstance(raw, list):
+            return [s for s in raw if isinstance(s, str)]
+        return []
+
+    def row_seed(i: int) -> Optional[int]:
+        seed = row_params(i).get("seed")
+        if seed is None or i >= actual_size:
+            return None
+        return int(seed) + request_indices[i][1]  # distinct stream per sample of a request
+
+    data["_tinker_max_new_tokens"] = [int(row_params(i).get("max_tokens") or 256) for i in range(padded_size)]
     data["_tinker_temperature"] = [
-        (expanded_params[i] or {}).get("temperature", temperature)
-        for i in range(actual_size)
-    ] + [temperature] * (padded_size - actual_size)
-    data["_tinker_top_p"] = [
-        (expanded_params[i] or {}).get("top_p", top_p)
-        for i in range(actual_size)
-    ] + [top_p] * (padded_size - actual_size)
-
-    raw_stop = first_params.get("stop")
-    stop_strings: List[str] = []
-    if raw_stop is not None:
-        if isinstance(raw_stop, str):
-            stop_strings = [raw_stop]
-        elif isinstance(raw_stop, list) and raw_stop and isinstance(raw_stop[0], str):
-            stop_strings = list(raw_stop)
-    if stop_strings:
-        data["stop_strings"] = [stop_strings] * padded_size
-
-    any_prompt_logprobs = any(req.prompt_logprobs for req in batch)
-    if any_prompt_logprobs:
-        data["_tinker_prompt_logprobs"] = [True] * padded_size
+        (0.0 if float(row_params(i).get("temperature", 0.7)) <= 0.01 else float(row_params(i).get("temperature", 0.7)))
+        for i in range(padded_size)
+    ]
+    data["_tinker_top_p"] = [float(row_params(i).get("top_p", 0.9)) for i in range(padded_size)]
+    data["_tinker_top_k"] = [row_params(i).get("top_k") for i in range(padded_size)]
+    data["_tinker_seed"] = [row_seed(i) for i in range(padded_size)]
+    data["_tinker_stop_token_ids"] = [list(row_params(i).get("stop_token_ids") or []) for i in range(padded_size)]
+    data["stop_strings"] = [row_stop_strings(i) for i in range(padded_size)]
+    data["_tinker_prompt_logprobs"] = [
+        bool(batch[request_indices[i][0]].prompt_logprobs) if i < actual_size else False
+        for i in range(padded_size)
+    ]
+    greedy = False  # per-row temperature 0.0 is greedy in vLLM
 
     logger.info(
         "[%s] Batched NeMo RL generate: %d requests → %d samples (padded to %d)",
@@ -227,8 +228,10 @@ async def _batched_nemo_rl_generate(
         out_logprobs = logprobs_tensor[i, prompt_len:prompt_len + gen_len].tolist()
         text = tokenizer.decode(out_tokens) if tokenizer else None
 
+        stop_strings = row_stop_strings(i)
+        stop_ids = set(data["_tinker_stop_token_ids"][i])
         stop_reason = "length"
-        if out_tokens and eos_id is not None and out_tokens[-1] == eos_id:
+        if out_tokens and ((eos_id is not None and out_tokens[-1] == eos_id) or out_tokens[-1] in stop_ids):
             stop_reason = "stop"
         elif text and stop_strings:
             for ss in stop_strings:
