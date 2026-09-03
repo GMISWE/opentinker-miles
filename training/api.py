@@ -13,7 +13,6 @@ import asyncio
 import logging
 import os
 import signal
-import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Set
 
@@ -27,8 +26,7 @@ from fastapi.responses import JSONResponse
 # Import modules
 from .storage import FuturesStorage, MetadataStorage, SessionStorage
 from .storage.futures import DuplicateSeqId
-from .config import get_config, TrainingConfig, StorageConfig, BackendConfig
-from .core import SlimeArgumentBuilder
+from .config import get_config, TrainingConfig
 from .utils import APIKeyAuth
 
 # Configure logging
@@ -40,38 +38,8 @@ class TrainingRuntimeState:
 
     training_clients: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     training_runs_metadata: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-    futures_store: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     poll_tracking: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     background_tasks: Set[asyncio.Task] = field(default_factory=set)
-
-def init_legacy_storage(storage_config: StorageConfig):
-    """Initialize legacy storage (kept for compatibility)"""
-    metadata_dir = storage_config.metadata_dir
-    futures_db_path = storage_config.futures_db_path
-    training_runs_dir = storage_config.training_runs_dir
-    checkpoints_dir = storage_config.checkpoints_dir
-
-    metadata_dir.mkdir(parents=True, exist_ok=True)
-    training_runs_dir.mkdir(parents=True, exist_ok=True)
-    checkpoints_dir.mkdir(parents=True, exist_ok=True)
-
-    # Legacy SQLite initialization (now handled by FuturesStorage)
-    conn = sqlite3.connect(str(futures_db_path))
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS futures (
-            request_id TEXT PRIMARY KEY,
-            model_id TEXT,
-            operation TEXT NOT NULL,
-            status TEXT DEFAULT 'pending',
-            result TEXT,
-            error TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
 
 def create_app(config: Optional[TrainingConfig] = None) -> FastAPI:
     """Application factory for the training API."""
@@ -146,9 +114,6 @@ def create_app(config: Optional[TrainingConfig] = None) -> FastAPI:
         if removed_sessions > 0:
             logger.info("Cleaned up %s stale sessions before loading", removed_sessions)
 
-        # Also clean legacy futures store
-        runtime.futures_store.clear()
-
         # Initialize backend
         backend_type = config_obj.backend.backend_type
         if backend_type == "miles":
@@ -163,8 +128,6 @@ def create_app(config: Optional[TrainingConfig] = None) -> FastAPI:
         )
         logger.info("Backend initialized: %s", backend_type)
 
-        # Initialize builders and utilities
-        slime_builder = SlimeArgumentBuilder()
         auth = APIKeyAuth(
             api_key=config_obj.auth.api_key,
             enabled=config_obj.auth.enabled,
@@ -174,7 +137,6 @@ def create_app(config: Optional[TrainingConfig] = None) -> FastAPI:
         application.state.futures_storage = futures_storage
         application.state.metadata_storage = metadata_storage
         application.state.session_storage = session_storage
-        application.state.slime_builder = slime_builder
         application.state.auth = auth
         application.state.backend = backend
         application.state.backend_type = backend_type
@@ -205,9 +167,6 @@ def create_app(config: Optional[TrainingConfig] = None) -> FastAPI:
             )
             logger.info("Session reaper enabled: timeout=%ss interval=%ss",
                         config_obj.session_timeout_s, config_obj.session_reap_interval_s)
-
-        # Initialize legacy storage for backward compatibility
-        init_legacy_storage(config_obj.storage)
 
         # Initialize Ray
         if not getattr(backend, "needs_ray", True):
@@ -313,11 +272,6 @@ async def _reap_sessions_forever(application: FastAPI, timeout_s: float, interva
 
 
 app = create_app()
-
-# For backward compatibility - export health function
-async def health():
-    """Legacy health check function"""
-    return {"status": "healthy"}
 
 if __name__ == "__main__":
     import argparse

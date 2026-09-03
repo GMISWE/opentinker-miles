@@ -145,59 +145,6 @@ class UnloadModelRequest(BaseModel):
     type: str = Field(default="unload_model", description="Request type")
 
 
-class BatchData(BaseModel):
-    """Batch data for training."""
-
-    prompts: List[str] = Field(..., description="List of prompts")
-    responses: List[str] = Field(..., description="List of responses")
-    rewards: Optional[List[float]] = Field(default=None, description="Optional rewards for RL")
-    advantages: Optional[List[float]] = Field(default=None, description="Optional advantages for RL")
-    log_probs: Optional[List[float]] = Field(default=None, description="Optional log probabilities")
-    ref_log_probs: Optional[List[float]] = Field(default=None, description="Optional reference log probs")
-    values: Optional[List[float]] = Field(default=None, description="Optional value estimates")
-
-    @validator('prompts', 'responses')
-    def validate_non_empty(cls, v):
-        """Ensure lists are non-empty."""
-        if not v:
-            raise ValueError("List cannot be empty")
-        return v
-
-    @validator('responses')
-    def validate_lengths_match(cls, v, values):
-        """Ensure prompts and responses have same length."""
-        if 'prompts' in values and len(v) != len(values['prompts']):
-            raise ValueError(
-                f"Prompts and responses length mismatch: "
-                f"{len(values['prompts'])} != {len(v)}"
-            )
-        return v
-
-
-class ForwardRequestOld(BaseModel):
-    """DEPRECATED: Old request for forward pass (inference only)."""
-
-    model_id: str = Field(..., description="Model ID")
-    prompts: List[str] = Field(..., description="List of prompts")
-    max_length: int = Field(default=512, ge=1, le=4096, description="Maximum sequence length")
-
-
-class ForwardBackwardRequestOld(BaseModel):
-    """DEPRECATED: Old request for forward-backward pass (training)."""
-
-    model_id: str = Field(..., description="Model ID")
-    batch: BatchData = Field(..., description="Training batch data")
-    loss_fn: str = Field(default="cross_entropy", description="Loss function name")
-    optimizer_kwargs: Optional[Dict[str, Any]] = Field(default=None, description="Optimizer keyword arguments")
-
-
-class OptimStepRequestOld(BaseModel):
-    """DEPRECATED: Old request to perform optimizer step."""
-
-    model_id: str = Field(..., description="Model ID")
-    step_num: Optional[int] = Field(default=None, ge=0, description="Step number for logging")
-
-
 class SaveWeightsRequest(BaseModel):
     """Request to save model weights."""
 
@@ -249,35 +196,6 @@ class SamplingParams(BaseModel):
             values["stop_token_ids"] = existing_stop_token_ids + stop
             values["stop"] = None  # Clear the stop field
         return values
-
-
-class CreateSamplingClientRequestOld(BaseModel):
-    """DEPRECATED: Old request to create a sampling client."""
-
-    model_id: str = Field(..., description="Model ID")
-    sampling_params: Optional[SamplingParams] = Field(default=None, description="Default sampling parameters")
-
-
-class SampleRequestOld(BaseModel):
-    """DEPRECATED: Old request for synchronous sampling."""
-
-    model_id: str = Field(..., description="Model ID")
-    prompt: str = Field(..., description="Input prompt")
-    prompt_tokens: Optional[List[int]] = Field(default=None, description="Pre-tokenized prompt")
-    sampling_params: Optional[SamplingParams] = Field(default=None, description="Sampling parameters")
-    num_samples: int = Field(default=1, ge=1, le=100, description="Number of samples to generate")
-    prompt_logprobs: bool = Field(default=False, description="Return prompt log probabilities")
-
-
-class ASampleRequestOld(BaseModel):
-    """DEPRECATED: Old request for asynchronous sampling."""
-
-    model_id: str = Field(..., description="Model ID")
-    prompt: str = Field(..., description="Input prompt")
-    prompt_tokens: Optional[List[int]] = Field(default=None, description="Pre-tokenized prompt")
-    sampling_params: Optional[SamplingParams] = Field(default=None, description="Sampling parameters")
-    num_samples: int = Field(default=1, ge=1, le=100, description="Number of samples to generate")
-    prompt_logprobs: bool = Field(default=False, description="Return prompt log probabilities")
 
 
 class GetInfoRequest(BaseModel):
@@ -452,25 +370,12 @@ class ForwardBackwardRequest(BaseModel):
     def wrap_old_format(cls, values):
         """Convert old format to new format for backward compatibility."""
         if isinstance(values, dict):
-            # Check if this is legacy HTTP test format: {"model_id": "...", "data": [{"input": "...", "target": "..."}]}
+            # flat {data, loss_fn} form -> nested forward_backward_input
             if 'data' in values and 'forward_backward_input' not in values:
-                data = values.get('data', [])
-                # Detect legacy test format (simple dict with "input"/"target" keys)
-                if data and len(data) > 0 and isinstance(data[0], dict) and 'input' in data[0]:
-                    # Legacy test format - mark it for fake data generation
-                    # Set a special flag so the service knows to generate fake test data
-                    values['_legacy_test_format'] = True
-                    values['forward_backward_input'] = {
-                        'data': [],  # Empty data, will be generated by service
-                        'loss_fn': values.pop('loss_fn', 'cross_entropy')
-                    }
-                    values.pop('data')  # Remove legacy data field
-                else:
-                    # Standard old format - wrap it normally
-                    values['forward_backward_input'] = {
-                        'data': values.pop('data'),
-                        'loss_fn': values.pop('loss_fn', 'cross_entropy')
-                    }
+                values['forward_backward_input'] = {
+                    'data': values.pop('data'),
+                    'loss_fn': values.pop('loss_fn', 'cross_entropy')
+                }
         return values
 
     @validator('forward_backward_input', always=True)

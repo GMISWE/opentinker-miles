@@ -18,7 +18,6 @@ from ..services.model_service import ModelService
 from ..services.session_service import SessionService
 from ..core.task_manager import TaskManager
 from ..core.dependencies import verify_api_key_dep
-from ..core import SlimeArgumentBuilder
 from ..storage import MetadataStorage, FuturesStorage
 from ..models.requests import (
     CreateModelRequest,
@@ -55,14 +54,6 @@ def get_model_service(request: Request) -> ModelService:
     if service is None:
         raise RuntimeError("ModelService not initialized on app state")
     return service
-
-
-def get_slime_builder(request: Request) -> SlimeArgumentBuilder:
-    """Dependency injection for SlimeArgumentBuilder."""
-    builder = getattr(request.app.state, "slime_builder", None)
-    if builder is None:
-        raise RuntimeError("SlimeArgumentBuilder not initialized on app state")
-    return builder
 
 
 def get_metadata_storage(request: Request) -> MetadataStorage:
@@ -118,7 +109,6 @@ async def create_model(
     _: None = Depends(verify_api_key_dep),
     service: ModelService = Depends(get_model_service),
     task_manager: TaskManager = Depends(get_task_manager),
-    slime_builder: SlimeArgumentBuilder = Depends(get_slime_builder),
     metadata_storage: MetadataStorage = Depends(get_metadata_storage),
     training_clients: Dict = Depends(get_training_clients),
     training_runs_metadata: Dict = Depends(get_training_runs_metadata),
@@ -149,7 +139,6 @@ async def create_model(
             parallelism_config=request.parallelism_config.dict() if request.parallelism_config else None,
             max_batch_size=request.max_batch_size,
             max_seq_len=request.max_seq_len,
-            slime_builder=slime_builder,
             metadata_storage=metadata_storage,
             training_clients=training_clients,
             training_runs_metadata=training_runs_metadata,

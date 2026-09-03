@@ -9,7 +9,6 @@ Thin HTTP layer for:
 import asyncio
 import logging
 import time
-from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from typing import Dict, Any
@@ -50,12 +49,6 @@ def get_futures_storage(request: Request) -> FuturesStorage:
     return storage
 
 
-def get_legacy_futures_store(request: Request) -> Dict:
-    """Get the legacy futures_store"""
-    runtime = _get_runtime(request)
-    return runtime.futures_store
-
-
 def get_poll_tracking(request: Request) -> Dict[str, Dict[str, Any]]:
     """Get the poll_tracking dict"""
     runtime = _get_runtime(request)
@@ -67,7 +60,6 @@ async def retrieve_future(
     request_id: str,
     _: None = Depends(verify_api_key_dep),
     futures_storage: FuturesStorage = Depends(get_futures_storage),
-    futures_store: Dict = Depends(get_legacy_futures_store),
     poll_tracking: Dict[str, Dict[str, Any]] = Depends(get_poll_tracking)
 ):
     """
@@ -106,11 +98,7 @@ async def retrieve_future(
     future = futures_storage.get_future(request_id)
 
     if not future:
-        # Also check legacy store for backward compatibility
-        if request_id in futures_store:
-            future = futures_store[request_id]
-        else:
-            raise HTTPException(status_code=404, detail=f"Future {request_id} not found")
+        raise HTTPException(status_code=404, detail=f"Future {request_id} not found")
 
     def _respond(fut: Dict[str, Any]):
         """Terminal-status dispatch (completed -> 200, failed -> 400)."""
@@ -170,7 +158,6 @@ async def retrieve_future_body(
     request: RetrieveFutureRequest,
     _: None = Depends(verify_api_key_dep),
     futures_storage: FuturesStorage = Depends(get_futures_storage),
-    futures_store: Dict = Depends(get_legacy_futures_store),
     poll_tracking: Dict[str, Dict[str, Any]] = Depends(get_poll_tracking)
 ):
     """
@@ -186,7 +173,6 @@ async def retrieve_future_body(
         request.request_id,
         _,
         futures_storage,
-        futures_store,
         poll_tracking
     )
 
@@ -196,34 +182,14 @@ async def cleanup_futures(
     request: CleanupFuturesRequest,
     _: None = Depends(verify_api_key_dep),
     futures_storage: FuturesStorage = Depends(get_futures_storage),
-    futures_store: Dict = Depends(get_legacy_futures_store)
 ):
     """
     Cleanup old futures - refactored with storage abstraction
     """
     try:
-        # Clean up using storage
-        removed_count = futures_storage.cleanup_old_futures(
+        total_removed = futures_storage.cleanup_old_futures(
             max_age_hours=request.max_age_hours
         )
-
-        # Also clean legacy store
-        cutoff_time = datetime.now().timestamp() - (request.max_age_hours * 3600)
-        legacy_removed = 0
-
-        for request_id in list(futures_store.keys()):
-            future = futures_store[request_id]
-            if future.get("created_at"):
-                try:
-                    created = datetime.fromisoformat(future["created_at"]).timestamp()
-                    if created < cutoff_time:
-                        del futures_store[request_id]
-                        legacy_removed += 1
-                except:
-                    pass
-
-        total_removed = removed_count + legacy_removed
-
         logger.info(f"Cleaned up {total_removed} old futures")
 
         return CleanupResult(
