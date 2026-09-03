@@ -248,8 +248,12 @@ class NemoRLBackend(TrainingBackend):
                 _maybe_pad_batch, batched_data, dp_size, mbs, h.image_preprocessor,
             )
 
-            # Sleep vLLM to free GPU memory for training workers
+            # Sleep vLLM to free GPU memory for training workers. Recorded as
+            # training_ready so a later sample wakes the engine first (weights
+            # are still in sync, so that wake needs no refit).
             if h.policy_generation is not None and h.colocated_inference:
+                async with h._generation_state_lock:
+                    h.generation_state = "training_ready"
                 await asyncio.to_thread(h.policy_generation.finish_generation)
 
             # Use prepare_for_training(), not prepare_for_lp_inference(): the latter
@@ -907,6 +911,8 @@ class NemoRLBackend(TrainingBackend):
                 "generation engine not initialized (debug_train_only mode?)",
                 backend="nemo_rl", operation="sample",
             )
+        # Wake/refit an engine a forward-only pass left asleep (fast path: one lock).
+        await _ensure_generation_ready(h)
         accumulator = self._batch_accumulators.setdefault(
             h.model_id, NemoRLBatchAccumulator()
         )
@@ -1042,22 +1048,33 @@ async def _ensure_generation_ready(handle) -> None:
         async with handle._generation_state_lock:
             if handle.generation_state == "generation_ready":
                 return
+            in_sync = handle.generation_synced_version == handle.weight_version
             logger.warning(
-                "Training completed but generation_state still training_ready "
-                "for %s — performing refit",
+                "Generation requested with the engine asleep for %s — %s",
                 handle.model_id,
+                "waking it (weights already in sync)" if in_sync else "performing refit",
             )
 
-        # Training has released GPU resources — safe to refit now
-        await asyncio.to_thread(
-            _refit_policy_generation,
-            handle.policy,
-            handle.policy_generation,
-            handle.colocated_inference,
-            handle.refit_memory_ratio,
-        )
-        handle.training_resident = False  # refit offloaded the policy
-        handle.generation_synced_version = handle.weight_version
+        # Training has released GPU resources. A forward-only pass left the
+        # engine asleep with current weights: wake it (a refit here trips
+        # stale DTensor sharding). After an un-refit optimizer step: refit.
+        if in_sync:
+            await asyncio.to_thread(
+                _wake_generation_stale,
+                handle.policy,
+                handle.policy_generation,
+                handle.colocated_inference,
+            )
+        else:
+            await asyncio.to_thread(
+                _refit_policy_generation,
+                handle.policy,
+                handle.policy_generation,
+                handle.colocated_inference,
+                handle.refit_memory_ratio,
+            )
+            handle.generation_synced_version = handle.weight_version
+        handle.training_resident = False  # the policy was offloaded either way
 
         async with handle._generation_state_lock:
             handle.generation_state = "generation_ready"
@@ -1243,10 +1260,11 @@ def _refit_policy_generation(policy, policy_generation, colocated_inference: boo
 
 
 def _wake_generation_stale(policy, policy_generation, colocated_inference: bool):
-    """Restore generation WITHOUT streaming new weights (A4 staleness-k skip
-    path): vLLM's level-1 sleep backed its weights up to CPU, so a plain wake
-    restores the pre-training (stale) version. Legal only under a declared
-    staleness_k > 0 — the caller gates on the ver(S) bound."""
+    """Restore generation WITHOUT streaming new weights: vLLM's level-1 sleep
+    backed its weights up to CPU, so a plain wake restores what the engine held
+    before it slept. Two callers: the A4 staleness-k skip after an optimizer
+    step (stale by a declared bound), and generation after a forward-only pass
+    (weights unchanged, so exactly current)."""
     if colocated_inference:
         policy.offload_after_refit()
         policy_generation.prepare_for_generation()
