@@ -14,7 +14,7 @@ from typing import Dict, Any, Optional
 
 from ..backends.base import TrainingBackend
 from ..storage import MetadataStorage
-from ..utils.helpers import generate_step_id
+from ..backends.checkpoint_interchange import resolve_checkpoint_root
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +24,12 @@ class CheckpointService:
 
     def __init__(self, backend: TrainingBackend):
         self.backend = backend
+
+    @staticmethod
+    def _next_step_id(client_info: Dict[str, Any]) -> int:
+        """Monotonic per-model save counter (the backend's iteration label)."""
+        client_info["save_counter"] = client_info.get("save_counter", 0) + 1
+        return client_info["save_counter"]
 
     async def save_weights(
         self,
@@ -48,7 +54,7 @@ class CheckpointService:
 
         # Generate checkpoint name and step_id
         checkpoint_name = path or f"checkpoint_{int(time.time())}"
-        step_id = generate_step_id(checkpoint_name)
+        step_id = self._next_step_id(client_info)
         checkpoint_path = f"tinker://{training_run_id}/weights/{checkpoint_name}"
 
         logger.info("[%s] Saving weights for %s to %s", request_id, model_id, checkpoint_path)
@@ -124,12 +130,14 @@ class CheckpointService:
             logger.info("[%s] Saving weights for sampler: %s", request_id, model_id)
 
             checkpoint_name = path or name or f"sampler_{int(time.time())}"
-            step_id = generate_step_id(checkpoint_name)
-            checkpoint_path = f"/data/checkpoints/tinker/iter_{step_id:07d}"
-            tinker_uri = f"tinker://{training_run_id}/weights/{checkpoint_name}"
+            step_id = self._next_step_id(client_info)
+            tinker_uri = f"tinker://{training_run_id}/sampler_weights/{checkpoint_name}"
+            # The backend resolves the URI through resolve_checkpoint_root, so the
+            # recorded filesystem path is where the bytes actually land.
+            checkpoint_path = resolve_checkpoint_root(tinker_uri)
 
             # Delegate actual save to backend
-            await self.backend.save_checkpoint(handle, checkpoint_path, step_id=step_id)
+            await self.backend.save_checkpoint(handle, tinker_uri, step_id=step_id)
 
             # Save checkpoint metadata
             metadata_storage.save_checkpoint(

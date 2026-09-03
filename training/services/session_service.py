@@ -373,6 +373,27 @@ class SessionService:
                 stale.append(session_id)
         return stale
 
+    def reap_stale_sessions(self, timeout_s: float) -> List[Tuple[str, List[str]]]:
+        """Expire sessions with no heartbeat for more than `timeout_s`.
+
+        Drops them from memory and storage and returns (session_id, model_ids)
+        pairs; the caller owns freeing the models.
+        """
+        now = datetime.now()
+        reaped: List[Tuple[str, List[str]]] = []
+        for session_id, session in list(self._sessions.items()):
+            if (now - session.last_heartbeat).total_seconds() <= timeout_s:
+                continue
+            self._sessions.pop(session_id, None)
+            for model_id in session.model_ids:
+                self._model_to_session.pop(model_id, None)
+            for sampler_id in session.sampling_session_ids:
+                self._samplers.pop(sampler_id, None)
+            if self._storage:
+                self._storage.delete_session(session_id)
+            reaped.append((session_id, list(session.model_ids)))
+        return reaped
+
     def get_active_session_count(self) -> int:
         """Get count of tracked sessions."""
         return len(self._sessions)

@@ -243,8 +243,12 @@ class AutomodelBackend(TrainingBackend):
 
     async def apply_optimizer_step(
         self, handle: BackendHandle, learning_rate: Optional[float] = None,
+        adam_params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Optimizer step over accumulated grads, then zero them."""
+        """Optimizer step over accumulated grads, then zero them.
+
+        adam_params is accepted for contract uniformity; betas/eps are fixed at creation.
+        """
         h: AutomodelHandle = handle  # type: ignore[assignment]
         async with h.lock:
             return await asyncio.to_thread(self._optimizer_step, h, learning_rate)
@@ -281,7 +285,7 @@ class AutomodelBackend(TrainingBackend):
     async def sample(
         self, handle: BackendHandle, request_id: str, prompt_tokens: List[int],
         num_samples: int, sampling_params: Optional[Dict[str, Any]] = None,
-        prompt_logprobs: bool = False,
+        prompt_logprobs: bool = False, pinned_version: Optional[int] = None,
     ) -> Dict[str, Any]:
         raise _no_generation("sample")
 

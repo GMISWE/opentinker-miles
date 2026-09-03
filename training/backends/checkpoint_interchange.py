@@ -27,16 +27,20 @@ ADAPTER_CONFIG_FILE = "adapter_config.json"
 
 
 def resolve_checkpoint_root(path: str, create: bool = False) -> str:
-    """tinker://<run_id>/weights/<name> -> <CHECKPOINT_BASE>/<run_id>/<name>.
+    """tinker://<run_id>/weights/<name> -> <CHECKPOINT_BASE>/<run_id>/<name>;
+    tinker://<run_id>/sampler_weights/<name> -> <CHECKPOINT_BASE>/<run_id>/sampler_weights/<name>.
 
-    Filesystem paths pass through. Mirrors the URI shape minted by
-    CheckpointService.save_weights.
+    Filesystem paths pass through. Mirrors the URI shapes minted by
+    CheckpointService.save_weights / save_weights_for_sampler.
     """
     if path.startswith("tinker://"):
         parts = path[len("tinker://"):].split("/")
         run_id = parts[0]
         name = parts[-1] if len(parts) > 2 else "default"
-        local = os.path.join(CHECKPOINT_BASE, run_id, name)
+        if len(parts) > 2 and parts[1] == "sampler_weights":
+            local = os.path.join(CHECKPOINT_BASE, run_id, "sampler_weights", name)
+        else:
+            local = os.path.join(CHECKPOINT_BASE, run_id, name)
     else:
         local = path
     if create:

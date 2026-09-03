@@ -1,64 +1,54 @@
 """
 Backend factory — creates the appropriate TrainingBackend from configuration.
+
+`SUPPORTED_BACKENDS` is the one allow-list; the CLI flag, the config
+validator and the signature-contract test all import it from here.
 """
+import importlib
 import logging
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional, Type
 
 from .base import TrainingBackend
 
 logger = logging.getLogger(__name__)
+
+# backend_type -> (module relative to this package, class name)
+_BACKEND_CLASSES = {
+    "miles": (".miles.backend", "MilesBackend"),
+    "nemo_rl": (".nemo_rl.backend", "NemoRLBackend"),
+    "verl": (".verl.backend", "VerlBackend"),
+    "automodel": (".automodel.backend", "AutomodelBackend"),
+    "megatron_bridge": (".megatron_bridge.backend", "MegatronBridgeBackend"),
+}
+SUPPORTED_BACKENDS = tuple(_BACKEND_CLASSES)
 
 
 class BackendFactory:
     """Creates the appropriate backend based on configuration."""
 
     @staticmethod
+    def backend_class(backend_type: str) -> Type[TrainingBackend]:
+        """Import and return the backend class without instantiating it.
+
+        Raises ValueError for an unknown type; ImportError propagates when the
+        backend's runtime dependencies are absent.
+        """
+        try:
+            module_name, class_name = _BACKEND_CLASSES[backend_type]
+        except KeyError:
+            raise ValueError(
+                f"Unknown backend: {backend_type!r}. "
+                f"Supported backends: {', '.join(SUPPORTED_BACKENDS)}"
+            ) from None
+        module = importlib.import_module(module_name, package=__package__)
+        return getattr(module, class_name)
+
+    @staticmethod
     def create(
         backend_type: str,
         backend_overrides: Optional[Dict[str, Any]] = None,
     ) -> TrainingBackend:
-        """
-        Instantiate the training backend for the given type.
-
-        Args:
-            backend_type: "miles", "nemo_rl", "verl", "automodel", or "megatron_bridge"
-            backend_overrides: Optional backend-specific config overrides.
-
-        Returns:
-            A TrainingBackend instance.
-
-        Raises:
-            ValueError: If backend_type is unknown.
-        """
-        overrides = backend_overrides or {}
-
-        if backend_type == "miles":
-            from .miles.backend import MilesBackend
-            logger.info("Creating Miles backend")
-            return MilesBackend(overrides)
-
-        elif backend_type == "nemo_rl":
-            from .nemo_rl.backend import NemoRLBackend
-            logger.info("Creating NeMo RL backend")
-            return NemoRLBackend(overrides)
-
-        elif backend_type == "verl":
-            from .verl.backend import VerlBackend
-            logger.info("Creating veRL backend")
-            return VerlBackend(overrides)
-
-        elif backend_type == "automodel":
-            from .automodel.backend import AutomodelBackend
-            logger.info("Creating Automodel classification backend")
-            return AutomodelBackend(overrides)
-
-        elif backend_type == "megatron_bridge":
-            from .megatron_bridge.backend import MegatronBridgeBackend
-            logger.info("Creating Megatron-Bridge classification backend")
-            return MegatronBridgeBackend(overrides)
-
-        else:
-            raise ValueError(
-                f"Unknown backend: {backend_type!r}. "
-                f"Supported backends: miles, nemo_rl, verl, automodel, megatron_bridge"
-            )
+        """Instantiate the training backend for `backend_type` (see SUPPORTED_BACKENDS)."""
+        cls = BackendFactory.backend_class(backend_type)
+        logger.info("Creating %s backend (%s)", backend_type, cls.__name__)
+        return cls(backend_overrides or {})

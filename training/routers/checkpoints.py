@@ -247,17 +247,16 @@ async def weights_info(
 
     model_id = path_parts[0]
     checkpoint_name = path_parts[2] if len(path_parts) >= 3 else None
+    if checkpoint_name and path_parts[1] == "sampler_weights":
+        checkpoint_name = f"sampler_{checkpoint_name}"  # metadata key used by save_weights_for_sampler
     logger.info(f"Extracted model_id: {model_id}, checkpoint_name: {checkpoint_name}")
 
     # Try to find model in active training clients first
     if model_id in training_clients:
         client_info = training_clients[model_id]
         base_model = client_info.get("base_model", "")
-        args = client_info.get("args", {})
-        lora_rank = getattr(args, "lora_rank", None) if args else None
-
-        # Determine if LoRA is enabled
-        is_lora = lora_rank is not None and lora_rank > 0
+        lora_rank = int((client_info.get("lora_config") or {}).get("rank") or 0)
+        is_lora = lora_rank > 0
 
         # Verify checkpoint exists if name was provided
         if checkpoint_name:

@@ -138,18 +138,8 @@ async def create_model(
             detail=f"Session not found: {request.session_id}"
         )
 
-    # Link model to session with seq_id and context for matching
-    session_service.add_model(
-        session_id=request.session_id,
-        model_id=model_id,
-        model_seq_id=request.model_seq_id,
-        base_model=request.base_model,
-        model_path=request.checkpoint_path  # May be None, that's OK
-    )
-    logger.info(f"Model {model_id} (seq={request.model_seq_id}) linked to session {request.session_id}")
-
     async def execute():
-        return await service.create_model(
+        result = await service.create_model(
             model_id=model_id,
             request_id=request_id,
             base_model=request.base_model,
@@ -170,6 +160,17 @@ async def create_model(
             num_labels=request.num_labels,
             head_config=request.head_config,
         )
+        # Link only once the backend holds the model, so a failed create
+        # leaves no dangling session->model entry.
+        session_service.add_model(
+            session_id=request.session_id,
+            model_id=model_id,
+            model_seq_id=request.model_seq_id,
+            base_model=request.base_model,
+            model_path=request.checkpoint_path,
+        )
+        logger.info(f"Model {model_id} (seq={request.model_seq_id}) linked to session {request.session_id}")
+        return result
 
     # Create async task
     task_manager.create_task(
