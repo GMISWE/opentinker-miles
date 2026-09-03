@@ -205,10 +205,12 @@ class SaveWeightsRequest(BaseModel):
 
 
 class LoadWeightsRequest(BaseModel):
-    """Request to load model weights."""
+    """Request to load model weights (permitted only as a model's first request)."""
 
     model_id: str = Field(..., description="Model ID")
-    path: str = Field(..., description="Checkpoint path to load from")
+    path: str = Field(..., description="tinker://<run>/weights/<name> to load from")
+    optimizer: bool = Field(default=False, description="Also restore optimizer state (not supported; must be false)")
+    seq_id: Optional[int] = Field(default=None, description="Sequence ID for ordering")
 
 
 class RetrieveFutureRequest(BaseModel):

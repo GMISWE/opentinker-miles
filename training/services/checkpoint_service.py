@@ -7,6 +7,8 @@ Handles:
 - Checkpoint metadata management
 """
 import logging
+import os
+import shutil
 import time
 import uuid
 from datetime import datetime
@@ -82,6 +84,69 @@ class CheckpointService:
             "name": checkpoint_name,
             "type": "save_weights",
         }
+
+    async def load_weights(
+        self,
+        model_id: str,
+        request_id: str,
+        path: str,
+        training_clients: Dict[str, Dict[str, Any]],
+        metadata_storage: MetadataStorage,
+    ) -> Dict[str, Any]:
+        """Load a training checkpoint into a live model (weights only)."""
+        if model_id not in training_clients:
+            raise KeyError(f"Model {model_id} not found")
+        handle = training_clients[model_id]["backend_handle"]
+        logger.info("[%s] Loading weights for %s from %s", request_id, model_id, path)
+        await self.backend.load_checkpoint(handle, path)
+        metadata_storage.update_training_run(
+            training_clients[model_id].get("training_run_id", model_id),
+            {"loaded_from": path, "last_request_time": datetime.now().isoformat()},
+        )
+        return {"type": "load_weights", "path": path, "model_id": model_id}
+
+    @staticmethod
+    def delete_checkpoint(
+        model_id: str,
+        checkpoint_type: str,
+        checkpoint_id: str,
+        metadata_storage: MetadataStorage,
+    ) -> bool:
+        """Remove a checkpoint's metadata record and its bytes. Returns False if unknown."""
+        kind = "weights" if checkpoint_type == "training" else "sampler_weights"
+        meta_name = checkpoint_id if kind == "weights" else f"sampler_{checkpoint_id}"
+        if metadata_storage.load_checkpoint(model_id, meta_name) is None:
+            return False
+        root = resolve_checkpoint_root(f"tinker://{model_id}/{kind}/{checkpoint_id}")
+        if os.path.isdir(root):
+            shutil.rmtree(root, ignore_errors=True)
+        metadata_storage.delete_checkpoint(model_id, meta_name)
+        logger.info("Deleted %s checkpoint %s of %s (%s)", checkpoint_type, checkpoint_id, model_id, root)
+        return True
+
+    @staticmethod
+    def list_checkpoints(model_id: str, metadata_storage: MetadataStorage) -> list:
+        """Tinker-shaped checkpoint records for a training run."""
+        out = []
+        for rec in metadata_storage.list_checkpoints(model_id, limit=1000):
+            is_sampler = rec.get("type") == "sampler"
+            path = rec.get("tinker_uri") if is_sampler else rec.get("path")
+            if not path:
+                continue
+            name = path.removeprefix("tinker://").split("/")[-1]
+            kind = "sampler_weights" if is_sampler else "weights"
+            root = resolve_checkpoint_root(path)
+            size = None
+            if os.path.isdir(root):
+                size = sum(os.path.getsize(os.path.join(d, f)) for d, _, fs in os.walk(root) for f in fs)
+            out.append({
+                "checkpoint_id": f"{kind}/{name}",
+                "checkpoint_type": "sampler" if is_sampler else "training",
+                "time": rec.get("created_at"),
+                "tinker_path": path,
+                "size_bytes": size,
+            })
+        return out
 
     async def save_weights_for_sampler(
         self,
