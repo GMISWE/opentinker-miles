@@ -1,13 +1,9 @@
 """
-GMI Wrapper V3 - Modular Architecture
+TinkerCloud training API: FastAPI app factory.
 
-Training API with clean separation of concerns:
-- Routers: HTTP request/response handling (routers/)
-- Services: Business logic (services/)
-- Core: Shared utilities (core/)
-
-All 17 endpoints are implemented in modular routers.
-This file contains only initialization and routing configuration.
+create_app(config) wires storage, the selected TrainingBackend, the services and
+the routers onto app.state; `app` is the environment-configured instance for
+`uvicorn training.api:app`. The CLI lives in training/__main__.py.
 """
 import asyncio
 import logging
@@ -43,7 +39,7 @@ class TrainingRuntimeState:
 
 def create_app(config: Optional[TrainingConfig] = None) -> FastAPI:
     """Application factory for the training API."""
-    application = FastAPI(title="GMI Wrapper V3 - Modular", version="3.1.0")
+    application = FastAPI(title="TinkerCloud training API", version="3.1.0")
 
     # Store config/runtime scaffolding for later use
     application.state.config = config or get_config()
@@ -94,7 +90,10 @@ def create_app(config: Optional[TrainingConfig] = None) -> FastAPI:
         logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
         logging.getLogger("uvicorn.error").setLevel(logging.INFO)
 
-        # Initialize storage modules
+        # Storage roots (a fresh pod has none of them; SQLite does not create directories)
+        for d in (config_obj.storage.metadata_dir, config_obj.storage.training_runs_dir,
+                  config_obj.storage.checkpoints_dir):
+            d.mkdir(parents=True, exist_ok=True)
         futures_storage = FuturesStorage(config_obj.storage.futures_db_path)
         metadata_storage = MetadataStorage(config_obj.storage.metadata_dir)
 
@@ -276,45 +275,6 @@ async def _reap_sessions_forever(application: FastAPI, timeout_s: float, interva
 
 app = create_app()
 
-if __name__ == "__main__":
-    import argparse
-    import uvicorn
-
-    parser = argparse.ArgumentParser(description="TinkerCloud Training API")
-    from .backends.factory import SUPPORTED_BACKENDS
-    parser.add_argument(
-        "--backend",
-        choices=list(SUPPORTED_BACKENDS),
-        default=None,
-        help="Training backend (default: miles). Also settable via TINKERCLOUD_BACKEND env var.",
-    )
-    parser.add_argument("--host", default=None)
-    parser.add_argument("--port", type=int, default=None)
-    cli_args = parser.parse_args()
-
-    # Get configuration
-    config = get_config()
-
-    # CLI --backend flag takes precedence over env var / config default
-    if cli_args.backend:
-        config.backend.backend_type = cli_args.backend
-
-    if cli_args.host:
-        config.server.host = cli_args.host
-    if cli_args.port:
-        config.server.port = cli_args.port
-
-    from .config import set_config
-    set_config(config)
-
-    # Recreate app with updated config
-    app = create_app(config)
-
-    # Run server
-    uvicorn.run(
-        app,
-        host=config.server.host,
-        port=config.server.port,
-        log_level=config.server.log_level.lower(),
-        access_log=config.server.access_log,
-    )
+if __name__ == "__main__":  # `python -m training.api` == `python -m training`
+    from .__main__ import main
+    main()
