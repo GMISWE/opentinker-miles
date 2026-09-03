@@ -17,6 +17,7 @@ import logging
 from typing import Callable, Dict, Any, Optional, Awaitable
 from ..storage import FuturesStorage
 from ..services import ordering
+from ..models.responses import validate_result
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +121,10 @@ class TaskManager:
                 else:
                     result = await task_func()
 
-                # Update storage with success
+                # A result that the operation's response model rejects fails
+                # the future here, with the offending field named, instead of
+                # failing inside the SDK's parser on the client.
+                result = validate_result(operation, result)
                 self.futures_storage.update_status(
                     request_id=request_id,
                     status="completed",
