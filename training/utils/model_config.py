@@ -171,75 +171,16 @@ def estimate_model_params(
         return 70.0
 
 
-def get_parallelism_config(
-    model_config: Dict[str, Any],
-    user_config: Optional[Dict] = None,
-    model_name: str = ""
-) -> Dict[str, int]:
-    """
-    Determine parallelism configuration using hybrid approach:
-    1. Environment defaults (deployment-level config)
-    2. Auto-detection based on model size (heuristic)
-    3. User override (request-level config)
-
-    Args:
-        model_config: Model configuration dict
-        user_config: Optional user-provided parallelism config
-        model_name: Optional model name/path for extracting size
-
-    Returns:
-        Dict with tensor_parallel_size, pipeline_parallel_size, num_gpus
-    """
-    # 1. Environment defaults
-    default_tp = int(os.getenv("SLIME_DEFAULT_TP", "1"))
-    default_pp = int(os.getenv("SLIME_DEFAULT_PP", "1"))
-    default_num_gpus = detect_num_gpus()
-
-    # 2. Auto-detect based on model size (if env not explicitly set)
-    if default_tp == 1:
-        total_params = estimate_model_params(model_config, model_name)
-        logger.info(f"Estimated model params: {total_params:.2f}B")
-
-        # For 4 GPUs available: use TP*PP=4
-        # Llama-3.1-8B converted with TP=2, PP=2
-        if total_params >= 30:    # >= 30B params: TP=8, PP=1 (requires 8 GPUs)
-            default_tp = 8
-            default_pp = 1
-        elif total_params >= 10:  # 10B-30B params: TP=4, PP=1 (requires 4 GPUs)
-            default_tp = 4
-            default_pp = 1
-        elif total_params >= 2:   # 2B-10B params: TP=2, PP=1, CP=2 (requires 4 GPUs)
-            default_tp = 2
-            default_pp = 1  # Use CP=2 instead of PP=2 for better RLVE alignment
-        # else: < 2B params: TP=1, PP=1 (requires 1 GPU)
-
-        logger.info(
-            f"Auto-detected TP={default_tp}, PP={default_pp} "
-            f"for {total_params:.2f}B params"
-        )
-
-    # 3. User override (optional)
-    if user_config:
-        tp = user_config.get("tensor_parallel_size", default_tp)
-        pp = user_config.get("pipeline_parallel_size", default_pp)
-        num_gpus = user_config.get("num_gpus", default_num_gpus)
-        logger.info(f"User override: TP={tp}, PP={pp}, GPUs={num_gpus}")
-    else:
-        tp, pp, num_gpus = default_tp, default_pp, default_num_gpus
-
-    return {
-        "tensor_parallel_size": tp,
-        "pipeline_parallel_size": pp,
-        "num_gpus": num_gpus
-    }
-
-
 def auto_detect_all_parallelism(
     model_config: Dict[str, Any],
     num_gpus: int,
     max_seq_len: int = 2048,
     rlve_enabled: bool = False,
-    model_name: str = ""
+    model_name: str = "",
+    default_tp: Optional[int] = None,
+    default_cp: Optional[int] = None,
+    rlve_tp: int = 2,
+    rlve_cp: int = 2,
 ) -> Dict[str, int]:
     """
     Auto-detect all parallelism dimensions (TP, PP, CP, DP).
@@ -261,9 +202,9 @@ def auto_detect_all_parallelism(
     if rlve_enabled:
         # RLVE MODE: Fixed parallelism for long sequences
         # TP=2, CP=2 → DP=1 on 4 GPUs (all GPUs work together on same batch)
-        tp = int(os.environ.get('SLIME_RLVE_TP', '2'))
+        tp = rlve_tp
         pp = 1  # No pipeline parallel for RLVE (simpler, less latency)
-        cp = int(os.environ.get('SLIME_RLVE_CP', '2'))
+        cp = rlve_cp
         dp = num_gpus // (tp * pp * cp)
         logger.info(f"RLVE parallelism: TP={tp}, PP={pp}, CP={cp}, DP={max(1, dp)}")
         return {'tp': tp, 'pp': pp, 'cp': cp, 'dp': max(1, dp)}
@@ -272,11 +213,9 @@ def auto_detect_all_parallelism(
     num_params = estimate_model_params(model_config, model_name)
     logger.info(f"Auto-detecting parallelism for {num_params:.2f}B params, {num_gpus} GPUs, max_seq_len={max_seq_len}")
 
-    # Check for environment override (for debugging/testing)
-    env_tp = os.environ.get('SLIME_DEFAULT_TP')
-    if env_tp:
-        tp = int(env_tp)
-        logger.info(f"Using SLIME_DEFAULT_TP override: TP={tp}")
+    if default_tp:
+        tp = default_tp
+        logger.info(f"Using configured TP override: TP={tp}")
     # TP: based on model size
     elif num_params < 2.0:  # <2B params
         tp = 1
@@ -294,10 +233,9 @@ def auto_detect_all_parallelism(
         pp = 1
 
     # CP: based on sequence length requirements
-    env_cp = os.environ.get('SLIME_DEFAULT_CP')
-    if env_cp:
-        cp = int(env_cp)
-        logger.info(f"Using SLIME_DEFAULT_CP override: CP={cp}")
+    if default_cp:
+        cp = default_cp
+        logger.info(f"Using configured CP override: CP={cp}")
     elif max_seq_len > 8192:
         # CP caveat: the miles seam returns per-CP-rank logprob chunks for
         # fb/forward (no full-sequence reassembly yet) — clients would see

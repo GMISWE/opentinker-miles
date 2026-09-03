@@ -7,6 +7,8 @@ re-exports it through the backend interface.
 """
 from typing import Any, Dict, Optional
 
+from .config import MilesConfig
+
 from ..base import ArgumentBuilder
 from ...core.slime_builder import SlimeArgumentBuilder
 
@@ -14,8 +16,9 @@ from ...core.slime_builder import SlimeArgumentBuilder
 class MilesArgumentBuilder(ArgumentBuilder):
     """Adapter: SlimeArgumentBuilder → ArgumentBuilder ABC."""
 
-    def __init__(self, default_save_dir: str = "/data/checkpoints/tinker"):
-        self._inner = SlimeArgumentBuilder(default_save_dir=default_save_dir)
+    def __init__(self, default_save_dir: str = "/data/checkpoints/tinker",
+                 config: Optional[MilesConfig] = None):
+        self._inner = SlimeArgumentBuilder(default_save_dir=default_save_dir, config=config)
 
     def build_args(
         self,

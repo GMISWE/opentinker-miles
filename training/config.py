@@ -184,10 +184,23 @@ class BackendConfig(BaseModel):
         default_factory=lambda: os.getenv("TINKERCLOUD_BACKEND", "miles"),
         description="Training backend; see training.backends.factory.SUPPORTED_BACKENDS"
     )
+    # JSON object; keys are the backend's config fields (training/backends/<b>/config.py),
+    # applied over the environment. NeMo RL passes unknown keys through as raw
+    # MasterConfig overrides; every other backend rejects them at startup.
     backend_overrides: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Backend-specific configuration overrides"
+        default_factory=lambda: BackendConfig._overrides_from_env(),
+        description="Backend-specific configuration overrides (TINKERCLOUD_BACKEND_OVERRIDES as JSON)"
     )
+
+    @staticmethod
+    def _overrides_from_env() -> Dict[str, Any]:
+        raw = os.getenv("TINKERCLOUD_BACKEND_OVERRIDES", "").strip()
+        if not raw:
+            return {}
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise ValueError("TINKERCLOUD_BACKEND_OVERRIDES must be a JSON object")
+        return parsed
 
     @validator("backend_type")
     def validate_backend_type(cls, v):
@@ -198,31 +211,6 @@ class BackendConfig(BaseModel):
                 f"Unsupported backend: {v!r}. Supported: {', '.join(SUPPORTED_BACKENDS)}"
             )
         return v
-
-
-class SlimeConfig(BaseModel):
-    """Slime backend configuration."""
-
-    cache_dir: Path = Field(
-        default_factory=lambda: Path(os.getenv("HF_HOME", "/data/models")),
-        description="HuggingFace cache directory"
-    )
-    default_batch_size: int = Field(
-        default=8,
-        description="Default batch size for training"
-    )
-    gradient_accumulation_steps: int = Field(
-        default=1,
-        description="Gradient accumulation steps"
-    )
-    mixed_precision: str = Field(
-        default="bf16",
-        description="Mixed precision training mode"
-    )
-    use_flash_attn: bool = Field(
-        default=True,
-        description="Use Flash Attention if available"
-    )
 
 
 class TrainingConfig(BaseModel):
@@ -247,10 +235,6 @@ class TrainingConfig(BaseModel):
     backend: BackendConfig = Field(
         default_factory=BackendConfig,
         description="Backend selection and configuration"
-    )
-    slime: SlimeConfig = Field(
-        default_factory=SlimeConfig,
-        description="Slime backend configuration"
     )
     supported_models: List[ModelInfo] = Field(
         default_factory=lambda: TrainingConfig._get_default_models(),

@@ -34,7 +34,6 @@ land here by pull request — the entry is the reviewable certificate.
 
 import json
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -59,20 +58,19 @@ def _load_entries(path: Path = _REGISTRY_PATH) -> list:
 
 
 def resolve_e0(base_model: str, tp: int, dp: int,
-               registry_path: Path = _REGISTRY_PATH) -> E0Resolution:
+               registry_path: Path = _REGISTRY_PATH,
+               override: Optional[int] = None) -> E0Resolution:
     """Resolve the E0 guard threshold for a pool boot.
 
     ``base_model`` may be a hub id ("Qwen/Qwen2.5-0.5B") or a basename;
     registry keys are basenames.
     """
-    env = os.environ.get("TINKERCLOUD_MILES_COBATCH_E0_TOKENS", "")
-    if env.strip() != "":
-        thr = int(env)
+    if override is not None:
         logger.info(
-            "E0 guard threshold from env override: %d tokens/rank "
-            "(registry not consulted)", thr,
+            "E0 guard threshold from configured override: %d tokens/rank "
+            "(registry not consulted)", override,
         )
-        return E0Resolution(source="env", threshold=thr, disable_cobatch=False)
+        return E0Resolution(source="override", threshold=override, disable_cobatch=False)
 
     basename = base_model.rsplit("/", 1)[-1]
     try:

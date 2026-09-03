@@ -19,6 +19,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ..base import BackendError, BackendHandle, TrainingBackend
+from .config import NemoRLConfig
 from ...core.loss_registry import clip_thresholds
 from ..checkpoint_interchange import (
     export_hf_adapter,
@@ -53,6 +54,7 @@ class NemoRLHandle(BackendHandle):
     hf_path: str = ""
     image_preprocessor: Any = None   # ImagePreprocessor (VLM only)
     colocated_inference: bool = True
+    refit_memory_ratio: float = 0.3      # share of free GPU memory for the IPC refit buffer
     rlve_config: Optional[Dict[str, Any]] = None
     wandb_config: Optional[Dict[str, Any]] = None
     created_at: str = ""
@@ -85,7 +87,8 @@ class NemoRLBackend(TrainingBackend):
     """
 
     def __init__(self, overrides: Optional[Dict[str, Any]] = None):
-        self.overrides = overrides or {}
+        # known keys -> typed config; the rest are raw MasterConfig overrides
+        self.config, self.overrides = NemoRLConfig.split_overrides(overrides)
         self._converter = None
         self._builder = None
         # PERF-002: per-model batch accumulators for sample()
@@ -102,7 +105,7 @@ class NemoRLBackend(TrainingBackend):
     def builder(self):
         if self._builder is None:
             from .builder import NemoRLArgumentBuilder
-            self._builder = NemoRLArgumentBuilder(overrides=self.overrides)
+            self._builder = NemoRLArgumentBuilder(overrides=self.overrides, config=self.config)
         return self._builder
 
     async def create_model(
@@ -166,6 +169,7 @@ class NemoRLBackend(TrainingBackend):
                 config_dict=config_dict,
                 checkpoint_path=init_weights_path,
                 debug_train_only=debug_train_only,
+                refit_memory_ratio=self.config.refit_buffer_memory_ratio,
             )
 
             handle = NemoRLHandle(
@@ -179,6 +183,7 @@ class NemoRLBackend(TrainingBackend):
                 loss_fn=loss_fn,
                 hf_path=hf_path,
                 colocated_inference=not debug_train_only,
+                refit_memory_ratio=self.config.refit_buffer_memory_ratio,
                 rlve_config=rlve_config,
                 wandb_config=wandb_config,
                 created_at=datetime.now().isoformat(),
@@ -636,6 +641,7 @@ class NemoRLBackend(TrainingBackend):
                                 h.policy,
                                 h.policy_generation,
                                 h.colocated_inference,
+                                h.refit_memory_ratio,
                             )
                             h.generation_synced_version = h.weight_version
                             h.training_resident = False  # refit offloaded the policy
@@ -721,6 +727,7 @@ class NemoRLBackend(TrainingBackend):
                     h.policy,
                     h.policy_generation,
                     h.colocated_inference,
+                    h.refit_memory_ratio,
                 )
                 h.training_resident = False  # refit offloaded the policy
                 async with h._generation_state_lock:
@@ -800,6 +807,7 @@ class NemoRLBackend(TrainingBackend):
                     h.policy,
                     h.policy_generation,
                     h.colocated_inference,
+                    h.refit_memory_ratio,
                 )
                 async with h._generation_state_lock:
                     h.generation_state = "generation_ready"
@@ -1046,6 +1054,7 @@ async def _ensure_generation_ready(handle) -> None:
             handle.policy,
             handle.policy_generation,
             handle.colocated_inference,
+            handle.refit_memory_ratio,
         )
         handle.training_resident = False  # refit offloaded the policy
         handle.generation_synced_version = handle.weight_version
@@ -1076,6 +1085,7 @@ def _init_nemo_rl_components(
     config_dict: Dict[str, Any],
     checkpoint_path: Optional[str],
     debug_train_only: bool,
+    refit_memory_ratio: float = 0.3,
 ):
     """
     Initialize NeMo RL Policy, VllmGeneration, cluster, tokenizer, and loss fn.
@@ -1169,7 +1179,8 @@ def _init_nemo_rl_components(
 
         # Do initial weight sync so generation has the correct weights
         logger.info("Performing initial weight sync (refit)...")
-        _refit_policy_generation(policy, policy_generation, colocated_inference=True)
+        _refit_policy_generation(policy, policy_generation, colocated_inference=True,
+                                 memory_ratio=refit_memory_ratio)
         logger.info("Initial weight sync complete")
 
     logger.info(
@@ -1192,13 +1203,13 @@ def _concatenate_batches(data_buffer: List) -> Any:
     return BatchedDataDict.from_batches(data_buffer)
 
 
-def _refit_policy_generation(policy, policy_generation, colocated_inference: bool):
+def _refit_policy_generation(policy, policy_generation, colocated_inference: bool,
+                             memory_ratio: float = 0.3):
     """
     Sync weights from training policy to inference engine (VllmGeneration).
 
     Follows the pattern from nemo_rl/algorithms/grpo.py:refit_policy_generation().
     """
-    import os
     import ray
 
     if colocated_inference:
@@ -1208,7 +1219,6 @@ def _refit_policy_generation(policy, policy_generation, colocated_inference: boo
     try:
         if colocated_inference:
             # IPC ZMQ path for colocated inference
-            memory_ratio = float(os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3"))
             buffer_size_bytes = int(policy.get_free_memory_bytes() * memory_ratio)
 
             futures_train = policy.stream_weights_via_ipc_zmq(
