@@ -319,6 +319,21 @@ class FuturesStorage:
         finally:
             conn.close()
 
+    TRAINING_OPERATIONS = ("forward", "forward_backward", "optim_step")
+
+    def has_training_requests(self, model_id: str) -> bool:
+        """True once the model has seen any forward / forward_backward / optim_step."""
+        placeholders = ",".join("?" * len(self.TRAINING_OPERATIONS))
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            row = conn.execute(
+                f"SELECT 1 FROM futures WHERE model_id = ? AND operation IN ({placeholders}) LIMIT 1",
+                (model_id, *self.TRAINING_OPERATIONS),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
     def cleanup_old_futures(self, max_age_hours: int = 24) -> int:
         """
         Remove futures older than specified age.

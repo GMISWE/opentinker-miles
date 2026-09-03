@@ -18,6 +18,7 @@ from ..core.task_manager import TaskManager
 from ..core.dependencies import verify_api_key_dep
 from ..storage import MetadataStorage, FuturesStorage
 from ..models.requests import (
+    LoadWeightsRequest,
     SaveWeightsRequest,
     SaveWeightsForSamplerRequest,
     WeightsInfoRequest,
@@ -25,9 +26,9 @@ from ..models.requests import (
 from ..models.responses import (
     AsyncOperationResponse,
     SaveWeightsForSamplerResult,
-    DeprecatedEndpointError,
     WeightsInfoResponse,
 )
+from fastapi import Response
 from ..utils import generate_request_id
 
 logger = logging.getLogger(__name__)
@@ -201,22 +202,99 @@ async def save_weights_for_sampler(
     )
 
 
-@router.post("/api/v1/load_weights")
+@router.post("/api/v1/load_weights", response_model=AsyncOperationResponse)
 async def load_weights(
-    _: None = Depends(verify_api_key_dep)
+    request: LoadWeightsRequest,
+    _: None = Depends(verify_api_key_dep),
+    service: CheckpointService = Depends(get_checkpoint_service),
+    task_manager: TaskManager = Depends(get_task_manager),
+    futures_storage: FuturesStorage = Depends(get_futures_storage),
+    metadata_storage: MetadataStorage = Depends(get_metadata_storage),
+    training_clients: Dict = Depends(get_training_clients),
 ):
-    """Deprecated endpoint - use checkpoint_path in create_model instead."""
-    return DeprecatedEndpointError(
-        error="Endpoint deprecated",
-        reason="load_weights is no longer supported as a separate operation",
-        solution={
-            "description": "Use checkpoint_path parameter in create_model request",
-            "example": {
-                "base_model": "meta-llama/Llama-3.1-8B",
-                "checkpoint_path": "tinker://run_abc123/weights/checkpoint_001"
-            }
-        }
+    """Load a saved training checkpoint into a model.
+
+    Permitted only as the model's first request (before any forward /
+    forward_backward / optim_step), matching the Tinker service; later loads
+    belong in a fresh model created with checkpoint_path.
+    """
+    if request.model_id not in training_clients:
+        raise HTTPException(status_code=404, detail=f"Model {request.model_id} not found")
+    if request.optimizer:
+        raise HTTPException(status_code=400, detail="load_weights with optimizer=true is not supported")
+    if futures_storage.has_training_requests(request.model_id):
+        raise HTTPException(
+            status_code=400,
+            detail=f"LoadWeights is not permitted with seq_id {request.seq_id}: the model has already "
+                   "trained; create a new model with checkpoint_path instead",
+        )
+    parts = request.path.removeprefix("tinker://").split("/")
+    if not request.path.startswith("tinker://") or len(parts) != 3 or parts[1] != "weights":
+        raise HTTPException(status_code=400, detail=f"path must be tinker://<run>/weights/<name>, got {request.path!r}")
+    if metadata_storage.load_checkpoint(parts[0], parts[2]) is None:
+        raise HTTPException(status_code=404, detail=f"Checkpoint not found: {request.path}")
+    request_id = generate_request_id()
+
+    async def execute():
+        return await service.load_weights(
+            model_id=request.model_id, request_id=request_id, path=request.path,
+            training_clients=training_clients, metadata_storage=metadata_storage,
+        )
+
+    task_manager.create_task(
+        request_id=request_id, operation="load_weights", model_id=request.model_id,
+        payload=request.dict(), task_func=execute,
     )
+    return AsyncOperationResponse(request_id=request_id, model_id=request.model_id)
+
+
+@router.get("/api/v1/training_runs/{model_id}/checkpoints")
+async def list_checkpoints(
+    model_id: str,
+    _: None = Depends(verify_api_key_dep),
+    service: CheckpointService = Depends(get_checkpoint_service),
+    metadata_storage: MetadataStorage = Depends(get_metadata_storage),
+):
+    """Checkpoints of a training run, in the SDK's CheckpointsListResponse shape."""
+    if metadata_storage.load_training_run(model_id) is None:
+        raise HTTPException(status_code=404, detail=f"Training run not found: {model_id}")
+    return {"checkpoints": service.list_checkpoints(model_id, metadata_storage), "cursor": None}
+
+
+def _delete(service, metadata_storage, model_id, checkpoint_type, checkpoint_id):
+    if checkpoint_type not in ("training", "sampler"):
+        raise HTTPException(status_code=400, detail="checkpoint_type must be 'training' or 'sampler'")
+    if not service.delete_checkpoint(model_id, checkpoint_type, checkpoint_id, metadata_storage):
+        raise HTTPException(status_code=404, detail=f"Checkpoint not found: {checkpoint_type} {checkpoint_id} of {model_id}")
+    return Response(status_code=204)
+
+
+@router.delete("/api/v1/training_runs/{model_id}/checkpoints/{kind}/{checkpoint_id}")
+async def delete_checkpoint_typed(
+    model_id: str, kind: str, checkpoint_id: str,
+    _: None = Depends(verify_api_key_dep),
+    service: CheckpointService = Depends(get_checkpoint_service),
+    metadata_storage: MetadataStorage = Depends(get_metadata_storage),
+):
+    """DELETE .../checkpoints/weights/<id> or .../checkpoints/sampler_weights/<id>."""
+    kinds = {"weights": "training", "sampler_weights": "sampler"}
+    if kind not in kinds:
+        raise HTTPException(status_code=400, detail="checkpoint path must be weights/<id> or sampler_weights/<id>")
+    return _delete(service, metadata_storage, model_id, kinds[kind], checkpoint_id)
+
+
+@router.delete("/api/v1/training_runs/{model_id}/checkpoints/{checkpoint_id}")
+async def delete_checkpoint_bare(
+    model_id: str, checkpoint_id: str, checkpoint_type: str = None,
+    _: None = Depends(verify_api_key_dep),
+    service: CheckpointService = Depends(get_checkpoint_service),
+    metadata_storage: MetadataStorage = Depends(get_metadata_storage),
+):
+    """A bare id needs ?checkpoint_type=training|sampler: the two kinds can share an id."""
+    if not checkpoint_type:
+        raise HTTPException(status_code=400, detail="specify the kind: .../checkpoints/weights/<id>, "
+                            ".../checkpoints/sampler_weights/<id>, or ?checkpoint_type=training|sampler")
+    return _delete(service, metadata_storage, model_id, checkpoint_type, checkpoint_id)
 
 
 @router.post("/api/v1/weights_info", response_model=WeightsInfoResponse)
