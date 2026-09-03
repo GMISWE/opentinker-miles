@@ -208,26 +208,8 @@ class MilesDataConverter(DataConverter):
                 merged[key] = v0
         return merged
 
-    def backend_to_forward_result(
-        self,
-        result: Any,
-        data: List[Dict],
-    ) -> Dict[str, Any]:
-        """Convert Miles forward result to Tinker format."""
-        return self._inner.rollout_to_forward_result(
-            result,
-            loss_fn="cross_entropy",
-            original_data=data,
-        )
+    def backend_to_forward_result(self, result: Any, data: List[Dict]) -> Dict[str, Any]:
+        raise NotImplementedError("MilesBackend builds Tinker results inline (backend.py)")
 
-    def backend_to_forward_backward_result(
-        self,
-        result: Any,
-        data: List[Dict],
-    ) -> Dict[str, Any]:
-        """Convert Miles forward_backward result to Tinker format."""
-        return self._inner.rollout_to_forward_backward_result(
-            result,
-            loss_fn="cross_entropy",
-            original_data=data,
-        )
+    def backend_to_forward_backward_result(self, result: Any, data: List[Dict]) -> Dict[str, Any]:
+        raise NotImplementedError("MilesBackend builds Tinker results inline (backend.py)")

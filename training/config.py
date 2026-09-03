@@ -256,10 +256,6 @@ class TrainingConfig(BaseModel):
         default_factory=lambda: TrainingConfig._get_default_models(),
         description="List of supported models"
     )
-    poll_tracking_enabled: bool = Field(
-        default=True,
-        description="Enable smart poll tracking for retrieve_future"
-    )
     allow_partial_batches: bool = Field(
         default_factory=lambda: os.getenv("ALLOW_PARTIAL_BATCHES", "false").lower() == "true",
         description="Allow forward_backward batches that are not divisible by data-parallel size"

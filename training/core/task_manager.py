@@ -207,7 +207,7 @@ class TaskManager:
         except asyncio.TimeoutError:
             logger.warning(f"Timeout waiting for tasks, {len(self._active_tasks)} still active")
 
-    @property
-    def active_count(self) -> int:
-        """Get count of currently active tasks"""
-        return len(self._active_tasks)
+    @classmethod
+    def inflight_count(cls) -> int:
+        """Number of async operations not yet completed (process-wide)."""
+        return len(cls._active_tasks)

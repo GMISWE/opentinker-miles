@@ -38,7 +38,6 @@ class ModelService:
         parallelism_config: Optional[Dict[str, Any]],
         max_batch_size: int,
         max_seq_len: int,
-        slime_builder: Any,  # kept for signature compat; unused — backend has its own builder
         metadata_storage: MetadataStorage,
         training_clients: Dict[str, Dict[str, Any]],
         training_runs_metadata: Dict[str, Dict[str, Any]],

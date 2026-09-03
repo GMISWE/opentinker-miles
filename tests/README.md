@@ -1,6 +1,33 @@
 # tinkercloud Tests
 
-Integration tests for tinkercloud server running in Docker.
+## Unit and protocol suites (CPU only, no server, no GPU)
+
+Two suites run without Ray or a GPU and are the acceptance bar for every
+protocol change:
+
+- `tests/protocol/` — the real `tinker` SDK against a live server on the
+  `fake` backend (`--backend fake`, deterministic CPU outputs). Covers auth,
+  model info, loss registry, sampler routing, sampling params, checkpoints,
+  and per-model ordering / seq_id idempotency. ~5 s.
+- `tests/test_*.py` unit tests that import `tinkercloud.training` directly
+  (ordering queue, backend interface contract, loss registry, checkpoint
+  interchange, validators, converter layout).
+
+The tests import the server as the `tinkercloud` package, so the checkout
+must be importable under that name (a symlink named `tinkercloud` pointing at
+this directory, with its parent on `PYTHONPATH`). On the cluster:
+
+```bash
+scripts/pod_pytest.sh                       # default pod + default suites
+scripts/pod_pytest.sh tinkercloud-nemorl tests/protocol -q
+```
+
+The script pushes the local working tree (sha-verified) to a scratch dir on
+the pod and runs pytest there; the deployed `/app` is untouched.
+
+## Integration tests against a running server
+
+Integration tests for a tinkercloud server running in Docker.
 
 ## Prerequisites
 
@@ -127,6 +154,11 @@ PYTHONPATH=/root/gavin/miles:/root/gavin/tinker-cookbook pytest tests/test_advan
 
 | File | Description |
 |------|-------------|
+| `protocol/` | SDK-driven protocol suite on the fake backend (see above) |
+| `test_ordering.py` | Per-model program order and barrier semantics (unit) |
+| `test_backend_interface.py` | Backend ABC signature contract for every `SUPPORTED_BACKENDS` entry |
+| `test_loss_registry.py` | `loss_fn` / `loss_fn_config` validation |
+| `test_checkpoint_interchange.py` | Checkpoint URI <-> root resolution |
 | `cleanup_test_env.py` | Cleanup script to free GPUs before tests |
 | `test_dpo.py` | DPO training integration tests |
 | `test_dpo_reduced.sh` | Shell script for quick DPO test |

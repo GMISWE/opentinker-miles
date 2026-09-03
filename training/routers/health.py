@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, Request
 
 from ..models.responses import HealthResponse, ServerCapabilities, ModelInfo
 from ..core.dependencies import verify_api_key_dep
+from ..core.task_manager import TaskManager
 from ..config import TrainingConfig
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,6 @@ async def health_simple(request: Request):
     """Health check for k8s probes (backward compatibility)"""
     runtime = _get_runtime(request)
     training_clients = runtime.training_clients
-    futures_store = runtime.futures_store
 
     return HealthResponse(
         status="healthy",
@@ -50,7 +50,7 @@ async def health_simple(request: Request):
         ray_initialized=ray.is_initialized(),
         active_training_clients=len(training_clients),
         model_ids=list(training_clients.keys()),
-        futures_count=len(futures_store)
+        futures_count=TaskManager.inflight_count()
     )
 
 
@@ -59,7 +59,6 @@ async def health(request: Request):
     """Health check endpoint - refactored with typed response"""
     runtime = _get_runtime(request)
     training_clients = runtime.training_clients
-    futures_store = runtime.futures_store
 
     return HealthResponse(
         status="healthy",
@@ -68,7 +67,7 @@ async def health(request: Request):
         ray_initialized=ray.is_initialized(),
         active_training_clients=len(training_clients),
         model_ids=list(training_clients.keys()),
-        futures_count=len(futures_store)
+        futures_count=TaskManager.inflight_count()
     )
 
 

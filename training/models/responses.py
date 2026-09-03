@@ -79,14 +79,6 @@ class ForwardBackwardResult(BaseModel):
     logprobs: Optional[TensorData] = Field(default=None, description="Batch log probabilities")
 
 
-class OptimStepResultOld(BaseModel):
-    """DEPRECATED: Old result from optimizer step."""
-
-    step_num: int = Field(..., description="Step number")
-    grad_norm: float = Field(..., description="Gradient norm")
-    success: bool = Field(default=True, description="Whether step succeeded")
-
-
 class OptimStepResult(BaseModel):
     """Result from optimizer step (new format)."""
     success: bool = Field(default=True, description="Whether step succeeded")
@@ -139,14 +131,6 @@ class SpecialTokens(BaseModel):
     eos_token: Optional[str] = Field(default=None, description="End of sequence token")
     bos_token: Optional[str] = Field(default=None, description="Beginning of sequence token")
     unk_token: Optional[str] = Field(default=None, description="Unknown token")
-
-
-class TokenizerInfoOld(BaseModel):
-    """DEPRECATED: Old tokenizer information."""
-
-    tokenizer_path: str = Field(..., description="Path to tokenizer")
-    vocab_size: int = Field(..., description="Vocabulary size")
-    special_tokens: Optional[Dict[str, int]] = Field(default=None, description="Special token IDs")
 
 
 class TokenizerInfo(BaseModel):
