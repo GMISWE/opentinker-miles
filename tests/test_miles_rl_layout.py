@@ -6,7 +6,7 @@ import pytest
 if importlib.util.find_spec("torch") is None:
     pytest.skip("torch not installed", allow_module_level=True)
 
-from tinkercloud.training.core.data_converter import TinkerDataConverter
+from tinkercloud.training.backends.miles.rollout_data import TinkerDataConverter
 
 
 def _datum(T=6, with_target=True):

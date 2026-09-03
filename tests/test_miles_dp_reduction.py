@@ -41,9 +41,9 @@ import pytest
 
 
 def _load_builder_module():
-    """Import slime_builder.py without dragging FastAPI in via the package init."""
+    """Import backends/miles/builder.py without dragging FastAPI in via the package init."""
     try:  # in-container / installed layout
-        from tinkercloud.training.core import slime_builder as m
+        from tinkercloud.training.backends.miles import builder as m
         return m
     except ImportError:
         pass
@@ -63,16 +63,19 @@ def _load_builder_module():
         return mod
 
     _pkg("_tcbdp")
-    _pkg("_tcbdp.core")
     _pkg("_tcbdp.utils")
     _pkg("_tcbdp.backends")
     _pkg("_tcbdp.backends.miles")
-    # slime_builder does `from ..backends.miles.config import MilesConfig`
+    base = types.ModuleType("_tcbdp.backends.base")
+    base.ArgumentBuilder = object
+    sys.modules["_tcbdp.backends.base"] = base
+    # the builder imports these leaves relatively; they must exist under the alias first
+    _load("_tcbdp.utils.model_config", os.path.join(root, "utils", "model_config.py"))
     _load("_tcbdp.backends.env_config", os.path.join(root, "backends", "env_config.py"))
     _load("_tcbdp.backends.miles.config", os.path.join(root, "backends", "miles", "config.py"))
-    _load("_tcbdp.utils.model_config", os.path.join(root, "utils", "model_config.py"))
-    return _load("_tcbdp.core.slime_builder",
-                 os.path.join(root, "core", "slime_builder.py"))
+    _load("_tcbdp.backends.miles.model_setup", os.path.join(root, "backends", "miles", "model_setup.py"))
+    return _load("_tcbdp.backends.miles.builder",
+                 os.path.join(root, "backends", "miles", "builder.py"))
 
 
 @pytest.fixture(scope="module")

@@ -31,9 +31,9 @@ FC2_BATCH_INVARIANCE_THRESHOLD = 352
 
 
 def _load_builder_module():
-    """Import slime_builder.py without dragging FastAPI in via the package init."""
+    """Import backends/miles/builder.py without dragging FastAPI in via the package init."""
     try:  # in-container / installed layout
-        from tinkercloud.training.core import slime_builder as m
+        from tinkercloud.training.backends.miles import builder as m
         return m
     except ImportError:
         pass
@@ -53,18 +53,19 @@ def _load_builder_module():
         return mod
 
     _pkg("_tcb")
-    _pkg("_tcb.core")
     _pkg("_tcb.utils")
     _pkg("_tcb.backends")
     _pkg("_tcb.backends.miles")
-    # slime_builder does `from ..backends.miles.config import MilesConfig`
+    base = types.ModuleType("_tcb.backends.base")
+    base.ArgumentBuilder = object
+    sys.modules["_tcb.backends.base"] = base
+    # the builder imports these leaves relatively; they must exist under the alias first
+    _load("_tcb.utils.model_config", os.path.join(root, "utils", "model_config.py"))
     _load("_tcb.backends.env_config", os.path.join(root, "backends", "env_config.py"))
     _load("_tcb.backends.miles.config", os.path.join(root, "backends", "miles", "config.py"))
-    # slime_builder does `from ..utils.model_config import ...`, so that leaf
-    # has to exist under the alias package before the builder is executed.
-    _load("_tcb.utils.model_config", os.path.join(root, "utils", "model_config.py"))
-    return _load("_tcb.core.slime_builder",
-                 os.path.join(root, "core", "slime_builder.py"))
+    _load("_tcb.backends.miles.model_setup", os.path.join(root, "backends", "miles", "model_setup.py"))
+    return _load("_tcb.backends.miles.builder",
+                 os.path.join(root, "backends", "miles", "builder.py"))
 
 
 # Qwen2.5-0.5B, the shape every number in the investigation was measured on.
@@ -84,7 +85,7 @@ MODEL_CONFIG = {
 
 def _build(builder_mod):
     """The CLI list the builder hands miles' parse_args, for a small model."""
-    return builder_mod.SlimeArgumentBuilder(
+    return builder_mod.MilesArgumentBuilder(
         default_save_dir="/tmp/ckpt"
     )._build_minimal_args(
         hf_model_path="/tmp/model",

@@ -1,4 +1,4 @@
-"""Miles backend — wraps TinkerTrainGroup/RolloutManager/SlimeArgumentBuilder
+"""Miles backend — wraps TinkerTrainGroup/RolloutManager/MilesArgumentBuilder
 behind the TrainingBackend interface.
 
 Targets the miles `tinker-seam` branch (upstream-based): async
@@ -93,7 +93,7 @@ def _model_input_lens(data: List[Any]) -> List[int]:
     """Per-datum model_input token lengths (the observation-contract unit:
     fb logprobs are datum-aligned to these, NOT to rollout tokens which
     append the final target)."""
-    from ...core.data_converter import TinkerDataConverter
+    from .rollout_data import TinkerDataConverter
 
     lens = []
     for d in data:
@@ -340,7 +340,7 @@ class MilesBackend(TrainingBackend):
 
         from miles.utils.adapter_config import TinkerAdapterConfig
 
-        # Same rank/alpha derivation as the builder (slime_builder LoRA args).
+        # Same rank/alpha derivation as the builder (MilesArgumentBuilder LoRA args).
         rank = int(lora_config.get("rank", 0))
         alpha = int(lora_config.get("alpha") or rank)
         adapter_name = re.sub(r"[^A-Za-z0-9._-]", "-", model_id)
@@ -1190,7 +1190,7 @@ class MilesBackend(TrainingBackend):
 
             # Pool mode: save_due_adapter_checkpoints only writes adapters with
             # registry step > 0 at a save-interval multiple (interval is 1 at
-            # pool boot, slime_builder). The registry step is miles' own
+            # pool boot, builder.py). The registry step is miles' own
             # training-loop counter and nothing advances it here — the CLIENT
             # owns the loop — so publish our weight version (= applied optimizer
             # steps) as the step this checkpoint represents.
