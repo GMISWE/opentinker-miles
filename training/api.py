@@ -72,7 +72,6 @@ def create_app(config: Optional[TrainingConfig] = None) -> FastAPI:
     async def startup_event():
         """Initialize storage, Ray, and inject dependencies into routers"""
         config_obj: TrainingConfig = application.state.config
-        runtime: TrainingRuntimeState = application.state.runtime
 
         logger.info(f"Loaded configuration - Log level: {config_obj.server.log_level}")
         logger.info(
@@ -127,6 +126,9 @@ def create_app(config: Optional[TrainingConfig] = None) -> FastAPI:
             backend_overrides=config_obj.backend.backend_overrides,
         )
         logger.info("Backend initialized: %s", backend_type)
+        backend_cfg = getattr(backend, "config", None)
+        if backend_cfg is not None:
+            logger.info("Effective %s backend config (value, source):\n%s", backend_type, backend_cfg.describe())
 
         auth = APIKeyAuth(
             api_key=config_obj.auth.api_key,

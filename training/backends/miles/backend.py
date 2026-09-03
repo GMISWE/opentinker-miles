@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 import ray
 
 from ..base import BackendError, BackendHandle, TrainingBackend, UnsupportedFeatureError
+from .config import MilesConfig
 from ...core.loss_registry import clip_thresholds
 from ..checkpoint_interchange import (
     CHECKPOINT_BASE,
@@ -221,6 +222,7 @@ class MilesBackend(TrainingBackend):
 
     def __init__(self, overrides: Optional[Dict[str, Any]] = None):
         self.overrides = overrides or {}
+        self.config = MilesConfig.from_env(self.overrides)
         # Lazy-import converter to avoid import errors when Miles is not installed
         self._converter = None
         self._builder = None
@@ -240,7 +242,7 @@ class MilesBackend(TrainingBackend):
     def builder(self):
         if self._builder is None:
             from .builder import MilesArgumentBuilder
-            self._builder = MilesArgumentBuilder()
+            self._builder = MilesArgumentBuilder(config=self.config)
         return self._builder
 
     async def create_model(
@@ -281,8 +283,8 @@ class MilesBackend(TrainingBackend):
             rlve_config=rlve_config, wandb_config=wandb_config,
             objective=objective, num_labels=num_labels, head_config=head_config,
         )
-        # Mirror the builder's pool gate (slime_builder: env slots + LoRA rank).
-        slots = int(os.environ.get("TINKERCLOUD_MILES_MULTILORA_SLOTS", "0") or 0)
+        # Mirror the builder's pool gate (configured slots + LoRA rank).
+        slots = self.config.multilora_slots
         pool_eligible = slots > 0 and bool(lora_config and lora_config.get("rank", 0) > 0)
         if not pool_eligible:
             return await self._boot_model(**boot_kwargs)
@@ -601,22 +603,19 @@ class MilesBackend(TrainingBackend):
                 )
                 pool.tenants[model_id] = adapter_slot
                 handle.lock = pool.lock
-                pool.cobatch_max_samples = int(
-                    os.environ.get("TINKERCLOUD_MILES_COBATCH_MAX_SAMPLES", "0") or 0
-                )
-                pool.cobatch_reorder = bool(int(
-                    os.environ.get("TINKERCLOUD_MILES_COBATCH_REORDER", "0") or 0
-                ))
+                pool.cobatch_max_samples = self.config.cobatch_max_samples
+                pool.cobatch_reorder = self.config.cobatch_reorder
                 if pool.cobatch_max_samples > 0:
                     # The guard threshold is a measured per-(model x parallel
                     # config) constant, resolved from the calibration registry
-                    # (env override wins; an uncalibrated config gets no
-                    # merging at all). See e0_registry.
+                    # (a configured threshold wins; an uncalibrated config gets
+                    # no merging at all). See e0_registry.
                     from .e0_registry import resolve_e0
                     res = resolve_e0(
                         base_model,
                         tp=int(getattr(args, "tensor_model_parallel_size", 1) or 1),
                         dp=_dp_size(args),
+                        override=self.config.cobatch_e0_tokens,
                     )
                     pool.cobatch_e0_tokens = res.threshold
                     if res.disable_cobatch:

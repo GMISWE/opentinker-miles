@@ -5,10 +5,10 @@ create_model args to NeMo RL PolicyConfig dict.
 Returns (config_dict, hf_path) similar to MilesArgumentBuilder.
 """
 import logging
-import os
 from typing import Any, Dict, Optional
 
 from ..base import ArgumentBuilder
+from .config import NemoRLConfig
 from ...utils.model_config import detect_num_gpus
 
 logger = logging.getLogger(__name__)
@@ -17,7 +17,6 @@ logger = logging.getLogger(__name__)
 # and vLLM engine to a model's *full* native context (often 128K+) would waste
 # KV-cache/activation memory, so we cap the auto-derived value here. Operators
 # can raise it (Explicit Configuration) for long-context runs.
-_DEFAULT_MAX_SEQ_LEN_CAP = 32768
 
 # HF config attributes that report a model's max context window, in priority order.
 _MAX_POSITIONS_ATTRS = (
@@ -50,8 +49,10 @@ def _read_model_max_positions(cfg: Any) -> Optional[int]:
 class NemoRLArgumentBuilder(ArgumentBuilder):
     """Builds NeMo RL PolicyConfig + loss config from Tinker API parameters."""
 
-    def __init__(self, overrides: Optional[Dict[str, Any]] = None):
-        self.overrides = overrides or {}
+    def __init__(self, overrides: Optional[Dict[str, Any]] = None,
+                 config: Optional[NemoRLConfig] = None):
+        self.overrides = overrides or {}  # raw MasterConfig deep-merge overrides
+        self.cfg = config or NemoRLConfig.from_env()
 
     def build_args(
         self,
@@ -84,7 +85,7 @@ class NemoRLArgumentBuilder(ArgumentBuilder):
         # size up to the model's native context below, so long-context recipes
         # (e.g. harbor_rl, 32K trajectories) work with no cookbook/SDK change.
         requested_seq_len = kwargs.get("max_seq_len", 2048)
-        seq_len_cap = int(os.environ.get("TINKERCLOUD_MAX_SEQ_LEN_CAP", _DEFAULT_MAX_SEQ_LEN_CAP))
+        seq_len_cap = self.cfg.max_seq_len_cap
         max_seq_len = requested_seq_len
         rlve_config = kwargs.get("rlve_config")
         wandb_config = kwargs.get("wandb_config")
@@ -149,10 +150,10 @@ class NemoRLArgumentBuilder(ArgumentBuilder):
                 "context_parallel_size", parallelism.get("context_parallel", 1)
             )
         # Explicit env override, mirroring miles' SLIME_DEFAULT_TP.
-        env_tp = os.environ.get("NEMORL_DEFAULT_TP")
+        env_tp = self.cfg.default_tp
         if env_tp:
-            tp_size = int(env_tp)
-            logger.info("Using NEMORL_DEFAULT_TP override: TP=%d", tp_size)
+            tp_size = env_tp
+            logger.info("Using configured TP override: TP=%d", tp_size)
         if parallelism or env_tp:
             if is_vlm and cp_size > 1:
                 logger.warning(
@@ -181,13 +182,13 @@ class NemoRLArgumentBuilder(ArgumentBuilder):
         # NEMORL_TRAIN_MB_TOKENS: override base budget; 0 disables dynamic
         # batching; NEMORL_TRAIN_MBS then sets the static micro-batch size.
         train_global_batch_size = max_batch_size
-        train_micro_batch_size = int(os.environ.get("NEMORL_TRAIN_MBS", "1"))
-        dyn_env = os.environ.get("NEMORL_TRAIN_MB_TOKENS")
+        train_micro_batch_size = self.cfg.train_mbs
+        dyn_env = self.cfg.train_mb_tokens
         # VLMs keep the static path: dynamic batching's slice/truncate is
         # unvalidated against multimodal kwargs (same conservatism as the
         # sequence_packing/cp guards above).
         dyn_default = 0 if is_vlm else min(max_seq_len, 8192)
-        dyn_mb_tokens = int(dyn_env) if dyn_env is not None else dyn_default
+        dyn_mb_tokens = dyn_env if dyn_env is not None else dyn_default
         dynamic_batching_cfg = (
             {
                 "enabled": True,
@@ -324,9 +325,9 @@ class NemoRLArgumentBuilder(ArgumentBuilder):
         # has no set_learning_rate, so the client's per-step LR is reproduced
         # server-side by the scheduler (linear lr0*(1-t/T), matching
         # q5_conv_migration.lr_at); verify delivered lr in train metrics.
-        if os.environ.get("NEMORL_MEGATRON") == "1":
-            meg_lr = float(os.environ.get("NEMORL_MEGATRON_LR", "2e-4"))
-            meg_iters = int(os.environ.get("NEMORL_MEGATRON_LR_DECAY_ITERS", "222"))
+        if self.cfg.megatron:
+            meg_lr = self.cfg.megatron_lr
+            meg_iters = self.cfg.megatron_lr_decay_iters
             policy_config["dtensor_cfg"] = {"enabled": False}
             # The bridge scheduler converts lr_decay_iters to SAMPLE units by
             # multiplying with config train_global_batch_size at init, while
@@ -334,8 +335,7 @@ class NemoRLArgumentBuilder(ArgumentBuilder):
             # gbs to the actual per-step batch so decay is exact (measured:
             # 4096 vs 128 slowed decay 32x — delivered lr 1.99972e-4 vs
             # declared 1.99099e-4 at step 1).
-            policy_config["train_global_batch_size"] = int(
-                os.environ.get("NEMORL_MEGATRON_GBS", "128"))
+            policy_config["train_global_batch_size"] = self.cfg.megatron_gbs
             if lora_config and lora_config.get("rank", 0) > 0:
                 meg_peft = {
                     "enabled": True,
@@ -348,8 +348,7 @@ class NemoRLArgumentBuilder(ArgumentBuilder):
                     "alpha": lora_config.get("alpha") or lora_config.get("rank", 8),
                     "dropout": lora_config.get("dropout", 0.0),
                     "dropout_position": "post",
-                    "lora_A_init_method": os.environ.get(
-                        "NEMORL_MEGATRON_A_INIT", "xavier"),
+                    "lora_A_init_method": self.cfg.megatron_a_init,
                     "lora_B_init_method": "zero",
                     "a2a_experimental": False,
                     "lora_dtype": None,
@@ -397,9 +396,7 @@ class NemoRLArgumentBuilder(ArgumentBuilder):
                     "adam_eps": 1.0e-8,
                     "sgd_momentum": 0.9,
                     "use_distributed_optimizer": True,
-                    "use_precision_aware_optimizer": (
-                        os.environ.get("NEMORL_MEGATRON_PRECISION_AWARE", "1")
-                        == "1"),
+                    "use_precision_aware_optimizer": self.cfg.megatron_precision_aware,
                     # Read unconditionally by the pod's nemo-rl rev
                     # (validate_and_set_config), absent from the older
                     # RL submodule checkout — supply both.

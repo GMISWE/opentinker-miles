@@ -43,20 +43,17 @@ def registry(tmp_path):
     return p
 
 
-def test_env_override_wins(monkeypatch, registry):
-    monkeypatch.setenv("TINKERCLOUD_MILES_COBATCH_E0_TOKENS", "256")
-    res = resolve_e0("Org/ModelA", tp=1, dp=2, registry_path=registry)
-    assert (res.source, res.threshold, res.disable_cobatch) == ("env", 256, False)
+def test_configured_override_wins(registry):
+    res = resolve_e0("Org/ModelA", tp=1, dp=2, registry_path=registry, override=256)
+    assert (res.source, res.threshold, res.disable_cobatch) == ("override", 256, False)
 
 
-def test_env_zero_disables_guard_not_cobatch(monkeypatch, registry):
-    monkeypatch.setenv("TINKERCLOUD_MILES_COBATCH_E0_TOKENS", "0")
-    res = resolve_e0("Org/ModelA", tp=1, dp=2, registry_path=registry)
-    assert (res.source, res.threshold, res.disable_cobatch) == ("env", 0, False)
+def test_override_zero_disables_guard_not_cobatch(registry):
+    res = resolve_e0("Org/ModelA", tp=1, dp=2, registry_path=registry, override=0)
+    assert (res.source, res.threshold, res.disable_cobatch) == ("override", 0, False)
 
 
-def test_registry_threshold(monkeypatch, registry):
-    monkeypatch.delenv("TINKERCLOUD_MILES_COBATCH_E0_TOKENS", raising=False)
+def test_registry_threshold(registry):
     res = resolve_e0("Org/ModelA", tp=1, dp=2, registry_path=registry)
     assert (res.source, res.threshold, res.disable_cobatch) == ("registry", 512, False)
 
