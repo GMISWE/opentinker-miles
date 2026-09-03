@@ -55,6 +55,11 @@ def _load_builder_module():
     _pkg("_tcb")
     _pkg("_tcb.core")
     _pkg("_tcb.utils")
+    _pkg("_tcb.backends")
+    _pkg("_tcb.backends.miles")
+    # slime_builder does `from ..backends.miles.config import MilesConfig`
+    _load("_tcb.backends.env_config", os.path.join(root, "backends", "env_config.py"))
+    _load("_tcb.backends.miles.config", os.path.join(root, "backends", "miles", "config.py"))
     # slime_builder does `from ..utils.model_config import ...`, so that leaf
     # has to exist under the alias package before the builder is executed.
     _load("_tcb.utils.model_config", os.path.join(root, "utils", "model_config.py"))

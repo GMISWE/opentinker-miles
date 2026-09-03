@@ -5,10 +5,12 @@ This module handles the construction of Slime training arguments,
 integrating model configuration, parallelism settings, and LoRA configuration.
 """
 import logging
-import os
 import sys
 from argparse import Namespace
-from typing import Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+
+if TYPE_CHECKING:
+    from ..backends.miles.config import MilesConfig
 
 from ..utils.model_config import (
     load_model_config,
@@ -30,14 +32,19 @@ class SlimeArgumentBuilder:
     all the various training settings required by Slime.
     """
 
-    def __init__(self, default_save_dir: str = "/data/checkpoints/tinker"):
+    def __init__(self, default_save_dir: str = "/data/checkpoints/tinker",
+                 config: Optional["MilesConfig"] = None):
         """
-        Initialize the argument builder.
-
         Args:
             default_save_dir: Default directory for saving checkpoints
+            config: Miles knobs (SLIME_* / TINKERCLOUD_MILES_*); read from the
+                environment when not given
         """
         self.default_save_dir = default_save_dir
+        if config is None:
+            from ..backends.miles.config import MilesConfig
+            config = MilesConfig.from_env()
+        self.cfg = config
 
     def build_args(
         self,
@@ -85,7 +92,7 @@ class SlimeArgumentBuilder:
         # Multi-LoRA pool mode (explicit opt-in, Constitution P3). Requires a
         # LoRA model; boots disaggregated (train/rollout GPUs split — upstream
         # bans colocate+offload with multi-LoRA).
-        multi_lora_slots = int(os.environ.get("TINKERCLOUD_MILES_MULTILORA_SLOTS", "0") or 0)
+        multi_lora_slots = self.cfg.multilora_slots
         if multi_lora_slots > 0 and not (lora_config and lora_config.get("rank", 0) > 0):
             logger.info("Multi-LoRA pool disabled for this model: no LoRA rank in lora_config")
             multi_lora_slots = 0
@@ -93,7 +100,7 @@ class SlimeArgumentBuilder:
             raise ValueError("Multi-LoRA pool mode does not support RLVE")
         rollout_gpus = 0
         if multi_lora_slots > 0:
-            train_gpus = int(os.environ.get("TINKERCLOUD_MILES_TRAIN_GPUS", "0") or 0) or max(num_gpus // 2, 1)
+            train_gpus = self.cfg.train_gpus or max(num_gpus // 2, 1)
             rollout_gpus = num_gpus - train_gpus
             assert rollout_gpus > 0, (
                 f"Multi-LoRA needs disaggregated rollout GPUs: total={num_gpus}, train={train_gpus}"
@@ -111,15 +118,19 @@ class SlimeArgumentBuilder:
             num_gpus,
             max_seq_len=max_seq_len,
             rlve_enabled=rlve_enabled,
-            model_name=base_model
+            model_name=base_model,
+            default_tp=self.cfg.default_tp,
+            default_cp=self.cfg.default_cp,
+            rlve_tp=self.cfg.rlve_tp,
+            rlve_cp=self.cfg.rlve_cp,
         )
         tp_size = parallel['tp']
         pp_size = parallel['pp']
         cp_size = parallel['cp']
         # Attribution-arm override (specs/013 stack-residual): explicit env,
         # default = auto-detect.
-        if os.environ.get('SLIME_TP'):
-            tp_size = int(os.environ['SLIME_TP'])
+        if self.cfg.tp:
+            tp_size = self.cfg.tp
 
         # Build parallel_config dict for compatibility
         parallel_config = {
@@ -230,7 +241,7 @@ class SlimeArgumentBuilder:
             # this GPU and cuBLAS, not a constant — re-measure with
             # probes/bi_fc2_bisect.py on a new model shape or GPU.
             '--data-pad-size-multiplier',
-            os.environ.get('SLIME_DATA_PAD_MULT', '512'),
+            str(self.cfg.data_pad_size_multiplier),
             # The client's declared seed, which decides the LoRA initializer.
             # Megatron's own default is 1234, so omitting this was reproducible
             # by accident while silently ignoring whatever the client asked for
@@ -239,22 +250,22 @@ class SlimeArgumentBuilder:
             '--seed', str((lora_config or {}).get('seed') or 1234),
             '--global-batch-size', str(global_batch_size),
             # RL algorithm
-            '--advantage-estimator', os.environ.get('SLIME_ADVANTAGE_ESTIMATOR', 'grpo'),
+            '--advantage-estimator', self.cfg.advantage_estimator,
             # Note: KL/TIS settings are added conditionally below based on RLVE mode
             # PPO clipping - asymmetric clip for importance ratios (matches Miles native)
-            '--eps-clip', os.environ.get('SLIME_EPS_CLIP', '0.2'),
-            '--eps-clip-high', os.environ.get('SLIME_EPS_CLIP_HIGH', '0.28'),
+            '--eps-clip', str(self.cfg.eps_clip),
+            '--eps-clip-high', str(self.cfg.eps_clip_high),
             # Entropy coefficient (0 = no entropy bonus, matches Miles native)
-            '--entropy-coef', os.environ.get('SLIME_ENTROPY_COEF', '0.00'),
+            '--entropy-coef', str(self.cfg.entropy_coef),
         ]
         # Per-request sampling seeds are honoured by SGLang only under
         # deterministic inference (a boot-time engine mode with a throughput cost).
-        if os.environ.get('SLIME_SGLANG_DETERMINISTIC', '0') == '1':
+        if self.cfg.sglang_deterministic:
             minimal_args += ['--sglang-enable-deterministic-inference']
         minimal_args += [
             # Weight decay - must be in minimal_args so Megatron's parse_args sees it
             # (Megatron defaults to 0.01; set to 0 for RL where weight decay fights policy updates)
-            '--weight-decay', os.environ.get('SLIME_WEIGHT_DECAY', '0.0'),
+            '--weight-decay', str(self.cfg.weight_decay),
             # Note: --normalize-advantages defaults to False, which is correct
             # (tinker-cookbook already centers advantages within groups)
             # Parallelism — actor-num-gpus-per-node must be set here so parse_args()
@@ -296,7 +307,7 @@ class SlimeArgumentBuilder:
             # These MUST be set here because parse_args() sets defaults based on them
             # Attribution-arm override (specs/013 stack-residual): SLIME_NO_OFFLOAD=1
             # drops both flags; default unchanged.
-            if os.environ.get('SLIME_NO_OFFLOAD') != '1':
+            if not self.cfg.no_offload:
                 minimal_args.extend([
                     '--colocate',
                     '--offload',  # Equivalent to --offload-train + --offload-rollout
@@ -314,10 +325,10 @@ class SlimeArgumentBuilder:
         #   that dominates pg_loss ~500:1 and causes training collapse.
         #   Enable via SLIME_USE_KL_LOSS=1 only when a real Megatron reference
         #   model is loaded.
-        if os.environ.get('SLIME_USE_KL_LOSS', '0') == '1':
+        if self.cfg.use_kl_loss:
             minimal_args.extend([
                 '--use-kl-loss',
-                '--kl-loss-coef', os.environ.get('SLIME_KL_LOSS_COEF', '0.1'),
+                '--kl-loss-coef', str(self.cfg.kl_loss_coef),
                 '--kl-loss-type', 'low_var_kl',
             ])
 
@@ -433,8 +444,8 @@ class SlimeArgumentBuilder:
         # fork defaults lora_A_init_method="xavier" (multi_lora_utils/
         # lora_utils getattr fallback); expose it so the init term measured on
         # the NeMo megatron path (0.076) can be tested on this stack.
-        if os.environ.get('SLIME_LORA_A_INIT'):
-            args.lora_A_init_method = os.environ['SLIME_LORA_A_INIT']
+        if self.cfg.lora_a_init:
+            args.lora_A_init_method = self.cfg.lora_a_init
         # Upstream only injects megatron-side LoRA adapters on the bridge path
         # (model.py: is_lora_enabled and megatron_to_hf_mode == "bridge");
         # without this the model silently builds as full-finetune and LoRA
@@ -482,7 +493,7 @@ class SlimeArgumentBuilder:
         args.adam_beta1 = 0.9
         args.adam_beta2 = 0.98
         args.adam_eps = 1e-8
-        wd = float(os.environ.get('SLIME_WEIGHT_DECAY', '0.0'))
+        wd = self.cfg.weight_decay
         args.weight_decay = wd
         args.start_weight_decay = wd
         args.end_weight_decay = wd
@@ -516,12 +527,8 @@ class SlimeArgumentBuilder:
         # client-declared max_seq_len (floor 8192): packed peak activation ==
         # the old mbs=1 worst case (one full-length sample), so no new OOM
         # surface; not the model's native context (specs/013 A5 lesson).
-        args.use_dynamic_batch_size = (
-            os.environ.get("SLIME_DYN_BATCH", "1") == "1"
-        )
-        args.max_tokens_per_gpu = int(
-            os.environ.get("SLIME_MAX_TOKENS_PER_GPU", str(max(8192, max_seq_len)))
-        )
+        args.use_dynamic_batch_size = self.cfg.dyn_batch
+        args.max_tokens_per_gpu = self.cfg.max_tokens_per_gpu or max(8192, max_seq_len)
 
         # Features
         args.colocate = multi_lora_slots == 0
@@ -586,7 +593,7 @@ class SlimeArgumentBuilder:
                 args.wandb_key = wandb_config.get("api_key")
             logger.info(f"Wandb logging enabled: project={args.wandb_project}")
         else:
-            enable_wandb = os.getenv("SLIME_ENABLE_WANDB", "0") == "1"
+            enable_wandb = self.cfg.enable_wandb
             if enable_wandb:
                 logger.warning(
                     "Slime WandB logging is ENABLED (via SLIME_ENABLE_WANDB env var). "

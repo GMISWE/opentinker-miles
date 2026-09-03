@@ -65,6 +65,11 @@ def _load_builder_module():
     _pkg("_tcbdp")
     _pkg("_tcbdp.core")
     _pkg("_tcbdp.utils")
+    _pkg("_tcbdp.backends")
+    _pkg("_tcbdp.backends.miles")
+    # slime_builder does `from ..backends.miles.config import MilesConfig`
+    _load("_tcbdp.backends.env_config", os.path.join(root, "backends", "env_config.py"))
+    _load("_tcbdp.backends.miles.config", os.path.join(root, "backends", "miles", "config.py"))
     _load("_tcbdp.utils.model_config", os.path.join(root, "utils", "model_config.py"))
     return _load("_tcbdp.core.slime_builder",
                  os.path.join(root, "core", "slime_builder.py"))
