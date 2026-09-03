@@ -1,9 +1,5 @@
 """
-Core business logic modules for the training API.
-
-This package contains managers and builders for training client lifecycle,
-async operations, and Slime argument construction.
+Backend-agnostic core: request validators, the loss registry, the async
+TaskManager and FastAPI dependencies. Backend-specific builders and
+converters live under training/backends/<backend>/.
 """
-from .slime_builder import SlimeArgumentBuilder
-
-__all__ = ["SlimeArgumentBuilder"]

@@ -1,8 +1,7 @@
 """
 Utility modules for the training API.
 
-This package provides utilities for authentication, model configuration,
-and common helper functions.
+Authentication, backend-agnostic model helpers, and common helpers.
 """
 from .auth import APIKeyAuth, verify_api_key
 from .helpers import (
@@ -18,9 +17,6 @@ from .model_config import (
     detect_num_gpus,
     load_model_config,
     estimate_model_params,
-    detect_torch_dist_path,
-    parse_checkpoint_uri,
-    compute_sglang_mem_fraction,
 )
 
 __all__ = [
@@ -39,7 +35,4 @@ __all__ = [
     "detect_num_gpus",
     "load_model_config",
     "estimate_model_params",
-    "detect_torch_dist_path",
-    "parse_checkpoint_uri",
-    "compute_sglang_mem_fraction",
 ]

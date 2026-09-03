@@ -2,13 +2,13 @@
 Miles data converter — wraps TinkerDataConverter behind the
 DataConverter ABC.
 
-The actual logic remains in training/core/data_converter.py. This module
+The Datum -> rollout_data logic lives in rollout_data.py. This module
 re-exports it through the backend interface.
 """
 from typing import Any, Dict, List
 
 from ..base import DataConverter
-from ...core.data_converter import TinkerDataConverter
+from .rollout_data import TinkerDataConverter
 
 
 def _zero_like(x: Any) -> Any:

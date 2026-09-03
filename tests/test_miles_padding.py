@@ -38,14 +38,13 @@ def _load_converter_module():
 
     _pkg("_tcp")
     _pkg("_tcp.backends")
-    _pkg("_tcp.core")
     _pkg("_tcp.backends.miles")
     base = types.ModuleType("_tcp.backends.base")
     base.DataConverter = object
     sys.modules["_tcp.backends.base"] = base
-    dc = types.ModuleType("_tcp.core.data_converter")
+    dc = types.ModuleType("_tcp.backends.miles.rollout_data")
     dc.TinkerDataConverter = object
-    sys.modules["_tcp.core.data_converter"] = dc
+    sys.modules["_tcp.backends.miles.rollout_data"] = dc
 
     path = os.path.join(root, "backends", "miles", "converter.py")
     spec = importlib.util.spec_from_file_location("_tcp.backends.miles.converter", path)

@@ -6,7 +6,7 @@ Handles both RL (PPO/GRPO) and SFT training modes.
 """
 import logging
 import torch
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +69,7 @@ class TinkerDataConverter:
         if input_ids is not None:
             return input_ids
 
-        raise ValueError(f"Unknown model_input format")
+        raise ValueError("Unknown model_input format")
 
     @staticmethod
     def extract_tensor_data(tensor_dict: Any) -> List[Any]:
@@ -215,7 +215,7 @@ class TinkerDataConverter:
         # Handle legacy HTTP test format: empty data or [{"input": "...", "target": "..."}]
         # This is for backward compatibility with test_4_multi_step_training.py
         if not data or len(data) == 0:
-            logger.warning(f"[CONVERTER] Empty data provided - cannot generate fake test data without args")
+            logger.warning("[CONVERTER] Empty data provided - cannot generate fake test data without args")
             # Return minimal rollout_data that will fail validation
             return {
                 "tokens": [],
