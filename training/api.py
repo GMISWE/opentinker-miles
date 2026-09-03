@@ -201,6 +201,7 @@ def create_app(config: Optional[TrainingConfig] = None) -> FastAPI:
             await _free_model(application, model_id, reason="shutdown")
         if ray.is_initialized():
             ray.shutdown()
+        application.state.futures_storage.close()
 
     @application.exception_handler(DuplicateSeqId)
     async def duplicate_seq_id_handler(request: Request, exc: DuplicateSeqId):

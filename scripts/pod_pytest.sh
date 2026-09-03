@@ -18,7 +18,7 @@ if [ $# -eq 0 ]; then
   set -- tests/protocol tests/test_ordering.py tests/test_backend_interface.py \
          tests/test_loss_registry.py tests/test_e0_registry.py tests/test_checkpoint_interchange.py \
          tests/test_validators.py tests/test_miles_rl_layout.py tests/test_optim_metrics_seam.py \
-         tests/test_miles_padding.py -q -p no:cacheprovider
+         tests/test_miles_padding.py tests/test_futures_storage.py -q -p no:cacheprovider
 fi
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REMOTE="/tmp/pytest-${USER:-u}"
