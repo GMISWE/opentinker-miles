@@ -50,6 +50,7 @@ class SGLangClient:
                 - temperature: float (default 1.0, matching the API schema default)
                 - top_p: float (default 0.9)
                 - max_tokens: int (default 256)
+                - top_k: int, stop: list[str], stop_token_ids: list[int], seed: int
             prompt_logprobs: Whether to return prompt log probabilities
 
         Returns:
@@ -66,13 +67,23 @@ class SGLangClient:
         """
         # Build request payload
         sampling_params = sampling_params or {}
+        sgl_params: Dict[str, Any] = {
+            "temperature": sampling_params.get("temperature", 1.0),
+            "top_p": sampling_params.get("top_p", 0.9),
+            "max_new_tokens": sampling_params.get("max_tokens", 256),
+        }
+        # Every documented Tinker sampling parameter is forwarded, none dropped.
+        if sampling_params.get("top_k") is not None and int(sampling_params["top_k"]) > 0:
+            sgl_params["top_k"] = int(sampling_params["top_k"])
+        if sampling_params.get("stop"):
+            sgl_params["stop"] = list(sampling_params["stop"])
+        if sampling_params.get("stop_token_ids"):
+            sgl_params["stop_token_ids"] = [int(t) for t in sampling_params["stop_token_ids"]]
+        if sampling_params.get("seed") is not None:
+            sgl_params["sampling_seed"] = int(sampling_params["seed"])
         payload = {
             "input_ids": input_ids,
-            "sampling_params": {
-                "temperature": sampling_params.get("temperature", 1.0),
-                "top_p": sampling_params.get("top_p", 0.9),
-                "max_new_tokens": sampling_params.get("max_tokens", 256),
-            },
+            "sampling_params": sgl_params,
             "return_logprob": True,
         }
 

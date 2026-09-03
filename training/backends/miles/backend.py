@@ -1437,10 +1437,14 @@ class MilesBackend(TrainingBackend):
 
         sequences = []
         prompt_logprobs_result = None
-        for _ in range(num_samples):
+        base_params = dict(sampling_params or {})
+        for i in range(num_samples):
+            params = dict(base_params)
+            if params.get("seed") is not None:
+                params["seed"] = int(params["seed"]) + i  # distinct stream per sample
             result = await client.generate(
                 input_ids=prompt_tokens,
-                sampling_params=sampling_params or {},
+                sampling_params=params,
                 prompt_logprobs=prompt_logprobs,
                 lora_path=lora_path,
             )
