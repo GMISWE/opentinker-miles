@@ -209,7 +209,9 @@ def create_app(config: Optional[TrainingConfig] = None) -> FastAPI:
         init_legacy_storage(config_obj.storage)
 
         # Initialize Ray
-        if not ray.is_initialized():
+        if not getattr(backend, "needs_ray", True):
+            logger.info("Backend %s does not use Ray; skipping ray.init", backend_type)
+        elif not ray.is_initialized():
             logger.info("Initializing Ray with address=%s", config_obj.ray.address)
             # ray.init installs a SIGTERM handler that sys.exit()s, pre-empting
             # uvicorn's graceful shutdown (and with it the model teardown above).

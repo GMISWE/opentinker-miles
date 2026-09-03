@@ -19,6 +19,7 @@ _BACKEND_CLASSES = {
     "verl": (".verl.backend", "VerlBackend"),
     "automodel": (".automodel.backend", "AutomodelBackend"),
     "megatron_bridge": (".megatron_bridge.backend", "MegatronBridgeBackend"),
+    "fake": (".fake.backend", "FakeBackend"),  # deterministic CPU backend for protocol tests
 }
 SUPPORTED_BACKENDS = tuple(_BACKEND_CLASSES)
 
