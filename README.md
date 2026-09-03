@@ -24,6 +24,9 @@ HF_TOKEN_FILE=~/.hf_token ./scripts/deploy_tinkercloud.sh --source git --target 
 ./scripts/deploy_tinkercloud.sh --source git --code-only
 ```
 
+The server itself is `python -m training [--backend miles|nemo_rl|...]` (or
+`uvicorn training.api:app`); the deploy script runs it behind a Ray head.
+
 Common knobs:
 
 | Var | Meaning |
@@ -72,13 +75,28 @@ Validated end-to-end against this server with each recipe's README hyperparamete
 
 ## Configuration
 
+Server-wide settings (`training/config.py`):
+
 | Variable | Purpose | Default |
 |---|---|---|
-| `TINKERCLOUD_BACKEND` | `miles` or `nemo_rl` | `miles` |
+| `TINKERCLOUD_BACKEND` | `miles`, `nemo_rl`, `verl`, `automodel`, `megatron_bridge`, `fake` (also `python -m training --backend B`) | `miles` |
+| `TINKERCLOUD_BACKEND_OVERRIDES` | JSON object of backend config fields, applied over the environment | unset |
 | `TRAINING_HOST` / `TRAINING_PORT` | Bind address | `0.0.0.0` / `8000` |
 | `TINKER_API_KEY` | API auth key | `tml-dev-key` |
-| `RAY_ADDRESS` | Ray cluster endpoint | auto (local head) |
-| `ALLOW_PARTIAL_BATCHES` | Pad batches smaller than DP size | `false` |
+| `RAY_ADDRESS` / `RAY_NAMESPACE` | Ray cluster endpoint / namespace | auto (local head) / `default` |
+| `METADATA_DIR` | Futures DB, sessions DB, checkpoint metadata | `/data/metadata` |
+| `TINKERCLOUD_CHECKPOINT_BASE` | Root the `tinker://` checkpoint URIs resolve under | `/data/checkpoints` |
+| `SESSION_TIMEOUT_S` / `SESSION_REAP_INTERVAL_S` | Expire silent sessions and free their models (`-1` disables) | `600` / `60` |
+| `ALLOW_PARTIAL_BATCHES` | Pad batches smaller than the DP size | `false` |
+| `KGATEWAY_LOG_LEVEL` / `KGATEWAY_ACCESS_LOG` | Log level / HTTP access log | `INFO` / `false` |
 | `HF_HOME` | HuggingFace model cache | `/data/models` |
 
+Per-backend knobs are declared fields with typed defaults in
+`training/backends/miles/config.py` (`SLIME_*`, `TINKERCLOUD_MILES_*`) and
+`training/backends/nemo_rl/config.py` (`NEMORL_*`, `NRL_*`); the server logs the
+effective values and their sources at startup.
 
+## Tests
+
+CPU-only suites run against the `fake` backend; see `tests/README.md`
+(`scripts/pod_pytest.sh` runs them on a cluster pod against your working tree).
