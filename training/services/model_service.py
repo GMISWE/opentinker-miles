@@ -99,7 +99,7 @@ class ModelService:
             "created_at": datetime.now().isoformat(),
             "checkpoint_path": checkpoint_path,
             "model_owner": "kgateway-user",
-            "is_lora": lora_config is not None,
+            "is_lora": bool(lora_config and lora_config.get("rank", 0) > 0),
             "lora_rank": lora_config.get("rank", 0) if lora_config else 0,
             "is_rlve": rlve_config is not None and rlve_config.get("enabled", False),
             "corrupted": False,
@@ -117,6 +117,7 @@ class ModelService:
             "training_run_id": training_run_id,
             "hf_path": hf_path,
             "base_model": base_model,
+            "lora_config": lora_config,
             "router_ip": getattr(handle, "router_ip", None),
             "router_port": getattr(handle, "router_port", None),
             "rlve_config": rlve_config,
@@ -199,23 +200,20 @@ class ModelService:
         client_info = training_clients[model_id]
         args = client_info.get("args")
 
+        # Backend-agnostic: the LoRA shape is what the client asked for at create time.
+        lora_rank = int((client_info.get("lora_config") or {}).get("rank") or 0)
+        is_lora = lora_rank > 0
         if args is not None:
             model_name = extract_model_name(args)
-            arch = detect_architecture(model_name)
-            is_lora = getattr(args, "lora_rank", 0) > 0
-            lora_rank = args.lora_rank if is_lora else None
         else:
-            # Non-Miles backend — use base_model from metadata
             model_name = client_info.get("base_model", "unknown")
-            arch = detect_architecture(model_name)
-            is_lora = False
-            lora_rank = None
+        arch = detect_architecture(model_name)
 
         return {
             "model_id": model_id,
             "model_data": {"arch": arch, "model_name": model_name},
             "is_lora": is_lora,
-            "lora_rank": lora_rank,
+            "lora_rank": lora_rank if is_lora else None,
             "model_name": model_name,
         }
 

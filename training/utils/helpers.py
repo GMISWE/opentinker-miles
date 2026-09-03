@@ -3,7 +3,6 @@ Helper utilities for the training API.
 
 This module provides common helper functions used across the training API.
 """
-import hashlib
 import logging
 import uuid
 from datetime import datetime
@@ -36,24 +35,6 @@ def generate_model_id(prefix: str = "model") -> str:
         Unique model ID in format: prefix_<hex16>
     """
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
-
-
-def generate_step_id(checkpoint_name: str, max_step: int = 100000) -> int:
-    """
-    Generate a consistent step ID from checkpoint name.
-
-    Uses MD5 hash to ensure the same checkpoint name always
-    maps to the same step ID, enabling deterministic checkpoint paths.
-
-    Args:
-        checkpoint_name: Name of the checkpoint
-        max_step: Maximum step value (modulo)
-
-    Returns:
-        Step ID (integer)
-    """
-    hash_digest = hashlib.md5(checkpoint_name.encode()).hexdigest()
-    return int(hash_digest[:8], 16) % max_step
 
 
 def format_timestamp(timestamp: Optional[datetime] = None) -> str:

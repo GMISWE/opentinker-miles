@@ -182,7 +182,7 @@ class BackendConfig(BaseModel):
 
     backend_type: str = Field(
         default_factory=lambda: os.getenv("TINKERCLOUD_BACKEND", "miles"),
-        description="Training backend: 'miles', 'nemo_rl', 'automodel', or 'megatron_bridge'"
+        description="Training backend; see training.backends.factory.SUPPORTED_BACKENDS"
     )
     backend_overrides: Dict[str, Any] = Field(
         default_factory=dict,
@@ -191,11 +191,11 @@ class BackendConfig(BaseModel):
 
     @validator("backend_type")
     def validate_backend_type(cls, v):
-        """Ensure backend type is supported."""
-        supported = ("miles", "nemo_rl", "automodel", "megatron_bridge")
-        if v not in supported:
+        """Ensure backend type is supported (single allow-list lives in the factory)."""
+        from .backends.factory import SUPPORTED_BACKENDS
+        if v not in SUPPORTED_BACKENDS:
             raise ValueError(
-                f"Unsupported backend: {v!r}. Supported: {', '.join(supported)}"
+                f"Unsupported backend: {v!r}. Supported: {', '.join(SUPPORTED_BACKENDS)}"
             )
         return v
 
@@ -263,6 +263,16 @@ class TrainingConfig(BaseModel):
     allow_partial_batches: bool = Field(
         default_factory=lambda: os.getenv("ALLOW_PARTIAL_BATCHES", "false").lower() == "true",
         description="Allow forward_backward batches that are not divisible by data-parallel size"
+    )
+    # The SDK heartbeats every 10 s; a session silent longer than the timeout
+    # is expired and its models are freed. -1 disables the reaper.
+    session_timeout_s: float = Field(
+        default_factory=lambda: float(os.getenv("SESSION_TIMEOUT_S", "600")),
+        description="Expire sessions with no heartbeat for this many seconds (-1 disables)"
+    )
+    session_reap_interval_s: float = Field(
+        default_factory=lambda: float(os.getenv("SESSION_REAP_INTERVAL_S", "60")),
+        description="How often the session reaper runs, in seconds"
     )
 
     @staticmethod

@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 
 import ray
 
-from ..base import BackendError, BackendHandle, TrainingBackend
+from ..base import BackendError, BackendHandle, TrainingBackend, UnsupportedFeatureError
 from ..checkpoint_interchange import (
     CHECKPOINT_BASE,
     export_hf_adapter,
@@ -1151,8 +1151,11 @@ class MilesBackend(TrainingBackend):
         async def _run() -> str:
             offload_train = h.args.offload_train if h.args else False
             if offload_train:
-                logger.info("Skipping save_model (offload_train=True)")
-                return checkpoint_path
+                # Never return a path nothing was written to.
+                raise UnsupportedFeatureError(
+                    "save_checkpoint with offload_train", backend="miles",
+                    suggestion="boot the actor group without --offload-train",
+                )
 
             # Pool mode: save_due_adapter_checkpoints only writes adapters with
             # registry step > 0 at a save-interval multiple (interval is 1 at

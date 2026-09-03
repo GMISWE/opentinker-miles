@@ -14,6 +14,7 @@ Tests are organized by dependency level:
 """
 import asyncio
 import importlib.util
+import inspect
 import logging
 import pytest
 
@@ -23,7 +24,7 @@ from tinkercloud.training.backends.base import (
     TrainingBackend,
     UnsupportedFeatureError,
 )
-from tinkercloud.training.backends.factory import BackendFactory
+from tinkercloud.training.backends.factory import BackendFactory, SUPPORTED_BACKENDS
 
 # Guard for NeMo RL availability
 HAS_NEMO_RL = importlib.util.find_spec("nemo_rl") is not None
@@ -141,6 +142,41 @@ class TestTrainingBackendABC:
             assert hasattr(TrainingBackend, method_name), (
                 f"TrainingBackend missing required method: {method_name}"
             )
+
+
+class TestBackendSignatureContract:
+    """Every registered backend must accept what the services pass to the ABC methods."""
+
+    _VARIADIC = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+
+    @pytest.mark.parametrize("backend_type", SUPPORTED_BACKENDS)
+    def test_signatures_compatible_with_abc(self, backend_type):
+        try:
+            cls = BackendFactory.backend_class(backend_type)
+        except ImportError as e:
+            pytest.skip(f"{backend_type} runtime not installed: {e}")
+        assert issubclass(cls, TrainingBackend)
+        for name in sorted(TrainingBackend.__abstractmethods__):
+            abc_sig = inspect.signature(getattr(TrainingBackend, name))
+            impl_sig = inspect.signature(getattr(cls, name))
+            impl_params = impl_sig.parameters
+            impl_variadic = any(p.kind in self._VARIADIC for p in impl_params.values())
+            for p in abc_sig.parameters.values():
+                if p.kind in self._VARIADIC:
+                    continue
+                assert p.name in impl_params or impl_variadic, (
+                    f"{cls.__name__}.{name} lacks parameter {p.name!r} declared by TrainingBackend"
+                )
+            for q in impl_params.values():
+                if q.name in abc_sig.parameters or q.kind in self._VARIADIC:
+                    continue
+                assert q.default is not inspect.Parameter.empty, (
+                    f"{cls.__name__}.{name} adds required parameter {q.name!r} absent from TrainingBackend"
+                )
+
+    def test_unknown_backend_class_raises(self):
+        with pytest.raises(ValueError):
+            BackendFactory.backend_class("nope")
 
 
 class TestSamplingContract:
@@ -363,19 +399,21 @@ class TestNemoRLBackendBuffering:
             )
         assert len(handle.data_buffer) == 3
 
-    def test_forward_backward_empty_data_raises(self, backend, handle):
-        """forward_backward() with empty data should raise BackendError."""
-        with pytest.raises(BackendError, match="Empty data"):
-            asyncio.run(
-                backend.forward_backward(handle, [], "importance_sampling")
-            )
+    def test_forward_backward_empty_data_is_noop(self, backend, handle):
+        """Empty data (GRPO all-zero advantages) is a deferred no-op, not an error."""
+        result = asyncio.run(backend.forward_backward(handle, [], "importance_sampling"))
+        assert result == {
+            "loss_fn_output_type": "importance_sampling",
+            "metrics": {}, "deferred": True, "loss_fn_outputs": [],
+        }
+        assert len(handle.data_buffer) == 0
 
-    def test_apply_optimizer_step_empty_buffer_raises(self, backend, handle):
-        """apply_optimizer_step() with empty buffer should raise BackendError."""
-        with pytest.raises(BackendError, match="No buffered data"):
-            asyncio.run(
-                backend.apply_optimizer_step(handle)
-            )
+    def test_apply_optimizer_step_empty_buffer_is_noop(self, backend, handle):
+        """An empty buffer steps nothing and reports success with grad_norm 0."""
+        result = asyncio.run(backend.apply_optimizer_step(handle))
+        assert result["success"] is True
+        assert result["grad_norm"] == 0.0
+        assert result["loss_fn_outputs"] == []
 
     def test_buffer_overflow_raises(self, backend, handle):
         """forward_backward() should raise when buffer exceeds max_buffer_size (CHK006)."""
@@ -410,7 +448,10 @@ class TestNemoRLBackendBuffering:
         result = asyncio.run(
             backend.forward_backward(handle, data, "importance_sampling")
         )
-        assert result == {"metrics": {}, "deferred": True, "loss_fn_outputs": []}
+        assert result == {
+            "loss_fn_output_type": "importance_sampling",
+            "metrics": {}, "deferred": True, "loss_fn_outputs": [],
+        }
 
     def test_concurrent_forward_backward_thread_safe(self, backend, handle):
         """Concurrent forward_backward() calls should be serialized by lock (CHK018)."""

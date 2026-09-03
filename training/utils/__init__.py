@@ -8,7 +8,6 @@ from .auth import APIKeyAuth, verify_api_key
 from .helpers import (
     generate_request_id,
     generate_model_id,
-    generate_step_id,
     format_timestamp,
     extract_error_message,
     validate_batch_data,
@@ -32,7 +31,6 @@ __all__ = [
     # Helpers
     "generate_request_id",
     "generate_model_id",
-    "generate_step_id",
     "format_timestamp",
     "extract_error_message",
     "validate_batch_data",

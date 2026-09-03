@@ -12,6 +12,7 @@ This file contains only initialization and routing configuration.
 import asyncio
 import logging
 import os
+import signal
 import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Set
@@ -193,12 +194,26 @@ def create_app(config: Optional[TrainingConfig] = None) -> FastAPI:
 
         logger.info("✅ Dependency providers registered on app state")
 
+        # Session reaper: a session silent longer than session_timeout_s is
+        # expired and its models freed (the SDK heartbeats every 10 s).
+        application.state.session_reaper = None
+        if config_obj.session_timeout_s >= 0:
+            application.state.session_reaper = asyncio.create_task(
+                _reap_sessions_forever(application, config_obj.session_timeout_s,
+                                       config_obj.session_reap_interval_s)
+            )
+            logger.info("Session reaper enabled: timeout=%ss interval=%ss",
+                        config_obj.session_timeout_s, config_obj.session_reap_interval_s)
+
         # Initialize legacy storage for backward compatibility
         init_legacy_storage(config_obj.storage)
 
         # Initialize Ray
         if not ray.is_initialized():
             logger.info("Initializing Ray with address=%s", config_obj.ray.address)
+            # ray.init installs a SIGTERM handler that sys.exit()s, pre-empting
+            # uvicorn's graceful shutdown (and with it the model teardown above).
+            prev_sigterm = signal.getsignal(signal.SIGTERM)
             try:
                 ray.init(
                     address=config_obj.ray.address,
@@ -209,19 +224,80 @@ def create_app(config: Optional[TrainingConfig] = None) -> FastAPI:
             except Exception as e:  # pylint: disable=broad-except
                 logger.error("Failed to initialize Ray: %s", e)
                 # Continue anyway - Ray might be available later
+            finally:
+                if signal.getsignal(signal.SIGTERM) is not prev_sigterm:
+                    signal.signal(signal.SIGTERM, prev_sigterm)
 
     @application.on_event("shutdown")
     async def shutdown_event():
-        """Clean up resources on shutdown"""
+        """Free every live model (actors, placement groups) before the process exits."""
+        reaper = getattr(application.state, "session_reaper", None)
+        if reaper is not None:
+            reaper.cancel()
         runtime: TrainingRuntimeState = application.state.runtime
-        for model_id, client_info in list(runtime.training_clients.items()):
-            try:
-                logger.info("Cleaning up training client %s", model_id)
-                # Cleanup logic here
-            except Exception as e:  # pylint: disable=broad-except
-                logger.error("Error cleaning up %s: %s", model_id, e)
+        for model_id in list(runtime.training_clients):
+            await _free_model(application, model_id, reason="shutdown")
+        if ray.is_initialized():
+            ray.shutdown()
+
+    @application.exception_handler(HTTPException)
+    async def http_exception_handler(request: Request, exc: HTTPException):
+        """Handle HTTP exceptions with structured responses"""
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "error": exc.detail,
+                "status_code": exc.status_code,
+                "path": str(request.url.path)
+            }
+        )
+
+    @application.exception_handler(Exception)
+    async def general_exception_handler(request: Request, exc: Exception):
+        """Handle unexpected exceptions"""
+        logger.error(f"Unexpected error: {exc}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Internal server error",
+                "detail": str(exc) if os.getenv("DEBUG") else None
+            }
+        )
 
     return application
+
+
+async def _free_model(application: FastAPI, model_id: str, reason: str) -> None:
+    """Release one model's backend resources and its session link; never raises."""
+    runtime: TrainingRuntimeState = application.state.runtime
+    try:
+        logger.info("Freeing model %s (%s)", model_id, reason)
+        await application.state.model_service.delete_model(
+            model_id=model_id,
+            training_clients=runtime.training_clients,
+            metadata_storage=application.state.metadata_storage,
+        )
+    except Exception:  # pylint: disable=broad-except
+        logger.exception("Failed to free model %s (%s)", model_id, reason)
+    try:
+        application.state.session_service.remove_model(model_id)
+    except Exception:  # pylint: disable=broad-except
+        logger.exception("Failed to unlink model %s from its session", model_id)
+
+
+async def _reap_sessions_forever(application: FastAPI, timeout_s: float, interval_s: float) -> None:
+    session_service = application.state.session_service
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            for session_id, model_ids in session_service.reap_stale_sessions(timeout_s):
+                logger.warning("Session %s silent > %ss: expired, freeing %d model(s)",
+                               session_id, timeout_s, len(model_ids))
+                for model_id in model_ids:
+                    if model_id in application.state.runtime.training_clients:
+                        await _free_model(application, model_id, reason=f"session {session_id} expired")
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("Session reaper tick failed")
 
 
 app = create_app()
@@ -231,42 +307,15 @@ async def health():
     """Legacy health check function"""
     return {"status": "healthy"}
 
-# ============================================================================
-# ERROR HANDLERS
-# ============================================================================
-
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    """Handle HTTP exceptions with structured responses"""
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "error": exc.detail,
-            "status_code": exc.status_code,
-            "path": str(request.url.path)
-        }
-    )
-
-@app.exception_handler(Exception)
-async def general_exception_handler(request: Request, exc: Exception):
-    """Handle unexpected exceptions"""
-    logger.error(f"Unexpected error: {exc}", exc_info=True)
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error": "Internal server error",
-            "detail": str(exc) if os.getenv("DEBUG") else None
-        }
-    )
-
 if __name__ == "__main__":
     import argparse
     import uvicorn
 
     parser = argparse.ArgumentParser(description="TinkerCloud Training API")
+    from .backends.factory import SUPPORTED_BACKENDS
     parser.add_argument(
         "--backend",
-        choices=["miles", "nemo_rl"],
+        choices=list(SUPPORTED_BACKENDS),
         default=None,
         help="Training backend (default: miles). Also settable via TINKERCLOUD_BACKEND env var.",
     )

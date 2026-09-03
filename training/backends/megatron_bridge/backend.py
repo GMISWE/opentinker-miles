@@ -144,7 +144,13 @@ class MegatronBridgeBackend(TrainingBackend):
         batch = self.converter.forward_backward_to_backend(data, loss_fn, {"seq_length": h.seq_length})
         return await _get(h.worker.forward_backward.remote(batch))
 
-    async def apply_optimizer_step(self, handle: BackendHandle, learning_rate: Optional[float] = None) -> Dict[str, Any]:
+    async def apply_optimizer_step(
+        self,
+        handle: BackendHandle,
+        learning_rate: Optional[float] = None,
+        adam_params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        # adam_params accepted for contract uniformity; betas/eps are fixed at creation.
         h: MegatronBridgeHandle = handle  # type: ignore[assignment]
         return await _get(h.worker.apply_optimizer_step.remote(learning_rate))
 
@@ -155,7 +161,8 @@ class MegatronBridgeBackend(TrainingBackend):
 
     async def sample(self, handle: BackendHandle, request_id: str, prompt_tokens: List[int],
                      num_samples: int, sampling_params: Optional[Dict[str, Any]] = None,
-                     prompt_logprobs: bool = False) -> Dict[str, Any]:
+                     prompt_logprobs: bool = False,
+                     pinned_version: Optional[int] = None) -> Dict[str, Any]:
         raise _no_generation("sample")
 
     async def get_logprobs(self, handle: BackendHandle, data: List[Dict]) -> List[Any]:

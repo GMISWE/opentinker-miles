@@ -18,6 +18,7 @@ from ..models.requests import ForwardRequest, ForwardBackwardRequest, OptimStepR
 from ..models.responses import AsyncOperationResponse
 from ..services.training_service import TrainingService
 from ..core.task_manager import TaskManager
+from ..core.dependencies import verify_api_key_dep
 from ..storage import FuturesStorage
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,7 @@ def get_task_manager(
 @router.post("/api/v1/forward", response_model=AsyncOperationResponse)
 async def forward(
     request: ForwardRequest,
+    _: None = Depends(verify_api_key_dep),
     http_request: Request = None,
     service: TrainingService = Depends(get_training_service),
     task_manager: TaskManager = Depends(get_task_manager),
@@ -125,6 +127,7 @@ async def forward(
 @router.post("/api/v1/forward_backward", response_model=AsyncOperationResponse)
 async def forward_backward(
     request: ForwardBackwardRequest,
+    _: None = Depends(verify_api_key_dep),
     http_request: Request = None,
     service: TrainingService = Depends(get_training_service),
     task_manager: TaskManager = Depends(get_task_manager),
@@ -175,6 +178,7 @@ async def forward_backward(
 @router.post("/api/v1/optim_step", response_model=AsyncOperationResponse)
 async def optim_step(
     request: OptimStepRequest,
+    _: None = Depends(verify_api_key_dep),
     http_request: Request = None,
     service: TrainingService = Depends(get_training_service),
     task_manager: TaskManager = Depends(get_task_manager),
