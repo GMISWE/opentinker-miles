@@ -70,6 +70,7 @@ class VerlHandle(BackendHandle):
 
 
 class VerlBackend(TrainingBackend):
+    SUPPORTED_LOSS_FNS = frozenset({"cross_entropy", "importance_sampling", "ppo"})  # losses.LOSS_FNS
     """veRL backend using upstream TinkerTrainingWorker split primitives."""
 
     def __init__(self, overrides: Optional[Dict[str, Any]] = None):
@@ -187,6 +188,7 @@ class VerlBackend(TrainingBackend):
         handle: BackendHandle,
         data: List[Dict],
         loss_fn: str,
+        loss_fn_config: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         h: VerlHandle = handle  # type: ignore[assignment]
         async with h._lock:
@@ -254,6 +256,7 @@ class VerlBackend(TrainingBackend):
         handle: BackendHandle,
         data: List[Dict],
         loss_fn: str,
+        loss_fn_config: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         logprobs = await self.get_logprobs(handle, data)
         return {"loss_fn_output_type": loss_fn, "loss_fn_outputs": logprobs, "metrics": {}}

@@ -19,6 +19,7 @@ from ..models.responses import AsyncOperationResponse
 from ..services.training_service import TrainingService
 from ..core.task_manager import TaskManager
 from ..core.dependencies import verify_api_key_dep
+from ..core import loss_registry
 from ..storage import FuturesStorage
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,14 @@ def get_task_manager(
     return TaskManager(futures_storage)
 
 
+def _validate_loss(loss_fn: str, loss_fn_config) -> None:
+    """Unknown loss names / keys are a client error, not a silent default."""
+    try:
+        loss_registry.validate(loss_fn, loss_fn_config)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.post("/api/v1/forward", response_model=AsyncOperationResponse)
 async def forward(
     request: ForwardRequest,
@@ -99,6 +108,7 @@ async def forward(
 
     # Get client info
     client_info = training_clients[request.model_id]
+    _validate_loss(request.forward_input.loss_fn, request.forward_input.loss_fn_config)
 
     # Business logic wrapped in async task
     async def execute_forward():
@@ -107,6 +117,7 @@ async def forward(
             data=request.forward_input.data,
             loss_fn=request.forward_input.loss_fn,
             client_info=client_info,
+            loss_fn_config=request.forward_input.loss_fn_config,
         )
 
     # Create background task with automatic error handling
@@ -150,6 +161,7 @@ async def forward_backward(
 
     # Get client info
     client_info = training_clients[request.model_id]
+    _validate_loss(request.forward_backward_input.loss_fn, request.forward_backward_input.loss_fn_config)
 
     # Business logic wrapped in async task
     async def execute_forward_backward():
@@ -158,6 +170,7 @@ async def forward_backward(
             data=request.forward_backward_input.data,
             loss_fn=request.forward_backward_input.loss_fn,
             client_info=client_info,
+            loss_fn_config=request.forward_backward_input.loss_fn_config,
         )
 
     # Create background task

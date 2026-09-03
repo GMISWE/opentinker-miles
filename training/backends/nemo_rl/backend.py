@@ -19,6 +19,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ..base import BackendError, BackendHandle, TrainingBackend
+from ...core.loss_registry import clip_thresholds
 from ..checkpoint_interchange import (
     export_hf_adapter,
     resolve_checkpoint_root,
@@ -58,6 +59,7 @@ class NemoRLHandle(BackendHandle):
     training_run_id: str = ""
     debug_train_only: bool = False
     loss_fn_name: str = ""               # String name from last forward_backward()
+    loss_fn_config: Optional[Dict[str, float]] = None  # per-call hyperparameters of the buffered batch
     generation_state: str = "generation_ready"  # "generation_ready" | "training_ready"
     _generation_state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _training_lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # Serialize optim_step GPU lifecycle
@@ -73,6 +75,8 @@ class NemoRLHandle(BackendHandle):
 
 
 class NemoRLBackend(TrainingBackend):
+    # TinkerSumCELoss / ClippedPGLossFn; cispo and dro have no NeMo RL loss.
+    SUPPORTED_LOSS_FNS = frozenset({"cross_entropy", "importance_sampling", "ppo"})
     """
     NeMo RL backend — uses Policy.train() push-mode API.
 
@@ -221,6 +225,7 @@ class NemoRLBackend(TrainingBackend):
         handle: BackendHandle,
         data: List[Dict],
         loss_fn: str,
+        loss_fn_config: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         """Forward-only pass — compute logprobs without gradients.
 
@@ -272,6 +277,7 @@ class NemoRLBackend(TrainingBackend):
         handle: BackendHandle,
         data: List[Dict],
         loss_fn: str,
+        loss_fn_config: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         """
         Buffer incoming data per R9 strategy. NO GPU training work yet.
@@ -338,10 +344,19 @@ class NemoRLBackend(TrainingBackend):
                             operation="forward_backward",
                         )
 
+                # One loss configuration per optimizer step: the buffer trains as
+                # a single policy.train() call, so a differing config cannot be honoured.
+                if h.data_buffer and (h.loss_fn_name, h.loss_fn_config or {}) != (loss_fn, loss_fn_config or {}):
+                    raise BackendError(
+                        f"loss mismatch within one optimizer step: buffered "
+                        f"{h.loss_fn_name!r} {h.loss_fn_config or {}}, new {loss_fn!r} {loss_fn_config or {}}",
+                        backend="nemo_rl", operation="forward_backward",
+                    )
                 h.data_buffer.append(batched_data)
                 buffer_len = len(h.data_buffer)
-                # Store loss_fn name for apply_optimizer_step() response
+                # Store loss_fn name + config for apply_optimizer_step()
                 h.loss_fn_name = loss_fn
+                h.loss_fn_config = dict(loss_fn_config) if loss_fn_config else None
 
             logger.info(
                 "Buffered microbatch %d for model %s (%d samples)",
@@ -447,6 +462,10 @@ class NemoRLBackend(TrainingBackend):
                 buffered_batches = h.data_buffer
                 h.data_buffer = []
                 num_buffered = len(buffered_batches)
+                # The config that governed this buffer; a pipelined fb(N+1) may
+                # overwrite h.loss_fn_config before we reach policy.train().
+                step_loss_config = h.loss_fn_config
+                h.loss_fn_config = None
 
             # Concatenate outside the lock (CPU-bound, no contention needed)
             phases: Dict[str, float] = {}  # Q3-R2 per-step cost decomposition
@@ -565,6 +584,16 @@ class NemoRLBackend(TrainingBackend):
                         # importable in the shared venv on server + workers).
                         from .losses import TinkerSumCELoss
                         active_loss_fn = TinkerSumCELoss()
+                    elif h.loss_fn_name == "ppo" and step_loss_config:
+                        # Per-call clip range: rebuild the clipped-PG loss from the
+                        # create-time config with the client's thresholds.
+                        from nemo_rl.algorithms.loss_functions import ClippedPGLossFn
+                        low, high = clip_thresholds(step_loss_config)
+                        active_loss_fn = ClippedPGLossFn({
+                            **h.config["loss_fn"],
+                            "ratio_clip_min": 1.0 - low,
+                            "ratio_clip_max": high - 1.0,
+                        })
                     else:
                         active_loss_fn = h.loss_fn  # ClippedPGLossFn (RL)
 
@@ -657,12 +686,18 @@ class NemoRLBackend(TrainingBackend):
                 {k: round(v, 3) for k, v in phases.items()},
             )
 
+            metrics = dict(result.get("metrics", {}))
+            if h.loss_fn_name == "ppo":
+                low, high = clip_thresholds(step_loss_config)
+                metrics["clip_low_threshold"] = low
+                metrics["clip_high_threshold"] = high
+
             return {
                 "success": True,
                 "grad_norm": result.get("grad_norm", 0.0),
                 "learning_rates": [],
                 "model_id": h.model_id,
-                "metrics": result.get("metrics", {}),
+                "metrics": metrics,
                 "loss_fn_outputs": loss_fn_outputs,
                 # A4 ver(S): post-step version state for driver-side accounting
                 "weight_version": h.weight_version,

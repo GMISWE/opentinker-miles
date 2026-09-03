@@ -7,7 +7,7 @@ must satisfy.
 """
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, FrozenSet, List, Optional
 
 
 class BackendError(Exception):
@@ -47,6 +47,9 @@ class TrainingBackend(ABC):
 
     # False for in-process backends (no Ray actors); the server then skips ray.init.
     needs_ray: bool = True
+    # Loss names (core.loss_registry) this backend can train; TrainingService
+    # rejects others with UnsupportedFeatureError before any GPU work.
+    SUPPORTED_LOSS_FNS: FrozenSet[str] = frozenset()
 
     @abstractmethod
     async def create_model(
@@ -93,6 +96,7 @@ class TrainingBackend(ABC):
         handle: BackendHandle,
         data: List[Dict],
         loss_fn: str,
+        loss_fn_config: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         """
         Forward-only pass (no gradient computation).
@@ -108,9 +112,14 @@ class TrainingBackend(ABC):
         handle: BackendHandle,
         data: List[Dict],
         loss_fn: str,
+        loss_fn_config: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         """
         Accumulate gradients for the given data.
+
+        `loss_fn_config` carries the per-call hyperparameters validated by
+        core.loss_registry (e.g. PPO clip thresholds); a backend that cannot
+        honour a given value must raise UnsupportedFeatureError, never ignore it.
 
         Multiple forward_backward calls accumulate gradients before
         a single apply_optimizer_step call.
