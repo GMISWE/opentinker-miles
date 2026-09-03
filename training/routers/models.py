@@ -243,11 +243,12 @@ async def unload_model(
         return UnloadModelResponse(model_id=model_id).dict()
 
     # Create async task
-    task_manager.create_task(
+    request_id = task_manager.create_task(
         request_id=request_id,
         operation="unload_model",
         model_id=model_id,
         payload=request.dict(),
+        seq_id=request.seq_id,
         task_func=execute
     )
 

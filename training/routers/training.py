@@ -121,11 +121,12 @@ async def forward(
         )
 
     # Create background task with automatic error handling
-    task_manager.create_task(
+    request_id = task_manager.create_task(
         request_id=request_id,
         operation="forward",
         model_id=request.model_id,
         payload=request.dict(),
+        seq_id=request.seq_id,
         task_func=execute_forward
     )
 
@@ -174,11 +175,12 @@ async def forward_backward(
         )
 
     # Create background task
-    task_manager.create_task(
+    request_id = task_manager.create_task(
         request_id=request_id,
         operation="forward_backward",
         model_id=request.model_id,
         payload=request.dict(),
+        seq_id=request.seq_id,
         task_func=execute_forward_backward
     )
 
@@ -224,11 +226,12 @@ async def optim_step(
         )
 
     # Create background task
-    task_manager.create_task(
+    request_id = task_manager.create_task(
         request_id=request_id,
         operation="optim_step",
         model_id=request.model_id,
         payload=request.dict(),
+        seq_id=request.seq_id,
         task_func=execute_optim_step
     )
 

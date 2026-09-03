@@ -912,8 +912,9 @@ class NemoRLBackend(TrainingBackend):
         )
         # ver(S) monitor (A4): certify the version actually served against the
         # declared bound, and stamp it into the response. Versions are read
-        # post-serve; a concurrent optim_step could bump weight_version between
-        # flush and here, but ops on one model are FIFO-serialized upstream.
+        # post-serve; sampling is not part of the model's ordered training
+        # program (services.ordering), so a concurrent optim_step can bump
+        # weight_version between flush and here — the stamp is best-effort.
         served_v = h.generation_synced_version
         latest_v = h.weight_version
         if latest_v - served_v > h.staleness_k:

@@ -16,6 +16,7 @@ import asyncio
 import logging
 from typing import Callable, Dict, Any, Optional, Awaitable
 from ..storage import FuturesStorage
+from ..services import ordering
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +64,9 @@ class TaskManager:
         operation: str,
         model_id: str,
         payload: Dict[str, Any],
-        task_func: Callable[[], Awaitable[Dict[str, Any]]]
-    ) -> None:
+        task_func: Callable[[], Awaitable[Dict[str, Any]]],
+        seq_id: Optional[int] = None,
+    ) -> str:
         """
         Create and track a background async task with automatic error handling.
 
@@ -95,21 +97,28 @@ class TaskManager:
                 task_func=do_training
             )
         """
-        # Save future with pending status
-        self.futures_storage.save_future(
+        # Save future with pending status; a retried seq_id returns the earlier request
+        owner = self.futures_storage.save_future(
             request_id=request_id,
             operation=operation,
             payload=payload,
-            model_id=model_id
+            model_id=model_id,
+            seq_id=seq_id,
         )
+        if owner != request_id:
+            return owner
+        kind = ordering.KINDS.get(operation)
 
         async def wrapped_task():
             """Wrapper that handles success/failure and storage updates"""
             try:
                 logger.info(f"[{request_id}] Starting {operation} for {model_id}")
 
-                # Execute the actual business logic
-                result = await task_func()
+                # Execute the actual business logic, in the model's program order
+                if kind is not None:
+                    result = await ordering.queues.run(model_id, kind, task_func)
+                else:
+                    result = await task_func()
 
                 # Update storage with success
                 self.futures_storage.update_status(
@@ -144,6 +153,7 @@ class TaskManager:
 
         # Prevent garbage collection
         task.add_done_callback(lambda t: None)
+        return request_id
 
     def get_task(self, request_id: str) -> Optional[asyncio.Task]:
         """
