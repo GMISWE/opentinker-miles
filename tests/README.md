@@ -89,43 +89,6 @@ python tests/test_dpo.py --test reduced
 python tests/test_dpo.py --test all
 ```
 
-### RLVE Tests
-
-**Shell script (quick, Tinker-only):**
-```bash
-# Run 1 batch (default)
-./tests/test_rlve_reduced.sh
-
-# Run specific number of batches
-./tests/test_rlve_reduced.sh 3
-```
-
-**Python (pytest compatible):**
-```bash
-# Run all RLVE tests
-PYTHONPATH=/root/gavin/miles:/root/gavin/tinker-cookbook pytest tests/test_rlve.py -v
-
-# Run specific test
-pytest tests/test_rlve.py::test_rlve_reduced -v
-
-# Run directly
-python tests/test_rlve.py --test reduced
-python tests/test_rlve.py --test all
-```
-
-**Full comparison (both paths, ~15 min):**
-```bash
-# Runs Tinker RLVE, then Native Miles RLVE, compares advantages
-./tests/test_rlve_both_paths.sh
-```
-
-**Note:** For DEBUG_ADVANTAGES to work, start server with:
-```bash
-DEBUG_ADVANTAGES=1 ALLOW_PARTIAL_BATCHES=true \
-PYTHONPATH=/root/gavin/tinkercloud:/root/Megatron-LM:/root/miles:$PYTHONPATH \
-python -m uvicorn training.api:app --host 0.0.0.0 --port 8000
-```
-
 ### Other Tests
 
 ```bash
@@ -134,9 +97,6 @@ pytest tests/test_health.py -v
 
 # Model creation
 pytest tests/test_model_creation.py -v
-
-# Full HTTP API test
-pytest tests/test_gmi_http.py -v
 
 # RLVE advantage alignment unit test (mock rewards)
 PYTHONPATH=/root/gavin/miles:/root/gavin/tinker-cookbook pytest tests/test_advantage_alignment.py -v
@@ -160,14 +120,12 @@ PYTHONPATH=/root/gavin/miles:/root/gavin/tinker-cookbook pytest tests/test_advan
 | `test_loss_registry.py` | `loss_fn` / `loss_fn_config` validation |
 | `test_checkpoint_interchange.py` | Checkpoint URI <-> root resolution |
 | `cleanup_test_env.py` | Cleanup script to free GPUs before tests |
+| `test_e2e_nemo_rl.sh` | Bash smoke test of the seven core operations against a live server |
+| `test_classification_backend_harness.py` | Classification backends (004) harness, GPU-free |
+| `test_gates_*.py` | Verdict/ordering/seed contracts of the gate suite (`gates/`, specs/014) |
 | `test_dpo.py` | DPO training integration tests |
 | `test_dpo_reduced.sh` | Shell script for quick DPO test |
 | `test_health.py` | Server health check tests |
 | `test_model_creation.py` | Model loading tests |
-| `test_gmi_http.py` | Full HTTP API tests |
 | `test_advantage_computation.py` | Advantage calculation unit tests (group centering) |
-| `test_advantage_alignment.py` | RLVE advantage path alignment unit test (mock rewards) |
-| `test_rlve.py` | RLVE training integration tests (Tinker path) |
-| `test_rlve_reduced.sh` | Shell script for quick RLVE test (Tinker-only) |
-| `test_rlve_both_paths.sh` | Full RLVE comparison (Tinker + Native Miles) |
-| `test_kgateway_training.py` | Training flow tests |
+| `test_advantage_alignment.py` | Advantage path alignment unit test (mock rewards) |
