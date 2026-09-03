@@ -45,6 +45,9 @@ class TrainingBackend(ABC):
     translate to Miles or NeMo RL native APIs.
     """
 
+    # False for in-process backends (no Ray actors); the server then skips ray.init.
+    needs_ray: bool = True
+
     @abstractmethod
     async def create_model(
         self,

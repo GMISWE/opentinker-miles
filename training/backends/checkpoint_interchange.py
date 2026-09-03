@@ -19,7 +19,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-CHECKPOINT_BASE = "/data/checkpoints"
+CHECKPOINT_BASE = os.getenv("TINKERCLOUD_CHECKPOINT_BASE", "/data/checkpoints")
 HF_ADAPTER_DIRNAME = "hf_adapter"
 ADAPTER_WEIGHTS_FILE = "adapter_model.safetensors"
 ADAPTER_WEIGHTS_TORCH_FILE = "adapter_model.bin"
