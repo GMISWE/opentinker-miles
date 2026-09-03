@@ -126,10 +126,17 @@ class TinkerDataConverter:
             # Miles convention: the mask covers the response REGION, so
             # response_length is the mask's length (zeros inside are allowed);
             # counting nonzeros breaks prompt/response alignment in get_batch.
-            # Causal N-1 trim: response == total yields an empty logit slice
-            # (same handling as the forward_backward RL path).
-            if len(loss_mask) == len(tokens) and len(tokens) > 1:
-                loss_mask = loss_mask[1:]
+            # Same layout as the forward_backward RL path: append the final
+            # target so the response is the T wire targets and the returned
+            # logprobs are T-long, entry k = logprob of target k.
+            target = cls._get_field(loss_fn_inputs, "target_tokens")
+            if target is None:
+                target = cls._get_field(loss_fn_inputs, "target")
+            target_data = cls.extract_tensor_data(target) if target is not None else None
+            if target_data and len(loss_mask) == len(tokens) and len(tokens) > 0:
+                tokens_list[-1] = torch.cat([tokens_list[-1], torch.tensor(target_data[-1:], dtype=torch.long)])
+            elif len(loss_mask) == len(tokens) and len(tokens) > 1:
+                loss_mask = loss_mask[:-1]  # no target on the wire: the last target is unknowable
             loss_masks_list.append(loss_mask)
             response_lengths_list.append(len(loss_mask))
             # print(f"[CONVERTER DEBUG SFT] Sample {len(loss_masks_list)-1}: loss_mask sum={response_length}, len={len(loss_mask)}", flush=True)
@@ -243,7 +250,13 @@ class TinkerDataConverter:
                 # Step 1: Extract raw data from loss_fn_inputs
                 logprobs = cls._get_field(loss_fn_inputs, "logprobs")
                 logprobs_data = cls.extract_tensor_data(logprobs) if logprobs is not None else None
+                # Loss mask: `mask` when the client sends one; otherwise the
+                # target-aligned `weights` (custom-loss datums); otherwise all ones
+                # (the cookbook's RL datums strip the mask and rely on zero
+                # advantages outside the response).
                 mask = cls._get_field(loss_fn_inputs, "mask")
+                if mask is None:
+                    mask = cls._get_field(loss_fn_inputs, "weights")
                 mask_data = cls.extract_tensor_data(mask) if mask is not None else None
 
                 # Step 2: Determine response_len from mask or logprobs
@@ -251,26 +264,39 @@ class TinkerDataConverter:
                     response_len = len(mask_data)
                 elif logprobs_data is not None:
                     response_len = len(logprobs_data)
-                    # print(f"[CONVERTER RL] Sample {idx}: No mask, using logprobs length={response_len} (tokens={len(tokens)})", flush=True)
                 else:
                     response_len = len(tokens)
-                    # print(f"[CONVERTER RL] Sample {idx}: No mask/logprobs, using token length={response_len}", flush=True)
 
-                # Step 3: Handle causal LM shift (N-1 adjustment)
-                #
-                # When response_len == token_length (entire sequence is "response"),
-                # Miles computes N-1 logits because logits[i] predicts tokens[i+1].
-                # We must trim all per-token data to N-1 to match.
-                # See: miles/backends/megatron_utils/loss.py:100-108
+                # Step 3: Causal shift. The wire datum is pre-shifted: model_input
+                # has T tokens and every per-token tensor has T entries, entry k
+                # describing target k = model_input[k+1] (k < T-1) or the final
+                # target (k = T-1). Miles computes one logprob per position after
+                # the first token, so with model_input alone it would see only
+                # T-1 targets: the final response token would get no loss or
+                # logprob, and any trim shifts the tensors against the positions
+                # they describe. Append the final target instead, as the SFT path
+                # and the NeMo RL converter do, so the response is exactly the T
+                # targets and every tensor lines up untouched.
                 token_length = len(tokens)
-                needs_causal_trim = (response_len == token_length and token_length > 1)
-                if needs_causal_trim:
-                    # print(f"[CONVERTER RL] Sample {idx}: Applying N-1 causal trim ({response_len} -> {response_len - 1})", flush=True)
+                target = cls._get_field(loss_fn_inputs, "target_tokens")
+                if target is None:
+                    target = cls._get_field(loss_fn_inputs, "target")
+                target_data = cls.extract_tensor_data(target) if target is not None else None
+                needs_causal_trim = False
+                if target_data and response_len == token_length and token_length > 0:
+                    tokens_list[-1] = torch.cat([
+                        tokens_list[-1], torch.tensor(target_data[-1:], dtype=torch.long),
+                    ])
+                elif response_len == token_length and token_length > 1:
+                    # No target on the wire (not a Tinker RL datum): the last
+                    # target is unknowable, so drop the LAST entry of each tensor
+                    # (the one describing it) and train on T-1 positions.
+                    logger.warning("RL datum %d carries no target_tokens; training on %d of %d targets", idx, token_length - 1, token_length)
+                    needs_causal_trim = True
                     response_len = token_length - 1
 
-                # Helper to trim tensor data for causal LM shift (skip first element)
                 def maybe_trim(data: list) -> list:
-                    return data[1:] if needs_causal_trim and data else data
+                    return data[:-1] if needs_causal_trim and data else data
 
                 # Step 4: Build per-token tensors (all must have length = response_len)
                 if mask_data is not None:

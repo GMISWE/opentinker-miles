@@ -128,34 +128,28 @@ class SGLangClient:
             output_logprobs = [item[0] for item in token_logprobs]
 
             # Build result
+            # finish_reason lives in meta_info as {"type": "stop"|"length", ...}
+            # (older builds: a top-level string).
+            finish = meta_info.get("finish_reason", sglang_output.get("finish_reason"))
+            finish_type = finish.get("type") if isinstance(finish, dict) else finish
             result = {
                 "tokens": output_tokens,
                 "logprobs": output_logprobs,
                 "text": sglang_output.get("text"),
-                "stop_reason": "stop" if sglang_output.get("finish_reason") == "stop" else "length"
+                "stop_reason": "stop" if finish_type == "stop" else "length",
             }
 
             # Extract prompt logprobs if requested
             if prompt_logprobs:
                 input_logprobs = meta_info.get("input_token_logprobs", [])
 
-                # Defensive handling: SGLang's input_token_logprobs format was undocumented
-                # and had a bug where it already includes None prefix.
-                # See CLAUDE.md -> "Logprobs None Handling" section.
-                #
-                # DPO Fix: train_dpo.py does logprobs[1:] to skip the first element.
-                # To ensure len(logprobs[1:]) == len(weights), we prepend an extra 0.0.
-                # Also replace any None values with 0.0 to avoid tensor creation errors.
-                # This way: SGLang returns N logprobs -> we return N+1 -> after [1:] we get N
-                normalized_logprobs = self._normalize_logprob_entries(input_logprobs)
-
-                # Replace None values with 0.0 to avoid "Could not infer dtype of NoneType"
-                # when train_dpo.py creates tensors from the logprobs
-                sanitized_logprobs = [0.0 if lp is None else lp for lp in normalized_logprobs]
-
-                # Prepend 0.0 for [1:] slice compensation in train_dpo.py
-                result["prompt_logprobs"] = [0.0] + sanitized_logprobs
-                logger.debug(f"Sanitized {len(normalized_logprobs)} logprobs, prepended 0.0 for DPO [1:] slice compensation")
+                # One entry per prompt token, position 0 = None (no logprob for
+                # the first token), matching the NeMo RL backend. SGLang has
+                # emitted the prompt entries with or without a leading None
+                # sentinel; normalise both to the same shape.
+                normalized = self._normalize_logprob_entries(input_logprobs)
+                tail = normalized[1:] if normalized and normalized[0] is None else normalized
+                result["prompt_logprobs"] = [None] + [0.0 if lp is None else lp for lp in tail]
 
             logger.debug(f"Generated {len(output_tokens)} tokens from SGLang")
             return result
