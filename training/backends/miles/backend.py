@@ -912,9 +912,23 @@ class MilesBackend(TrainingBackend):
                 await h.rollout_manager.offload.remote()
 
             rollout_data = self.converter.forward_to_backend(data, h.args, adapter_slot=h.adapter_slot)
+            # Same DP alignment as fb: fewer samples than DP ranks gives an
+            # actor an empty local batch (get_data_iterator divides by zero).
+            n_pad = self.converter.pad_rollout_data_to_dp(rollout_data, _dp_size(h.args))
+            if n_pad:
+                logger.info("Padded forward with %d inert sample(s) to align with dp=%d",
+                            n_pad, _dp_size(h.args))
             # TinkerTrainGroup returns per-sample logprob tensors already
             # merged into the client's submission order.
             logprobs = await h.train_group.forward_logprobs(0, Box(ray.put(rollout_data)))
+            if n_pad:
+                if len(logprobs) != len(data) + n_pad:
+                    raise BackendError(
+                        f"forward returned {len(logprobs)} per-sample outputs for "
+                        f"{len(data)} samples + {n_pad} pads",
+                        backend="miles", operation="forward",
+                    )
+                logprobs = logprobs[:len(data)]
 
             loss_fn_outputs = [
                 {"logprobs": {"data": lp.tolist(), "shape": [len(lp)], "dtype": "float32"}}
