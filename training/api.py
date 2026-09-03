@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse
 
 # Import modules
 from .storage import FuturesStorage, MetadataStorage, SessionStorage
+from .storage.futures import DuplicateSeqId
 from .config import get_config, TrainingConfig, StorageConfig, BackendConfig
 from .core import SlimeArgumentBuilder
 from .utils import APIKeyAuth
@@ -241,6 +242,15 @@ def create_app(config: Optional[TrainingConfig] = None) -> FastAPI:
             await _free_model(application, model_id, reason="shutdown")
         if ray.is_initialized():
             ray.shutdown()
+
+    @application.exception_handler(DuplicateSeqId)
+    async def duplicate_seq_id_handler(request: Request, exc: DuplicateSeqId):
+        """A reused (model_id, seq_id) with a different request is a client bug.
+
+        400 rather than 409: the SDK retries 408/409/429/5xx for hours, and a
+        conflict can never succeed on retry."""
+        return JSONResponse(status_code=400, content={"error": str(exc), "status_code": 400,
+                                                      "path": str(request.url.path)})
 
     @application.exception_handler(HTTPException)
     async def http_exception_handler(request: Request, exc: HTTPException):

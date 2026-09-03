@@ -5,6 +5,7 @@ This module provides a storage layer for tracking asynchronous operations
 in the training API, using SQLite for persistence and in-memory caching
 for performance.
 """
+import hashlib
 import json
 import logging
 import sqlite3
@@ -39,6 +40,10 @@ def _serialize_result(result: Any) -> Optional[str]:
     else:
         # Plain dict or JSON-serializable object
         return json.dumps(result)
+
+
+class DuplicateSeqId(ValueError):
+    """A (model_id, seq_id) pair was reused with a different request."""
 
 
 class FuturesStorage:
@@ -92,28 +97,70 @@ class FuturesStorage:
                 CREATE INDEX IF NOT EXISTS idx_futures_model
                 ON futures(model_id)
             """)
+            # seq_id idempotency (added later; migrate older files in place)
+            columns = {row[1] for row in cursor.execute("PRAGMA table_info(futures)").fetchall()}
+            if "seq_id" not in columns:
+                cursor.execute("ALTER TABLE futures ADD COLUMN seq_id INTEGER")
+            if "payload_hash" not in columns:
+                cursor.execute("ALTER TABLE futures ADD COLUMN payload_hash TEXT")
+            cursor.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_futures_model_seq
+                ON futures(model_id, seq_id) WHERE seq_id IS NOT NULL
+            """)
 
             conn.commit()
             logger.info(f"Initialized futures database at {self.db_path}")
         finally:
             conn.close()
 
+    @staticmethod
+    def payload_hash(payload: Dict[str, Any]) -> str:
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+    def find_by_seq_id(self, model_id: str, seq_id: int) -> Optional[Dict[str, Any]]:
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            row = conn.execute(
+                "SELECT request_id, operation, payload_hash FROM futures WHERE model_id = ? AND seq_id = ?",
+                (model_id, seq_id),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        return {"request_id": row[0], "operation": row[1], "payload_hash": row[2]}
+
     def save_future(
         self,
         request_id: str,
         operation: str,
         payload: Dict[str, Any],
-        model_id: Optional[str] = None
-    ) -> None:
+        model_id: Optional[str] = None,
+        seq_id: Optional[int] = None,
+    ) -> str:
         """
         Save a new future for an async operation.
 
-        Args:
-            request_id: Unique identifier for the request
-            operation: Type of operation (e.g., "create_model", "forward_backward")
-            payload: Operation payload/parameters
-            model_id: Optional model identifier
+        With a `seq_id`, the pair (model_id, seq_id) is unique: a retry of the
+        same request returns the existing request_id (no new future); a
+        different operation or payload under a reused seq_id raises
+        DuplicateSeqId.
+
+        Returns:
+            The request_id that owns this (model_id, seq_id): the given one, or
+            the earlier one on an idempotent retry.
         """
+        phash = self.payload_hash(payload)
+        if seq_id is not None and model_id is not None:
+            existing = self.find_by_seq_id(model_id, seq_id)
+            if existing is not None:
+                if existing["operation"] == operation and existing["payload_hash"] == phash:
+                    logger.info("[%s] retry of seq_id %s for %s -> %s", request_id, seq_id, model_id, existing["request_id"])
+                    return existing["request_id"]
+                raise DuplicateSeqId(
+                    f"Training request sequence number {seq_id} was reused for {model_id} "
+                    f"with a different {'operation' if existing['operation'] != operation else 'payload'}"
+                )
         future_data = {
             "request_id": request_id,
             "model_id": model_id,
@@ -135,8 +182,8 @@ class FuturesStorage:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT OR REPLACE INTO futures
-                (request_id, model_id, operation, payload, status, result, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (request_id, model_id, operation, payload, status, result, created_at, updated_at, seq_id, payload_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 request_id,
                 model_id,
@@ -145,14 +192,25 @@ class FuturesStorage:
                 future_data["status"],
                 None,
                 future_data["created_at"],
-                future_data["updated_at"]
+                future_data["updated_at"],
+                seq_id,
+                phash,
             ))
             conn.commit()
+        except sqlite3.IntegrityError:
+            # lost a race with a concurrent retry of the same seq_id
+            existing = self.find_by_seq_id(model_id, seq_id) if seq_id is not None else None
+            if existing and existing["operation"] == operation and existing["payload_hash"] == phash:
+                with self._lock:
+                    self._memory_store.pop(request_id, None)
+                return existing["request_id"]
+            raise DuplicateSeqId(f"Training request sequence number {seq_id} was reused for {model_id}")
         except Exception as e:
             logger.error(f"Failed to save future {request_id}: {e}")
             raise
         finally:
             conn.close()
+        return request_id
 
     def update_status(
         self,

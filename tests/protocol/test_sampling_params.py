@@ -27,7 +27,8 @@ def test_seed_reproduces_and_samples_differ(service_client, server):
     a = sc.sample(prompt=prompt, num_samples=3, sampling_params=types.SamplingParams(max_tokens=6, seed=7)).result()
     b = sc.sample(prompt=prompt, num_samples=3, sampling_params=types.SamplingParams(max_tokens=6, seed=7)).result()
     c = sc.sample(prompt=prompt, num_samples=3, sampling_params=types.SamplingParams(max_tokens=6, seed=8)).result()
-    toks = lambda r: [s.tokens for s in r.sequences]
+    def toks(r):
+        return [s.tokens for s in r.sequences]
     assert toks(a) == toks(b)
     assert toks(a) != toks(c)
     assert len({tuple(t) for t in toks(a)}) == 3  # the samples of one request are distinct

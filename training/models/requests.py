@@ -141,6 +141,7 @@ class UnloadModelRequest(BaseModel):
     """
 
     model_id: str = Field(..., description="Model ID to unload")
+    seq_id: Optional[int] = Field(default=None, description="Per-model sequence number (idempotent retries)")
     type: str = Field(default="unload_model", description="Request type")
 
 
@@ -202,6 +203,7 @@ class SaveWeightsRequest(BaseModel):
 
     model_id: str = Field(..., description="Model ID")
     path: Optional[str] = Field(default=None, description="Checkpoint name/path")
+    seq_id: Optional[int] = Field(default=None, description="Per-model sequence number (idempotent retries)")
 
 
 class LoadWeightsRequest(BaseModel):
@@ -433,12 +435,14 @@ class ForwardRequest(BaseModel):
     """Forward pass request (new format)."""
     model_id: str = Field(..., description="Model ID")
     forward_input: ForwardInput = Field(..., description="Forward pass data")
+    seq_id: Optional[int] = Field(default=None, description="Per-model sequence number (idempotent retries)")
 
 
 class ForwardBackwardRequest(BaseModel):
     """Forward-backward pass request (supports both old and new formats)."""
     model_id: str = Field(..., description="Model ID")
     forward_backward_input: Optional[ForwardBackwardInput] = Field(default=None, description="Training data (new format)")
+    seq_id: Optional[int] = Field(default=None, description="Per-model sequence number (idempotent retries)")
     # Old format fields (for backward compatibility with HTTP tests)
     data: Optional[List[ForwardBackwardDatum]] = Field(default=None, description="Training data (old format)")
     loss_fn: Optional[str] = Field(default=None, description="Loss function (old format)")
@@ -493,6 +497,7 @@ class OptimStepRequest(BaseModel):
     model_id: str = Field(..., description="Model ID")
     adam_params: Optional[AdamParams] = Field(default=None, description="Adam optimizer parameters")
     step_num: Optional[int] = Field(default=None, ge=0, description="Step number for logging")
+    seq_id: Optional[int] = Field(default=None, description="Per-model sequence number (idempotent retries)")
 
 
 class ASampleRequest(BaseModel):

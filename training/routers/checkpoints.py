@@ -120,11 +120,12 @@ async def save_weights(
         )
 
     # Create async task
-    task_manager.create_task(
+    request_id = task_manager.create_task(
         request_id=request_id,
         operation="save_weights",
         model_id=request.model_id,
         payload=request.dict(),
+        seq_id=request.seq_id,
         task_func=execute
     )
 
@@ -188,11 +189,12 @@ async def save_weights_for_sampler(
         return SaveWeightsForSamplerResult(**result)
 
     # Create async task
-    task_manager.create_task(
+    request_id = task_manager.create_task(
         request_id=request_id,
         operation="save_weights_for_sampler",
         model_id=request.model_id,
         payload=request.dict(),
+        seq_id=request.seq_id,
         task_func=execute
     )
 
@@ -241,9 +243,10 @@ async def load_weights(
             training_clients=training_clients, metadata_storage=metadata_storage,
         )
 
-    task_manager.create_task(
+    request_id = task_manager.create_task(
         request_id=request_id, operation="load_weights", model_id=request.model_id,
-        payload=request.dict(), task_func=execute,
+        payload=request.dict(),
+        seq_id=request.seq_id, task_func=execute,
     )
     return AsyncOperationResponse(request_id=request_id, model_id=request.model_id)
 

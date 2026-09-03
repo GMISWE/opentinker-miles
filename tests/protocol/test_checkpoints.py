@@ -43,7 +43,7 @@ def test_load_weights_first_request_rule(service_client, server):
     p = src.save_state("w").result().path
 
     fresh = service_client.create_lora_training_client(base_model="fake/tiny", rank=2)
-    r = server.post("/api/v1/load_weights", {"model_id": fresh.model_id, "path": p, "optimizer": False, "seq_id": 1})
+    r = server.post("/api/v1/load_weights", {"model_id": fresh.model_id, "path": p, "optimizer": False, "seq_id": 1001})
     assert r.status_code == 200, r.text
     fut = server.post("/api/v1/retrieve_future", {"request_id": r.json()["request_id"]}, timeout=60)
     assert fut.status_code == 200 and fut.json()["path"] == p, fut.text
@@ -51,7 +51,7 @@ def test_load_weights_first_request_rule(service_client, server):
     op = fresh.optim_step(types.AdamParams(learning_rate=0.0)).result()
     assert op.metrics["fake_w"] == 0.5
 
-    r = server.post("/api/v1/load_weights", {"model_id": fresh.model_id, "path": p, "optimizer": False, "seq_id": 3})
+    r = server.post("/api/v1/load_weights", {"model_id": fresh.model_id, "path": p, "optimizer": False, "seq_id": 1003})
     assert r.status_code == 400 and "not permitted" in r.json()["error"], r.text
 
     trained = service_client.create_lora_training_client(base_model="fake/tiny", rank=2)
