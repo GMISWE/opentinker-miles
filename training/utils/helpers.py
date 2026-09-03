@@ -260,34 +260,3 @@ def extract_learning_rates(optimizer: Optional[Any]) -> Dict[str, float]:
             learning_rates[lr_key] = float(param_group.get('lr', 0.0))
 
     return learning_rates
-
-
-def find_model_with_rollout_manager(training_clients: Dict[str, Dict[str, Any]]) -> Optional[str]:
-    """
-    Find first model capable of serving sampling requests.
-
-    Checks for:
-    1. Miles backend: has 'rollout_manager' (SGLang HTTP sampling)
-    2. NeMo RL backend: has 'backend_handle' with backend_type='nemo_rl' (vLLM Ray sampling)
-
-    Args:
-        training_clients: Dict of training client info
-
-    Returns:
-        Model ID if found, None otherwise
-    """
-    for model_id, client_info in training_clients.items():
-        if "rollout_manager" in client_info and client_info["rollout_manager"] is not None:
-            logger.debug(f"Found model with RolloutManager (Miles): {model_id}")
-            return model_id
-        handle = client_info.get("backend_handle")
-        if handle is not None and getattr(handle, "backend_type", None) == "nemo_rl":
-            logger.debug(f"Found model with NemoRL backend: {model_id}")
-            return model_id
-        # verl M2: handle carries its own rollout state (vLLM server replicas)
-        if handle is not None and getattr(handle, "has_rollout", False):
-            logger.debug(f"Found model with rollout-enabled handle: {model_id}")
-            return model_id
-
-    logger.warning("No model with RolloutManager or NemoRL backend found")
-    return None
