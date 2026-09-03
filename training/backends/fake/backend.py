@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 
 from ..base import BackendError, BackendHandle, TrainingBackend
 from ..checkpoint_interchange import resolve_checkpoint_root
+from ...core.loss_registry import LOSS_FNS
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,6 @@ class FakeHandle(BackendHandle):
     weight_version: int = 0
     step_count: int = 0
     pending: int = 0
-    has_rollout: bool = True  # discoverable as a sampling target
     metrics: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -69,6 +69,7 @@ def logprobs_for(tokens: List[int]) -> List[float]:
 
 class FakeBackend(TrainingBackend):
     needs_ray = False
+    SUPPORTED_LOSS_FNS = frozenset(LOSS_FNS)
 
     def __init__(self, overrides: Optional[Dict[str, Any]] = None):
         self.overrides = overrides or {}
@@ -124,21 +125,26 @@ class FakeBackend(TrainingBackend):
             outputs.append({"logprobs": {"data": lp, "shape": [len(lp)], "dtype": "float32"}})
         return outputs, (sum(losses) / len(losses) if losses else 0.0)
 
-    async def forward(self, handle: BackendHandle, data: List[Any], loss_fn: str) -> Dict[str, Any]:
+    async def forward(self, handle: BackendHandle, data: List[Any], loss_fn: str,
+                      loss_fn_config: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
         h = self._handle(handle, "forward")
         outputs, _ = self._outputs(data)
-        self._trace("forward", h.model_id, n=len(data), loss_fn=loss_fn)
+        self._trace("forward", h.model_id, n=len(data), loss_fn=loss_fn, loss_fn_config=loss_fn_config)
         return {"type": "forward", "loss_fn_output_type": loss_fn, "loss_fn_outputs": outputs, "metrics": {}}
 
-    async def forward_backward(self, handle: BackendHandle, data: List[Any], loss_fn: str) -> Dict[str, Any]:
+    async def forward_backward(self, handle: BackendHandle, data: List[Any], loss_fn: str,
+                               loss_fn_config: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
         h = self._handle(handle, "forward_backward")
         outputs, loss = self._outputs(data)
         h.pending += 1
-        self._trace("forward_backward", h.model_id, n=len(data), loss_fn=loss_fn)
+        self._trace("forward_backward", h.model_id, n=len(data), loss_fn=loss_fn, loss_fn_config=loss_fn_config)
+        metrics = {"loss:mean": loss}
+        for k, v in (loss_fn_config or {}).items():
+            metrics[f"{k}:mean"] = float(v)
         return {
             "loss_fn_output_type": loss_fn,
             "loss": loss,
-            "metrics": {"loss:mean": loss},
+            "metrics": metrics,
             "loss_fn_outputs": outputs,
             "deferred": False,
         }

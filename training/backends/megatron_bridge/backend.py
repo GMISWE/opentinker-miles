@@ -43,6 +43,7 @@ async def _get(ref):
 
 
 class MegatronBridgeBackend(TrainingBackend):
+    SUPPORTED_LOSS_FNS = frozenset({"cross_entropy", "classification_ce"})
     """Megatron-native classification backend (Ray-actor delegation, no gen plane)."""
 
     def __init__(self, overrides: Optional[Dict[str, Any]] = None):
@@ -134,12 +135,14 @@ class MegatronBridgeBackend(TrainingBackend):
             request_id, model_id, base_model, num_labels, seq_length, lc.get("rank", 16))
         return handle
 
-    async def forward(self, handle: BackendHandle, data: List[Dict], loss_fn: str) -> Dict[str, Any]:
+    async def forward(self, handle: BackendHandle, data: List[Dict], loss_fn: str,
+                      loss_fn_config: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
         h: MegatronBridgeHandle = handle  # type: ignore[assignment]
         batch = self.converter.forward_to_backend(data, {"seq_length": h.seq_length})
         return await _get(h.worker.forward.remote(batch))
 
-    async def forward_backward(self, handle: BackendHandle, data: List[Dict], loss_fn: str) -> Dict[str, Any]:
+    async def forward_backward(self, handle: BackendHandle, data: List[Dict], loss_fn: str,
+                               loss_fn_config: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
         h: MegatronBridgeHandle = handle  # type: ignore[assignment]
         batch = self.converter.forward_backward_to_backend(data, loss_fn, {"seq_length": h.seq_length})
         return await _get(h.worker.forward_backward.remote(batch))

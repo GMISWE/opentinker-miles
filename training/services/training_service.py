@@ -8,7 +8,7 @@ in the concrete backend implementation (e.g. MilesBackend, NemoRLBackend).
 import logging
 from typing import Dict, List, Any, Optional
 
-from ..backends.base import TrainingBackend
+from ..backends.base import TrainingBackend, UnsupportedFeatureError
 
 logger = logging.getLogger(__name__)
 
@@ -23,12 +23,21 @@ class TrainingService:
     def __init__(self, backend: TrainingBackend):
         self.backend = backend
 
+    def _check_loss_supported(self, loss_fn: str) -> None:
+        supported = getattr(self.backend, "SUPPORTED_LOSS_FNS", None)
+        if supported is not None and loss_fn not in supported:
+            raise UnsupportedFeatureError(
+                f"loss_fn {loss_fn!r}", backend=type(self.backend).__name__,
+                suggestion=f"this backend supports: {', '.join(sorted(supported))}",
+            )
+
     async def forward(
         self,
         model_id: str,
         data: List[Any],
         loss_fn: str,
         client_info: Dict[str, Any],
+        loss_fn_config: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         """
         Execute forward-only pass (no gradients).
@@ -37,9 +46,10 @@ class TrainingService:
         computing gradients.
         """
         logger.info("Forward pass for %s", model_id)
+        self._check_loss_supported(loss_fn)
 
         handle = client_info["backend_handle"]
-        result = await self.backend.forward(handle, data, loss_fn)
+        result = await self.backend.forward(handle, data, loss_fn, loss_fn_config=loss_fn_config)
 
         logger.info("Forward pass completed for %s", model_id)
         return result
@@ -50,14 +60,16 @@ class TrainingService:
         data: List[Any],
         loss_fn: str,
         client_info: Dict[str, Any],
+        loss_fn_config: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         """
         Execute forward-backward pass (accumulate gradients, no optimizer step).
         """
         logger.info("Forward-backward pass for %s", model_id)
+        self._check_loss_supported(loss_fn)
 
         handle = client_info["backend_handle"]
-        result = await self.backend.forward_backward(handle, data, loss_fn)
+        result = await self.backend.forward_backward(handle, data, loss_fn, loss_fn_config=loss_fn_config)
 
         logger.info("Forward-backward completed for %s", model_id)
         return result

@@ -46,6 +46,7 @@ class AutomodelHandle(BackendHandle):
 
 
 class AutomodelBackend(TrainingBackend):
+    SUPPORTED_LOSS_FNS = frozenset({"cross_entropy", "classification_ce"})
     """HF-encoder classification backend (no generation plane)."""
 
     def __init__(self, overrides: Optional[Dict[str, Any]] = None):
@@ -192,6 +193,7 @@ class AutomodelBackend(TrainingBackend):
 
     async def forward(
         self, handle: BackendHandle, data: List[Dict], loss_fn: str,
+        loss_fn_config: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         """Forward-only logits pass (no gradient)."""
         import asyncio
@@ -215,6 +217,7 @@ class AutomodelBackend(TrainingBackend):
 
     async def forward_backward(
         self, handle: BackendHandle, data: List[Dict], loss_fn: str,
+        loss_fn_config: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         """Convert a classification Datum, run forward + loss.backward()
         immediately, and return the real loss (deferred=False)."""

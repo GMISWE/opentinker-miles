@@ -370,6 +370,7 @@ class ForwardInput(BaseModel):
     """Batch of forward data."""
     data: List[ForwardDatum] = Field(..., description="Batch data")
     loss_fn: str = Field(default="cross_entropy", description="Loss function")
+    loss_fn_config: Optional[Dict[str, float]] = Field(default=None, description="Loss hyperparameters (see core.loss_registry)")
 
 
 class ForwardBackwardDatum(BaseModel):
@@ -381,7 +382,8 @@ class ForwardBackwardDatum(BaseModel):
 class ForwardBackwardInput(BaseModel):
     """Batch of forward_backward data."""
     data: List[ForwardBackwardDatum] = Field(..., description="Batch data")
-    loss_fn: str = Field(default="cross_entropy", description="Loss function (cross_entropy, ppo_loss, etc.)")
+    loss_fn: str = Field(default="cross_entropy", description="Loss function name (see core.loss_registry)")
+    loss_fn_config: Optional[Dict[str, float]] = Field(default=None, description="Loss hyperparameters (see core.loss_registry)")
 
 
 # ============= Sampling Models =============
