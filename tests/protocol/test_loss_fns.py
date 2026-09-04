@@ -51,7 +51,7 @@ def test_supported_losses_reach_backend_with_config(service_client, server, mode
     tokens = list(range(20, 27))
     fb = model.forward_backward([make_datum(tokens)], loss_fn, loss_fn_config=cfg).result()
     model.optim_step(types.AdamParams(learning_rate=0.0)).result()
-    assert fb.loss_fn_outputs[0]["logprobs"].data == [-(t % 7) / 7.0 for t in tokens[:-1]]
+    assert list(fb.loss_fn_outputs[0]["logprobs"].data) == pytest.approx([-(t % 7) / 7.0 for t in tokens[:-1]], rel=1e-6)
     for k, v in (cfg or {}).items():
         assert fb.metrics[f"{k}:mean"] == v, fb.metrics  # fb metrics carry a ":<reduction>" suffix
     seen = [t for t in server.trace() if t["op"] == "forward_backward" and t["model_id"] == model.model_id]

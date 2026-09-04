@@ -24,7 +24,8 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 _COLUMNS = ("request_id", "model_id", "operation", "status", "result",
-            "created_at", "updated_at", "seq_id", "payload_hash", "payload_bytes")
+            "created_at", "updated_at", "seq_id", "payload_hash", "payload_bytes",
+            "result_proto")
 
 
 def _serialize_result(result: Any) -> Optional[str]:
@@ -70,9 +71,9 @@ class FuturesStorage:
     def _init_database(self) -> None:
         cur = self._conn
         columns = {row[1] for row in cur.execute("PRAGMA table_info(futures)").fetchall()}
-        if columns and ("payload" in columns or "payload_bytes" not in columns):
-            # Legacy layout (full payload column). Rows never survive a server
-            # start (startup purges all futures), so rebuild rather than migrate.
+        if columns and set(_COLUMNS) != columns:
+            # Older layout. Rows never survive a server start (startup purges
+            # all futures), so rebuild rather than migrate.
             logger.info("Rebuilding futures table at %s (legacy schema)", self.db_path)
             cur.execute("DROP TABLE futures")
         cur.execute("""
@@ -86,7 +87,8 @@ class FuturesStorage:
                 updated_at TEXT NOT NULL,
                 seq_id INTEGER,
                 payload_hash TEXT NOT NULL,
-                payload_bytes INTEGER NOT NULL
+                payload_bytes INTEGER NOT NULL,
+                result_proto BLOB
             )
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_futures_status ON futures(status)")
@@ -164,6 +166,7 @@ class FuturesStorage:
             "request_id": request_id, "model_id": model_id, "operation": operation,
             "status": "pending", "result": None, "created_at": now, "updated_at": now,
             "seq_id": seq_id, "payload_hash": phash, "payload_bytes": pbytes,
+            "result_proto": None,
         }
         with self._lock:
             try:
@@ -190,25 +193,36 @@ class FuturesStorage:
             self._cache_put(fut)
         return request_id
 
-    def update_status(self, request_id: str, status: str, result: Optional[Any] = None) -> bool:
-        """Set a future's status (and result). False if the future is unknown."""
+    def update_status(self, request_id: str, status: str, result: Optional[Any] = None,
+                      result_proto: Optional[bytes] = None) -> bool:
+        """Set a future's status (and result; and its proto view, when the
+        operation has one). False if the future is unknown."""
         plain = _as_plain(result) if result is not None else None
         now = datetime.utcnow().isoformat()
         with self._lock:
             cur = self._conn.execute(
-                "UPDATE futures SET status = ?, result = ?, updated_at = ? WHERE request_id = ?",
-                (status, json.dumps(plain) if plain is not None else None, now, request_id),
+                "UPDATE futures SET status = ?, result = ?, result_proto = ?, updated_at = ? WHERE request_id = ?",
+                (status, json.dumps(plain) if plain is not None else None, result_proto, now, request_id),
             )
             if cur.rowcount == 0:
                 logger.warning("Future %s not found for update", request_id)
                 return False
             fut = self._cache.get(request_id) or self._load(request_id)
             if fut is not None:
-                fut.update(status=status, updated_at=now)
+                fut.update(status=status, updated_at=now, result_proto=result_proto)
                 if plain is not None:
                     fut["result"] = plain
                 self._cache_put(fut)
         return True
+
+    def set_result_proto(self, request_id: str, result_proto: bytes) -> None:
+        """Attach the proto view of a completed result built after completion."""
+        with self._lock:
+            self._conn.execute("UPDATE futures SET result_proto = ? WHERE request_id = ?",
+                               (result_proto, request_id))
+            fut = self._cache.get(request_id)
+            if fut is not None:
+                fut["result_proto"] = result_proto
 
     def get_future(self, request_id: str) -> Optional[Dict[str, Any]]:
         with self._lock:

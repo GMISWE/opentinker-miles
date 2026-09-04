@@ -18,6 +18,7 @@ from typing import Callable, Dict, Any, Optional, Awaitable
 from ..storage import FuturesStorage
 from ..services import ordering
 from ..models.responses import validate_result
+from ..proto.wire import PROTO_RESULT_OPERATIONS, serialize_result
 
 logger = logging.getLogger(__name__)
 
@@ -125,10 +126,23 @@ class TaskManager:
                 # the future here, with the offending field named, instead of
                 # failing inside the SDK's parser on the client.
                 result = validate_result(operation, result)
+                # Sample and forward/forward_backward results have a proto view
+                # (SDK >= 0.25 retrieves them only as proto). Build it once here,
+                # off the event loop, beside the JSON of record; never rebuild it
+                # per poll. A view that fails to build is logged and left to the
+                # retrieve path, which then answers the proto client with 500
+                # while JSON clients still get the result.
+                result_proto = None
+                if operation in PROTO_RESULT_OPERATIONS:
+                    try:
+                        result_proto = await asyncio.to_thread(serialize_result, operation, result)
+                    except Exception as e:
+                        logger.error(f"[{request_id}] proto view of {operation} result not built: {e}")
                 self.futures_storage.update_status(
                     request_id=request_id,
                     status="completed",
-                    result=result
+                    result=result,
+                    result_proto=result_proto,
                 )
 
                 logger.info(f"[{request_id}] {operation} completed successfully")

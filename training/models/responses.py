@@ -14,6 +14,10 @@ class AsyncOperationResponse(BaseModel):
 
     request_id: str = Field(..., description="Request ID for tracking")
     model_id: Optional[str] = Field(default=None, description="Associated model ID")
+    # Sampling submissions only: one id per sequence the request will return,
+    # fixed at submission. SDK >= 0.25 stamps them onto SampledSequence.sequence_id
+    # and refuses a sample result whose submission carried none.
+    sample_sequence_ids: Optional[List[str]] = Field(default=None, description="Per-sequence ids (sampling only)")
 
 
 class FutureStatus(BaseModel):
@@ -53,6 +57,19 @@ class HealthResponse(BaseModel):
     active_training_clients: Optional[int] = Field(default=None, description="Number of active training clients")
     model_ids: Optional[List[str]] = Field(default=None, description="List of active model IDs")
     futures_count: Optional[int] = Field(default=None, description="Number of pending async operations")
+
+
+class ClientConfigResponse(BaseModel):
+    """Feature flags the SDK (>= 0.25) fetches once at client construction
+    (`POST /api/v1/client/config`). Fields the SDK does not know are ignored
+    client-side; fields omitted here take the SDK's defaults. Every value
+    below is the setting this server actually honours."""
+
+    pjwt_auth_enabled: bool = Field(default=False, description="False: API keys only, no JWT exchange")
+    proto_compress_fwdbwd: bool = Field(default=False, description="True only when the server can zstd-decompress bodies")
+    create_model_via_load_weights: bool = Field(default=False, description="False: create_model then load_weights")
+    sample_use_retrieve_futures: bool = Field(default=False, description="False: no /retrieve_futures poller")
+    use_pyqwest_transport: bool = Field(default=False, description="False: the SDK uses its httpx default transport")
 
 
 class TensorData(BaseModel):

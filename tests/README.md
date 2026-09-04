@@ -25,6 +25,21 @@ scripts/pod_pytest.sh tinkercloud-nemorl tests/protocol -q
 The script pushes the local working tree (sha-verified) to a scratch dir on
 the pod and runs pytest there; the deployed `/app` is untouched.
 
+The protocol suite passes under both SDK eras: the fork SDK installed on the
+pod (JSON wire) and upstream `tinker >= 0.25` (proto wire, `client/config`
+handshake, sequence ids). To run it under an upstream SDK without touching
+the pod's install, put one in a scratch target and prepend it to `PYTHONPATH`
+for the test process only (the server the suite spawns never imports the SDK):
+
+```bash
+kubectl exec tinkercloud-nemorl -- pip install --target /tmp/pytest-$USER/sdk027 "tinker==0.27.0"
+kubectl exec tinkercloud-nemorl -- bash -c "cd /tmp/pytest-$USER/app && \
+  PYTHONPATH=/tmp/pytest-$USER/sdk027:/tmp/pytest-$USER python -m pytest tests/protocol tests/test_proto_wire_sdk.py -q"
+```
+
+`tests/test_proto_wire_sdk.py` (the codec driven by the SDK's own
+`request_conv` / `response_conv`) is skipped unless such an SDK is importable.
+
 ## Integration tests against a running server
 
 Integration tests for a tinkercloud server running in Docker.

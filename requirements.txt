@@ -19,6 +19,12 @@ openai
 tiktoken
 pydantic>=2.0.0
 
+# Tinker proto wire format (SDK >= 0.25): protobuf for the schema, zstandard
+# for compressed forward_backward bodies (optional: without it the server
+# tells clients not to compress)
+protobuf>=4.21
+zstandard
+
 # Observability (optional, for production)
 prometheus-client
 opentelemetry-distro

@@ -11,10 +11,11 @@ import ray
 from datetime import datetime
 from fastapi import APIRouter, Depends, Request
 
-from ..models.responses import HealthResponse, ServerCapabilities, ModelInfo
+from ..models.responses import ClientConfigResponse, HealthResponse, ServerCapabilities, ModelInfo
 from ..core.dependencies import verify_api_key_dep
 from ..core.task_manager import TaskManager
 from ..config import TrainingConfig
+from ..proto.wire import zstd_available
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,20 @@ async def health(request: Request):
         model_ids=list(training_clients.keys()),
         futures_count=TaskManager.inflight_count()
     )
+
+
+@router.get("/api/v1/healthz")
+async def healthz():
+    """Readiness probe in the SDK's shape (`HealthResponse.status` is the literal "ok")."""
+    return {"status": "ok"}
+
+
+@router.post("/api/v1/client/config", response_model=ClientConfigResponse)
+async def client_config(request: Request):
+    """Feature flags for the connecting SDK (>= 0.25 fetches this once at
+    construction and fails without it). The body carries the SDK version;
+    every client gets the same flags."""
+    return ClientConfigResponse(proto_compress_fwdbwd=zstd_available())
 
 
 @router.get("/api/v1/get_server_capabilities", response_model=ServerCapabilities)
