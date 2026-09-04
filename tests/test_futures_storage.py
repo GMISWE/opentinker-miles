@@ -88,3 +88,36 @@ def test_cleanup(store):
     assert store.cleanup_old_futures(max_age_hours=24) == 0
     assert store.cleanup_old_futures(max_age_hours=0) == 1
     assert store.get_future("r1") is None
+
+
+def test_result_proto_is_stored_beside_the_json(store, tmp_path):
+    store.save_future("r1", "forward_backward", _payload(3), model_id="m", seq_id=1)
+    assert store.get_future("r1")["result_proto"] is None
+    store.update_status("r1", "completed", {"metrics": {}}, result_proto=b"\x0a\x01x")
+    assert store.get_future("r1")["result_proto"] == b"\x0a\x01x"
+    assert store.get_future("r1")["result"] == {"metrics": {}}
+    # survives cache eviction (read back from the row)
+    store._cache.clear()
+    assert store.get_future("r1")["result_proto"] == b"\x0a\x01x"
+    # attached after completion (lazy build on first proto retrieve)
+    store.save_future("r2", "sample", {}, model_id="m")
+    store.update_status("r2", "completed", {"sequences": []})
+    store.set_result_proto("r2", b"pb")
+    store._cache.clear()
+    assert store.get_future("r2")["result_proto"] == b"pb"
+
+
+def test_pre_proto_schema_is_rebuilt(tmp_path):
+    db = tmp_path / "futures.db"
+    conn = sqlite3.connect(db)
+    conn.execute("""CREATE TABLE futures (request_id TEXT PRIMARY KEY, model_id TEXT, operation TEXT NOT NULL,
+                    status TEXT NOT NULL, result TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    seq_id INTEGER, payload_hash TEXT NOT NULL, payload_bytes INTEGER NOT NULL)""")
+    conn.execute("INSERT INTO futures VALUES ('old','m','forward','pending',NULL,'t','t',1,'h',0)")
+    conn.commit()
+    conn.close()
+    s = FuturesStorage(db)
+    assert s.get_future("old") is None
+    s.save_future("new", "forward", {}, model_id="m", seq_id=1)
+    assert s.get_future("new")["result_proto"] is None
+    s.close()

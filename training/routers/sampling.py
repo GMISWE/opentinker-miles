@@ -7,7 +7,7 @@ Endpoints:
 - POST /api/v1/create_sampling_client - Create SGLang sampling client
 """
 import logging
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
@@ -121,6 +121,12 @@ def model_id_from_path(model_path: str) -> str:
     return model_path.removeprefix("tinker://").split("/")[0]
 
 
+def _sequence_ids(request_id: str, n: int) -> List[str]:
+    """Identity of each sequence a sampling request will return, fixed at
+    submission (SDK >= 0.25 requires one per sequence on the promise)."""
+    return [f"{request_id}-{i}" for i in range(n)]
+
+
 @router.post("/api/v1/asample", response_model=AsyncOperationResponse)
 async def asample(
     request: ASampleRequest,
@@ -183,7 +189,8 @@ async def asample(
 
     return AsyncOperationResponse(
         request_id=request_id,
-        model_id=model_id
+        model_id=model_id,
+        sample_sequence_ids=_sequence_ids(request_id, request.num_samples),
     )
 
 
@@ -233,7 +240,8 @@ async def sample(
 
     return AsyncOperationResponse(
         request_id=request_id,
-        model_id=model_id
+        model_id=model_id,
+        sample_sequence_ids=_sequence_ids(request_id, len(request.prompts) * request.num_samples),
     )
 
 

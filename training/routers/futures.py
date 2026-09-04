@@ -9,7 +9,7 @@ Thin HTTP layer for:
 import asyncio
 import logging
 import time
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from typing import Dict, Any
 
@@ -18,6 +18,7 @@ from ..models.responses import CleanupResult
 from ..storage import FuturesStorage
 from ..core.dependencies import verify_api_key_dep
 from ..core.task_manager import TaskManager
+from ..proto.wire import PROTO_CONTENT_TYPE, PROTO_RESULT_OPERATIONS, serialize_result
 
 # Hold a pending retrieve on the operation's task instead of answering 408
 # immediately. The SDK's retrieve cycle costs ~450 ms client-side, so an
@@ -55,27 +56,40 @@ def get_poll_tracking(request: Request) -> Dict[str, Dict[str, Any]]:
     return runtime.poll_tracking
 
 
+async def _completed_response(fut: Dict[str, Any], accept: str, futures_storage: FuturesStorage) -> Response:
+    """A completed future's result: proto bytes when the client accepts proto
+    and the operation has that view (SDK >= 0.25 rejects JSON for sample and
+    forward/forward_backward results), else the JSON of record."""
+    if fut["operation"] in PROTO_RESULT_OPERATIONS and PROTO_CONTENT_TYPE in accept.lower():
+        blob = fut.get("result_proto")
+        if blob is None:
+            # Not built at completion (see TaskManager); build it now, once.
+            try:
+                blob = await asyncio.to_thread(serialize_result, fut["operation"], fut.get("result") or {})
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"result has no proto encoding: {e}")
+            futures_storage.set_result_proto(fut["request_id"], blob)
+        return Response(content=blob, media_type=PROTO_CONTENT_TYPE)
+    return JSONResponse(content=fut.get("result", {}))
+
+
 @router.post("/api/v1/retrieve_future/{request_id}")
 async def retrieve_future(
     request_id: str,
+    http_request: Request,
     _: None = Depends(verify_api_key_dep),
     futures_storage: FuturesStorage = Depends(get_futures_storage),
     poll_tracking: Dict[str, Dict[str, Any]] = Depends(get_poll_tracking)
 ):
     """
-    Retrieve async operation result - refactored with storage abstraction
+    Retrieve async operation result.
 
     Returns:
     - 408 (Request Timeout) if operation is still running
-    - 200 with result if completed successfully
+    - 200 with result if completed successfully (proto when `Accept:
+      application/x-protobuf` and the operation has a proto view, else JSON)
     - 400 if the operation terminally failed (the SDK retries 408 and every
       5xx indefinitely, so a failed future MUST return 4xx or clients hang)
-
-    Benefits:
-    - Storage abstraction instead of direct dict access
-    - Proper HTTP status codes matching Tinker API spec
-    - Cleaner error handling
-    - Request ID in path for RESTful design
     """
     # Smart logging for polling operations
     if request_id not in poll_tracking:
@@ -100,7 +114,9 @@ async def retrieve_future(
     if not future:
         raise HTTPException(status_code=404, detail=f"Future {request_id} not found")
 
-    def _respond(fut: Dict[str, Any]):
+    accept = http_request.headers.get("accept", "")
+
+    async def _respond(fut: Dict[str, Any]):
         """Terminal-status dispatch (completed -> 200, failed -> 400)."""
         if fut["status"] == "completed":
             if request_id in poll_tracking:
@@ -110,8 +126,7 @@ async def retrieve_future(
                     f"[retrieve_future] {request_id} completed: "
                     f"{stats['count']} polls over {duration:.2f}s"
                 )
-            # Return 200 with result data only (matching original API)
-            return JSONResponse(content=fut.get("result", {}))
+            return await _completed_response(fut, accept, futures_storage)
 
         if request_id in poll_tracking:
             stats = poll_tracking.pop(request_id)
@@ -133,7 +148,7 @@ async def retrieve_future(
         raise HTTPException(status_code=400, detail=error or "Operation failed")
 
     if future["status"] != "pending":
-        return _respond(future)
+        return await _respond(future)
 
     # Pending: long-poll on the operation's task, then re-check once. The
     # registry is class-level, so a fresh TaskManager sees tasks created by
@@ -149,28 +164,22 @@ async def retrieve_future(
             pass  # task errors are recorded in storage as status=failed
     refreshed = futures_storage.get_future(request_id)
     if refreshed and refreshed["status"] != "pending":
-        return _respond(refreshed)
+        return await _respond(refreshed)
     raise HTTPException(status_code=408, detail="Operation still in progress")
 
 
 @router.post("/api/v1/retrieve_future")
 async def retrieve_future_body(
     request: RetrieveFutureRequest,
+    http_request: Request,
     _: None = Depends(verify_api_key_dep),
     futures_storage: FuturesStorage = Depends(get_futures_storage),
     poll_tracking: Dict[str, Dict[str, Any]] = Depends(get_poll_tracking)
 ):
-    """
-    Retrieve future (body version for backward compatibility).
-
-    Returns:
-    - 408 (Request Timeout) if operation is still running
-    - 200 with result if completed successfully
-    - 400 if the operation terminally failed
-    """
-    # Delegate to the path-based version which implements the correct behavior
+    """Retrieve future by request body (the form the SDK uses); same contract as the path form."""
     return await retrieve_future(
         request.request_id,
+        http_request,
         _,
         futures_storage,
         poll_tracking

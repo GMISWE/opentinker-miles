@@ -4,9 +4,13 @@ Request models for the training API.
 This module defines Pydantic models for all API request payloads,
 providing validation and documentation.
 """
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field, validator, model_validator
+
+# loss_fn_config values: numbers, or text on the keys core.loss_registry declares
+# as text (the SDK's loss_fn_config_v2 carries both).
+LossFnConfig = Dict[str, Union[float, str]]
 
 
 class LoraConfig(BaseModel):
@@ -166,6 +170,8 @@ class RetrieveFutureRequest(BaseModel):
     """Request to retrieve async operation result."""
 
     request_id: str = Field(..., description="Request ID to retrieve")
+    # SDK >= 0.25 sends this; results are always returned inline, so it is accepted and ignored.
+    allow_metadata_only: bool = Field(default=False, description="Accepted for SDK compatibility; no effect")
 
 
 class SamplingParams(BaseModel):
@@ -292,7 +298,7 @@ class ForwardInput(BaseModel):
     """Batch of forward data."""
     data: List[ForwardDatum] = Field(..., description="Batch data")
     loss_fn: str = Field(default="cross_entropy", description="Loss function")
-    loss_fn_config: Optional[Dict[str, float]] = Field(default=None, description="Loss hyperparameters (see core.loss_registry)")
+    loss_fn_config: Optional[LossFnConfig] = Field(default=None, description="Loss hyperparameters (see core.loss_registry)")
 
 
 class ForwardBackwardDatum(BaseModel):
@@ -305,7 +311,7 @@ class ForwardBackwardInput(BaseModel):
     """Batch of forward_backward data."""
     data: List[ForwardBackwardDatum] = Field(..., description="Batch data")
     loss_fn: str = Field(default="cross_entropy", description="Loss function name (see core.loss_registry)")
-    loss_fn_config: Optional[Dict[str, float]] = Field(default=None, description="Loss hyperparameters (see core.loss_registry)")
+    loss_fn_config: Optional[LossFnConfig] = Field(default=None, description="Loss hyperparameters (see core.loss_registry)")
 
 
 # ============= Sampling Models =============

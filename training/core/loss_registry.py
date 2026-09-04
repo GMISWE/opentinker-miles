@@ -6,7 +6,7 @@ misspelt name or a stray key never silently degrades to a default.
 Per-backend support is declared on TrainingBackend.SUPPORTED_LOSS_FNS and
 checked by TrainingService.
 """
-from typing import Dict, FrozenSet, Mapping, Optional
+from typing import Any, Dict, FrozenSet, Mapping, Optional
 
 CLIP_KEYS = frozenset({"clip_low_threshold", "clip_high_threshold"})
 
@@ -20,21 +20,30 @@ LOSS_FNS: Dict[str, FrozenSet[str]] = {
     "classification_ce": frozenset(),
 }
 
+# name -> the subset of its keys whose value is text rather than a number
+# (the SDK's loss_fn_config_v2 can carry strings; every current key is numeric).
+TEXT_KEYS: Dict[str, FrozenSet[str]] = {}
+
 # Tinker's documented PPO/CISPO defaults (epsilon 0.2 either side).
 DEFAULT_CLIP_LOW = 0.8
 DEFAULT_CLIP_HIGH = 1.2
 
 
-def validate(loss_fn: str, loss_fn_config: Optional[Mapping[str, float]] = None) -> None:
-    """Raise ValueError if `loss_fn` is unknown or `loss_fn_config` carries a key it does not take."""
+def validate(loss_fn: str, loss_fn_config: Optional[Mapping[str, Any]] = None) -> None:
+    """Raise ValueError if `loss_fn` is unknown or `loss_fn_config` carries a key it does not take
+    (or a value of the wrong kind for the key)."""
     allowed = LOSS_FNS.get(loss_fn)
     if allowed is None:
         raise ValueError(f"Unknown loss_fn {loss_fn!r}; supported: {', '.join(sorted(LOSS_FNS))}")
+    text_keys = TEXT_KEYS.get(loss_fn, frozenset())
     for key, value in (loss_fn_config or {}).items():
         if key not in allowed:
             take = f"takes {', '.join(sorted(allowed))}" if allowed else "takes no loss_fn_config"
             raise ValueError(f"loss_fn_config key {key!r} is not valid for {loss_fn!r} ({take})")
-        if not isinstance(value, (int, float)) or isinstance(value, bool):
+        if key in text_keys:
+            if not isinstance(value, str):
+                raise ValueError(f"loss_fn_config[{key!r}] must be text, got {type(value).__name__}")
+        elif not isinstance(value, (int, float)) or isinstance(value, bool):
             raise ValueError(f"loss_fn_config[{key!r}] must be a number, got {type(value).__name__}")
     if loss_fn_config and CLIP_KEYS & set(loss_fn_config):
         low = loss_fn_config.get("clip_low_threshold", DEFAULT_CLIP_LOW)

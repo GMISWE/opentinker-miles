@@ -80,6 +80,11 @@ class Server:
             return []
         return [json.loads(line) for line in self.trace_path.read_text().splitlines() if line.strip()]
 
+    def post_raw(self, path: str, data: bytes, headers: dict, key: str | None = API_KEY, timeout: float = 30):
+        """POST a prepared body (proto / zstd) with explicit headers."""
+        h = {"X-API-Key": key, **headers} if key else dict(headers)
+        return requests.post(self.base_url + path, data=data, headers=h, timeout=timeout)
+
     def post(self, path: str, body: dict, key: str | None = API_KEY, **kw):
         headers = {"X-API-Key": key} if key else {}
         return requests.post(self.base_url + path, json=body, headers=headers, timeout=kw.pop("timeout", 30))

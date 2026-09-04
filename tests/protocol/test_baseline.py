@@ -1,4 +1,5 @@
 """Regression floor: the plain SDK training loop must work before any protocol change lands."""
+import pytest
 from tinker import types
 
 from .conftest import make_datum
@@ -14,14 +15,14 @@ def test_train_save_unload(service_client, server):
     fb_out = fb.result()
     op_out = op.result()
 
-    # one logprob per model_input token, deterministic values
+    # one logprob per model_input token, deterministic values (float32 on the proto wire)
     assert len(fb_out.loss_fn_outputs) == 2
-    lp = fb_out.loss_fn_outputs[0]["logprobs"].data
-    assert lp == [-(t % 7) / 7.0 for t in tokens[:-1]]
+    lp = list(fb_out.loss_fn_outputs[0]["logprobs"].data)
+    assert lp == pytest.approx([-(t % 7) / 7.0 for t in tokens[:-1]], rel=1e-6)
     assert op_out.metrics["grad_norm"] == 1.0  # first optimizer step on this model
 
     fwd = tc.forward([make_datum(tokens)], "cross_entropy").result()
-    assert fwd.loss_fn_outputs[0]["logprobs"].data == lp
+    assert list(fwd.loss_fn_outputs[0]["logprobs"].data) == lp
 
     path = tc.save_state("baseline").result().path
     assert path == f"tinker://{tc.model_id}/weights/baseline"
@@ -47,8 +48,10 @@ def test_load_from_state_round_trips_weights(service_client, server):
 
     tc2 = service_client.create_training_client_from_state(path)
     assert tc2.model_id != tc.model_id
-    created = [t for t in server.trace() if t["op"] == "create_model" and t["model_id"] == tc2.model_id]
-    assert created and created[0]["checkpoint_path"] == path
+    # the fork SDK creates with checkpoint_path; upstream creates, then load_weights
+    mine = [t for t in server.trace() if t["model_id"] == tc2.model_id]
+    created = [t for t in mine if t["op"] == "create_model"]
+    assert created and (created[0]["checkpoint_path"] == path or "load_checkpoint" in [t["op"] for t in mine])
     # the loaded model continues from the saved weights: w = 0.25 * 1 pending microbatch
     op = tc2.optim_step(types.AdamParams(learning_rate=0.0)).result()
     assert op.metrics["fake_w"] == 0.25
