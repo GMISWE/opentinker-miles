@@ -19,6 +19,7 @@ Narrative: specs/006-verl-backend/design.md.
 """
 import asyncio
 import logging
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -26,11 +27,10 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from ..base import BackendError, BackendHandle, TrainingBackend, UnsupportedFeatureError
-from ..checkpoint_interchange import (
+from ...checkpoints.interchange import (
     HF_ADAPTER_DIRNAME,
     find_hf_adapter,
     read_adapter_config,
-    resolve_checkpoint_root,
 )
 
 logger = logging.getLogger(__name__)
@@ -105,7 +105,7 @@ class VerlBackend(TrainingBackend):
         rl_config: Optional[Dict[str, Any]] = None,
         rollout_config: Optional[Dict[str, Any]] = None,
         debug_train_only: bool = False,
-        checkpoint_path: Optional[str] = None,
+        resume_from: Optional[Path] = None,
         max_batch_size: int = 4096,
         max_seq_len: int = 2048,
         rlve_config: Optional[Dict[str, Any]] = None,
@@ -114,6 +114,7 @@ class VerlBackend(TrainingBackend):
         objective: str = "language_modeling",
         num_labels: Optional[int] = None,
         head_config: Optional[Dict[str, Any]] = None,
+        native_root: Optional[Path] = None,
     ) -> VerlHandle:
         if staleness_k > 0:
             # verl's sync is already lazy but version-gated to staleness 0 at
@@ -140,8 +141,8 @@ class VerlBackend(TrainingBackend):
             # path wraps the module BEFORE FSDP, so it cannot be a post-boot
             # load_checkpoint. Native verl shards still resume that way.
             adapter_dir = None
-            if checkpoint_path:
-                ckpt_root = resolve_checkpoint_root(checkpoint_path)
+            if resume_from:
+                ckpt_root = str(resume_from)
                 adapter_dir = find_hf_adapter(ckpt_root)
                 if adapter_dir:
                     cfg["model"]["lora_adapter_path"] = adapter_dir
@@ -169,8 +170,8 @@ class VerlBackend(TrainingBackend):
                 rollout_synced_version=0 if enable_rollout else -1,
                 lora_rank=int(cfg["model"]["lora_rank"] or 0),
             )
-            if checkpoint_path and adapter_dir is None:
-                await self.load_checkpoint(handle, checkpoint_path)
+            if resume_from and adapter_dir is None:
+                await self.load_checkpoint(handle, resume_from)
             logger.info(
                 "[%s] verl model %s created (dp=%d, rollout=%s, adapter=%s)",
                 request_id, model_id, handle.dp_size, enable_rollout, adapter_dir,
@@ -301,16 +302,19 @@ class VerlBackend(TrainingBackend):
     async def save_checkpoint(
         self,
         handle: BackendHandle,
-        checkpoint_path: str,
-        step_id: Optional[int] = None,
-    ) -> str:
+        root: Path,
+        step: Optional[int] = None,
+        persist: bool = True,
+    ) -> None:
         h: VerlHandle = handle  # type: ignore[assignment]
+        if not persist:
+            return  # ephemeral sampler save: the engines already hold the weights
         async with h._lock:
             try:
                 await self._quiesce_samplers(h)
-                local_path = resolve_checkpoint_root(checkpoint_path, create=True)
+                local_path = str(root)
                 await asyncio.to_thread(
-                    h.worker_group.save_checkpoint, local_path, None, step_id or h.weight_version,
+                    h.worker_group.save_checkpoint, local_path, None, step or h.weight_version,
                 )
                 if h.lora_rank > 0:
                     # verl writes FSDP-sharded .pt only; no PEFT export path
@@ -321,11 +325,10 @@ class VerlBackend(TrainingBackend):
                         "usable for verl resume, not for cross-backend migration",
                         local_path, HF_ADAPTER_DIRNAME,
                     )
-                return checkpoint_path
             except Exception as e:
                 raise BackendError(str(e), backend="verl", operation="save_checkpoint", original_error=e) from e
 
-    async def load_checkpoint(self, handle: BackendHandle, checkpoint_path: str,
+    async def load_checkpoint(self, handle: BackendHandle, root: Path,
                               optimizer: bool = False) -> None:
         h: VerlHandle = handle  # type: ignore[assignment]
         if optimizer:
@@ -334,7 +337,7 @@ class VerlBackend(TrainingBackend):
         async with h._lock:
             try:
                 await self._quiesce_samplers(h)
-                local_path = resolve_checkpoint_root(checkpoint_path)
+                local_path = str(root)
                 if find_hf_adapter(local_path):
                     # PeftModel.from_pretrained wraps pre-FSDP: only create_model
                     # can attach an interchange adapter.

@@ -133,7 +133,8 @@ PYTHONPATH=/root/gavin/miles:/root/gavin/tinker-cookbook pytest tests/test_advan
 | `test_ordering.py` | Per-model program order and barrier semantics (unit) |
 | `test_backend_interface.py` | Backend ABC signature contract for every `SUPPORTED_BACKENDS` entry |
 | `test_loss_registry.py` | `loss_fn` / `loss_fn_config` validation |
-| `test_checkpoint_interchange.py` | Checkpoint URI <-> root resolution |
+| `test_checkpoint_store.py` | Checkpoint identity <-> directory, save counter, pending/completed/failed records |
+| `test_checkpoint_interchange.py` | Cross-backend HF PEFT adapter publish/stage |
 | `cleanup_test_env.py` | Cleanup script to free GPUs before tests |
 | `test_e2e_nemo_rl.sh` | Bash smoke test of the seven core operations against a live server |
 | `test_classification_backend_harness.py` | Classification backends (004) harness, GPU-free |

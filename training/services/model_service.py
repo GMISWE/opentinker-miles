@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 
 from ..backends.base import TrainingBackend, BackendHandle
+from ..checkpoints import CheckpointStore
 from ..storage import MetadataStorage
 from ..utils.model_config import extract_model_name, detect_architecture, detect_num_gpus
 
@@ -24,8 +25,9 @@ logger = logging.getLogger(__name__)
 class ModelService:
     """Service for managing ML model lifecycle and resources."""
 
-    def __init__(self, backend: TrainingBackend):
+    def __init__(self, backend: TrainingBackend, store: CheckpointStore):
         self.backend = backend
+        self.store = store
 
     async def create_model(
         self,
@@ -60,6 +62,11 @@ class ModelService:
         if parallelism_config:
             num_gpus = parallelism_config.get("num_gpus", num_gpus)
 
+        # The URI is an identity; the backend gets the resolved directory of a
+        # completed weights checkpoint, and its own private area for this model.
+        resume_from = self.store.resolve_resume(checkpoint_path) if checkpoint_path else None
+        native_root = self.store.native_root(model_id)
+
         # Delegate to backend. The objective axis (feature 004) is forwarded so
         # classification backends can stand up a classification head; LM-only
         # backends reject non-LM objectives. See specs/004-bionemo-classification.
@@ -71,7 +78,8 @@ class ModelService:
             lora_config=lora_config,
             parallelism=parallelism_config,
             debug_train_only=debug_train_only,
-            checkpoint_path=checkpoint_path,
+            resume_from=resume_from,
+            native_root=native_root,
             max_batch_size=max_batch_size,
             max_seq_len=max_seq_len,
             rlve_config=rlve_config,
@@ -159,6 +167,9 @@ class ModelService:
             self._legacy_delete(client_info)
 
         del training_clients[model_id]
+        # ephemeral sampler records die with the model; persistent checkpoints
+        # and the native area stay for a later resume
+        self.store.release_model(model_id)
 
         if "training_run_id" in client_info:
             metadata_storage.update_training_run(

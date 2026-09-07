@@ -174,9 +174,11 @@ def _offline_adapter_logprobs(adapter_dir: str, probe: list[list[int]]) -> list[
 
 def _resolve_local(path: str) -> str:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-    from training.backends.checkpoint_interchange import find_hf_adapter, resolve_checkpoint_root
+    from training.checkpoints import CheckpointRef, CheckpointStore
+    from training.checkpoints.interchange import find_hf_adapter
+    from training.config import get_config
 
-    root = resolve_checkpoint_root(path)
+    root = str(CheckpointStore(get_config().storage.checkpoint_base, metadata=None).root(CheckpointRef.parse(path)))
     adapter = find_hf_adapter(root)
     if adapter is None:
         raise SystemExit(

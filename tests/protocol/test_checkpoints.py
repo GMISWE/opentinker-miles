@@ -29,7 +29,7 @@ def test_list_and_delete(service_client, server):
     assert server.post("/api/v1/weights_info", {"tinker_path": p}).status_code == 200
     # bytes are gone for the deleted kind only
     assert not (server.checkpoint_base / tc.model_id / "sampler_weights" / "c1").exists()
-    assert (server.checkpoint_base / tc.model_id / "c1").exists()
+    assert (server.checkpoint_base / tc.model_id / "weights" / "c1").exists()
 
     assert _delete(server, tc.model_id, "c1", checkpoint_type="training").status_code == 204
     assert rest.list_checkpoints(tc.model_id).result().checkpoints == []
@@ -97,7 +97,7 @@ def test_load_weights_honours_the_optimizer_flag(service_client, server):
 
     # a checkpoint that carries no optimizer state: weights-only fine, with-optimizer refused
     import json
-    state = server.checkpoint_base / src.model_id / "opt" / "fake_state.json"
+    state = server.checkpoint_base / src.model_id / "weights" / "opt" / "fake_state.json"
     st = json.loads(state.read_text())
     st.pop("optimizer")
     state.write_text(json.dumps(st))
@@ -106,3 +106,52 @@ def test_load_weights_honours_the_optimizer_flag(service_client, server):
     assert fut.status_code == 400 and "no optimizer state" in fut.text, fut.text
     fresh2 = service_client.create_lora_training_client(base_model="fake/tiny", rank=2)
     assert load(fresh2.model_id, False).status_code == 200
+
+
+def test_a_save_in_flight_is_pending_not_missing(service_client, server):
+    """weights_info / load_weights on a checkpoint whose save has not returned
+    answer 425, never 404; the record exists before the bytes do."""
+    import time
+    tc = service_client.create_lora_training_client(base_model="fake/tiny", rank=2)
+    fut = tc.save_state("slow-one")                       # the fake writes slow-* after a delay
+    p = f"tinker://{tc.model_id}/weights/slow-one"
+    seen = None
+    for _ in range(40):
+        seen = server.post("/api/v1/weights_info", {"tinker_path": p}).status_code
+        if seen == 425:
+            break
+        time.sleep(0.05)
+    assert seen == 425
+    assert fut.result().path == p
+    assert server.post("/api/v1/weights_info", {"tinker_path": p}).status_code == 200
+
+
+def test_kind_and_shape_are_checked_at_admission(service_client, server):
+    tc = service_client.create_lora_training_client(base_model="fake/tiny", rank=2)
+    sp = tc.save_weights_for_sampler("k1").result().path
+    fresh = service_client.create_lora_training_client(base_model="fake/tiny", rank=2)
+    # a sampler checkpoint is not a training resume
+    r = server.post("/api/v1/load_weights", {"model_id": fresh.model_id, "path": sp, "optimizer": False, "seq_id": 1001})
+    assert r.status_code == 400 and "weights required" in r.json()["error"], r.text
+    # only the tinker://<model>/<kind>/<name> grammar exists
+    for bad in ("/data/checkpoints/x", f"tinker://{tc.model_id}", f"tinker://{tc.model_id}/weights/a/b",
+                f"tinker://{tc.model_id}/native/x"):
+        assert server.post("/api/v1/weights_info", {"tinker_path": bad}).status_code == 400, bad
+        r = server.post("/api/v1/load_weights", {"model_id": fresh.model_id, "path": bad, "optimizer": False})
+        assert r.status_code == 400, (bad, r.text)
+
+
+def test_sampler_from_a_checkpoint_path_is_pinned_to_its_version(service_client, server):
+    """A sampling client built from a sampler_weights path serves the weight
+    version that checkpoint was saved at, not the live weights."""
+    tc = service_client.create_lora_training_client(base_model="fake/tiny", rank=2)
+    tc.forward_backward([make_datum([1, 2, 3])], "cross_entropy")
+    tc.optim_step(types.AdamParams(learning_rate=0.5)).result()          # version 1
+    sp = tc.save_weights_for_sampler("v1").result().path
+    tc.forward_backward([make_datum([1, 2, 3])], "cross_entropy")
+    tc.optim_step(types.AdamParams(learning_rate=0.5)).result()          # live is version 2
+    sc = service_client.create_sampling_client(model_path=sp)
+    sc.sample(prompt=types.ModelInput.from_ints([1, 2]), num_samples=1,
+              sampling_params=types.SamplingParams(max_tokens=2)).result()
+    pinned = [t["pinned_version"] for t in server.trace() if t["op"] == "sample" and t["model_id"] == tc.model_id]
+    assert pinned and pinned[-1] == 1, pinned

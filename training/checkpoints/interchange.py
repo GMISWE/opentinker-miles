@@ -9,7 +9,9 @@ checkpoint::
 
 Every backend writes it on save_checkpoint and reads it on resume, so a
 program can move between engines; native formats stay for same-backend
-fast resume. Design + measured seam gates: specs/007-q5-migration/HANDOFF.md.
+fast resume. Where a checkpoint root lives is the store's business
+(training/checkpoints/store.py); this module only knows the adapter's shape
+inside a root. Design + measured seam gates: specs/007-q5-migration/HANDOFF.md.
 """
 import json
 import logging
@@ -19,33 +21,10 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-CHECKPOINT_BASE = os.getenv("TINKERCLOUD_CHECKPOINT_BASE", "/data/checkpoints")
 HF_ADAPTER_DIRNAME = "hf_adapter"
 ADAPTER_WEIGHTS_FILE = "adapter_model.safetensors"
 ADAPTER_WEIGHTS_TORCH_FILE = "adapter_model.bin"
 ADAPTER_CONFIG_FILE = "adapter_config.json"
-
-
-def resolve_checkpoint_root(path: str, create: bool = False) -> str:
-    """tinker://<run_id>/weights/<name> -> <CHECKPOINT_BASE>/<run_id>/<name>;
-    tinker://<run_id>/sampler_weights/<name> -> <CHECKPOINT_BASE>/<run_id>/sampler_weights/<name>.
-
-    Filesystem paths pass through. Mirrors the URI shapes minted by
-    CheckpointService.save_weights / save_weights_for_sampler.
-    """
-    if path.startswith("tinker://"):
-        parts = path[len("tinker://"):].split("/")
-        run_id = parts[0]
-        name = parts[-1] if len(parts) > 2 else "default"
-        if len(parts) > 2 and parts[1] == "sampler_weights":
-            local = os.path.join(CHECKPOINT_BASE, run_id, "sampler_weights", name)
-        else:
-            local = os.path.join(CHECKPOINT_BASE, run_id, name)
-    else:
-        local = path
-    if create:
-        os.makedirs(local, exist_ok=True)
-    return local
 
 
 def hf_adapter_dir(checkpoint_root: str) -> str:

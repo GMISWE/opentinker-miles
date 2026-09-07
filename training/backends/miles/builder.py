@@ -14,7 +14,6 @@ from .model_setup import (
     auto_detect_all_parallelism,
     compute_sglang_mem_fraction,
     detect_torch_dist_path,
-    resolve_native_checkpoint,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,7 +38,8 @@ class MilesArgumentBuilder(ArgumentBuilder):
         base_model: str,
         lora_config: Optional[Dict[str, Any]] = None,
         debug_train_only: bool = False,
-        checkpoint_path: Optional[str] = None,
+        load_dir: Optional[str] = None,
+        save_dir: Optional[str] = None,
         parallelism_config: Optional[Dict] = None,
         max_batch_size: int = 4096,
         max_seq_len: int = 2048,
@@ -56,7 +56,9 @@ class MilesArgumentBuilder(ArgumentBuilder):
             base_model: Path to model (can be torch_dist format)
             lora_config: LoRA configuration dict
             debug_train_only: If True, skip update_weights() to avoid SGLang cache flush
-            checkpoint_path: If provided, load from this checkpoint
+            load_dir: Megatron directory to load weights (only) from at create
+            save_dir: Megatron --save root for this model (its native area);
+                default_save_dir when not given
             parallelism_config: Optional parallelism config (TP, PP, num_gpus)
             max_batch_size: Max batch size for forward_backward (avoids gradient accumulation)
             rlve_config: Optional RLVE configuration (enables server-side RLVE)
@@ -142,6 +144,7 @@ class MilesArgumentBuilder(ArgumentBuilder):
             rlve_config=rlve_config,
             multi_lora_slots=multi_lora_slots,
             lora_config=lora_config,
+            save_dir=save_dir,
         )
 
         # Parse args to get Slime defaults
@@ -154,9 +157,10 @@ class MilesArgumentBuilder(ArgumentBuilder):
             megatron_checkpoint_path,
             lora_config,
             debug_train_only,
-            checkpoint_path,
+            load_dir,
             model_config,
             parallel_config,
+            save_dir=save_dir,
             rlve_config=rlve_config,
             wandb_config=wandb_config,
             multi_lora_slots=multi_lora_slots,
@@ -179,6 +183,7 @@ class MilesArgumentBuilder(ArgumentBuilder):
         rlve_config: Optional[Dict[str, Any]] = None,
         multi_lora_slots: int = 0,
         lora_config: Optional[Dict[str, Any]] = None,
+        save_dir: Optional[str] = None,
     ) -> list:
         """Build minimal CLI arguments for Slime's parse_args."""
         # Check if RLVE mode is enabled
@@ -271,7 +276,7 @@ class MilesArgumentBuilder(ArgumentBuilder):
             # the fallback logic can set args.load = args.ref_load when no
             # checkpoint resume is specified (see miles/utils/arguments.py:1452-1460)
             '--ref-load', megatron_checkpoint_path,
-            '--save', self.default_save_dir,
+            '--save', save_dir or self.default_save_dir,
             # Pool mode: save_due_adapter_checkpoints only writes adapters at a
             # save-interval multiple, and the interval lives on the ACTORS' args
             # copy — interval 1 makes the client's save_state the trigger (saves
@@ -387,9 +392,10 @@ class MilesArgumentBuilder(ArgumentBuilder):
         megatron_checkpoint_path: str,
         lora_config: Dict,
         debug_train_only: bool,
-        checkpoint_path: Optional[str],
+        load_dir: Optional[str],
         model_config: Dict[str, Any],
         parallel_config: Dict[str, int],
+        save_dir: Optional[str] = None,
         rlve_config: Optional[Dict[str, Any]] = None,
         wandb_config: Optional[Dict[str, Any]] = None,
         multi_lora_slots: int = 0,
@@ -412,13 +418,15 @@ class MilesArgumentBuilder(ArgumentBuilder):
         # Checkpoint paths
         args.pretrained_checkpoint = megatron_checkpoint_path
         args.ref_load = megatron_checkpoint_path
-        args.save = self.default_save_dir
+        # every model saves under its own root (the store's native area for
+        # it), so counter-numbered iter_* dirs of different models never collide
+        args.save = save_dir or self.default_save_dir
 
-        # create_model(checkpoint_path) is a weights-only load by contract: a
+        # create_model(resume_from) is a weights-only load by contract: a
         # fresh optimizer, RNG and iteration count. Without these Megatron's
         # --load is a full resume. load_weights(optimizer=true) is the resume path.
-        if checkpoint_path:
-            args.load = resolve_native_checkpoint(checkpoint_path, args.save)
+        if load_dir:
+            args.load = load_dir
             args.no_load_optim = True
             args.no_load_rng = True
             args.finetune = True

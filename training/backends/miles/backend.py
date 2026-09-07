@@ -19,37 +19,34 @@ import ray
 from ..base import BackendError, BackendHandle, TrainingBackend, UnsupportedFeatureError
 from .config import MilesConfig
 from ...core.loss_registry import clip_thresholds
-from ..checkpoint_interchange import (
-    CHECKPOINT_BASE,
-    export_hf_adapter,
-    resolve_checkpoint_root,
-)
+from ...checkpoints.interchange import export_hf_adapter
 from .model_setup import record_native_checkpoint, resolve_native_checkpoint
 
 logger = logging.getLogger(__name__)
-
-_ADAPTER_CHECKPOINT_BASE = os.path.join(CHECKPOINT_BASE, "adapters")
-
 
 def _dp_size(args: Any) -> int:
     """Data-parallel width the actors will split a batch across."""
     return int(getattr(args, "data_parallel_size", 1) or 1)
 
 
-def _adapter_save_dir(adapter_name: str) -> Path:
-    """Per-tenant dir miles writes adapter checkpoints into. Without it
-    (config.save=None) miles skips per-adapter checkpoints entirely.
+def _adapter_save_dir(native_root: Optional[Path], adapter_name: str) -> Path:
+    """Per-tenant dir miles writes adapter checkpoints into, under the model's
+    own native area. Without it (config.save=None) miles skips per-adapter
+    checkpoints entirely.
 
     Path, not str: TinkerAdapterConfig.save is annotated `str | Path | None`
     but miles only ever does `config.save / "checkpoints"` — a str explodes
     at adapter registration (declared type wider than the honored one).
     """
-    return Path(_ADAPTER_CHECKPOINT_BASE) / adapter_name
+    if native_root is None:
+        raise BackendError("create_model needs native_root for the adapter save dir",
+                           backend="miles", operation="create_model")
+    return Path(native_root) / "adapters" / adapter_name
 
 
-def _publish_adapter(adapter_save_dir: Path, checkpoint_path: str, adapter_name: Optional[str]) -> None:
+def _publish_adapter(adapter_save_dir: Path, root: str, adapter_name: Optional[str]) -> None:
     """Copy the newest per-adapter HF PEFT pair miles wrote into the
-    cross-backend interchange dir (specs/007 §2.1)."""
+    cross-backend interchange dir under the checkpoint root (specs/007 §2.1)."""
     ckpt_root = os.path.join(adapter_save_dir, "checkpoints")
     if not os.path.isdir(ckpt_root):
         logger.warning("Adapter %s: no checkpoints under %s to publish", adapter_name, ckpt_root)
@@ -59,12 +56,10 @@ def _publish_adapter(adapter_save_dir: Path, checkpoint_path: str, adapter_name:
         logger.warning("Adapter %s: no step_* checkpoint in %s", adapter_name, ckpt_root)
         return
     latest = max(steps, key=lambda d: int(d[5:]))
-    export_hf_adapter(
-        os.path.join(ckpt_root, latest), resolve_checkpoint_root(checkpoint_path, create=True),
-    )
+    export_hf_adapter(os.path.join(ckpt_root, latest), root)
 
 
-def _publish_native_adapter(args, checkpoint_path: str) -> None:
+def _publish_native_adapter(args, root: str) -> None:
     """Single-tenant publish: miles' save_model writes the PEFT pair only into
     its native `<args.save>/iter_*/adapter` dir (as `adapter_model.bin` — the
     fused-QKV lora_A aliasing makes safetensors refuse), and nothing exported
@@ -87,9 +82,9 @@ def _publish_native_adapter(args, checkpoint_path: str) -> None:
         logger.warning("No iter_*/adapter under %s; nothing to publish", save_root)
         return
     latest = max(candidates, key=os.path.getmtime)
-    export_hf_adapter(latest, resolve_checkpoint_root(checkpoint_path, create=True))
+    export_hf_adapter(latest, root)
     # the iter_* dir this adapter came from is what a resume must hand Megatron
-    record_native_checkpoint(checkpoint_path, os.path.dirname(latest))
+    record_native_checkpoint(root, os.path.dirname(latest))
 
 
 def _model_input_lens(data: List[Any]) -> List[int]:
@@ -259,7 +254,7 @@ class MilesBackend(TrainingBackend):
         rl_config: Optional[Dict[str, Any]] = None,
         rollout_config: Optional[Dict[str, Any]] = None,
         debug_train_only: bool = False,
-        checkpoint_path: Optional[str] = None,
+        resume_from: Optional[Path] = None,
         max_batch_size: int = 4096,
         max_seq_len: int = 2048,
         rlve_config: Optional[Dict[str, Any]] = None,
@@ -268,6 +263,7 @@ class MilesBackend(TrainingBackend):
         staleness_k: int = 0,
         num_labels: Optional[int] = None,
         head_config: Optional[Dict[str, Any]] = None,
+        native_root: Optional[Path] = None,
     ) -> MilesHandle:
         if staleness_k > 0:
             # A staleness declaration is a permission (served staleness <= k), so
@@ -281,10 +277,11 @@ class MilesBackend(TrainingBackend):
             model_id=model_id, request_id=request_id, base_model=base_model,
             num_gpus=num_gpus, lora_config=lora_config, parallelism=parallelism,
             rl_config=rl_config, rollout_config=rollout_config,
-            debug_train_only=debug_train_only, checkpoint_path=checkpoint_path,
+            debug_train_only=debug_train_only, resume_from=resume_from,
             max_batch_size=max_batch_size, max_seq_len=max_seq_len,
             rlve_config=rlve_config, wandb_config=wandb_config,
             objective=objective, num_labels=num_labels, head_config=head_config,
+            native_root=native_root,
         )
         # Mirror the builder's pool gate (configured slots + LoRA rank).
         slots = self.config.multilora_slots
@@ -297,7 +294,8 @@ class MilesBackend(TrainingBackend):
                     model_id=model_id, request_id=request_id,
                     base_model=base_model, lora_config=lora_config,
                     debug_train_only=debug_train_only,
-                    checkpoint_path=checkpoint_path, rlve_config=rlve_config,
+                    resume_from=resume_from, rlve_config=rlve_config,
+                    native_root=native_root,
                     objective=objective,
                 )
             return await self._boot_model(**boot_kwargs)
@@ -309,9 +307,10 @@ class MilesBackend(TrainingBackend):
         base_model: str,
         lora_config: Dict[str, Any],
         debug_train_only: bool,
-        checkpoint_path: Optional[str],
+        resume_from: Optional[Path],
         rlve_config: Optional[Dict[str, Any]],
         objective: str,
+        native_root: Optional[Path] = None,
     ) -> MilesHandle:
         """Register a new tenant adapter into the live pool (caller holds
         _pool_admin). The pool's boot args govern parallelism/batch shape;
@@ -334,7 +333,7 @@ class MilesBackend(TrainingBackend):
                 "Multi-LoRA pool mode supports neither debug_train_only nor RLVE",
                 backend="miles", operation="create_model",
             )
-        if checkpoint_path:
+        if resume_from:
             raise BackendError(
                 "Resuming from a checkpoint into a multi-LoRA pool is not "
                 "supported yet (adapter-scoped resume unimplemented)",
@@ -347,7 +346,7 @@ class MilesBackend(TrainingBackend):
         rank = int(lora_config.get("rank", 0))
         alpha = int(lora_config.get("alpha") or rank)
         adapter_name = re.sub(r"[^A-Za-z0-9._-]", "-", model_id)
-        adapter_save_dir = _adapter_save_dir(adapter_name)
+        adapter_save_dir = _adapter_save_dir(native_root, adapter_name)
         try:
             registration = await pool.controller.register_adapter.remote(
                 adapter_name,
@@ -421,7 +420,7 @@ class MilesBackend(TrainingBackend):
         rl_config: Optional[Dict[str, Any]] = None,
         rollout_config: Optional[Dict[str, Any]] = None,
         debug_train_only: bool = False,
-        checkpoint_path: Optional[str] = None,
+        resume_from: Optional[Path] = None,
         max_batch_size: int = 4096,
         max_seq_len: int = 2048,
         rlve_config: Optional[Dict[str, Any]] = None,
@@ -429,6 +428,7 @@ class MilesBackend(TrainingBackend):
         objective: str = "language_modeling",
         num_labels: Optional[int] = None,
         head_config: Optional[Dict[str, Any]] = None,
+        native_root: Optional[Path] = None,
     ) -> MilesHandle:
         if objective != "language_modeling":
             raise BackendError(
@@ -440,13 +440,21 @@ class MilesBackend(TrainingBackend):
         try:
             logger.info("[%s] Creating Miles model %s", request_id, model_id)
 
+            # The actors take Megatron directories: --load is the iter_* dir
+            # recorded when the checkpoint was published; --save is this
+            # model's own native area, so two models' iter_* never collide.
+            load_dir = resolve_native_checkpoint(str(resume_from)) if resume_from else None
+            if native_root is None:
+                raise BackendError("create_model needs native_root for Megatron --save",
+                                   backend="miles", operation="create_model")
             # Build Slime arguments (blocking — run in thread pool)
             args, hf_path = await asyncio.to_thread(
                 self.builder.build_args,
                 base_model=base_model,
                 lora_config=lora_config,
                 debug_train_only=debug_train_only,
-                checkpoint_path=checkpoint_path,
+                load_dir=load_dir,
+                save_dir=str(native_root),
                 parallelism_config=parallelism,
                 max_batch_size=max_batch_size,
                 max_seq_len=max_seq_len,
@@ -504,7 +512,7 @@ class MilesBackend(TrainingBackend):
                 await controller.start.remote()
 
                 adapter_name = re.sub(r"[^A-Za-z0-9._-]", "-", model_id)
-                adapter_save_dir = _adapter_save_dir(adapter_name)
+                adapter_save_dir = _adapter_save_dir(native_root, adapter_name)
                 registration = await controller.register_adapter.remote(
                     adapter_name,
                     TinkerAdapterConfig(
@@ -588,7 +596,7 @@ class MilesBackend(TrainingBackend):
                 adapter_name=adapter_name,
                 adapter_slot=adapter_slot,
                 adapter_save_dir=adapter_save_dir,
-                created_from_checkpoint=bool(checkpoint_path),
+                created_from_checkpoint=bool(resume_from),
             )
 
             if multi_lora:
@@ -1177,12 +1185,15 @@ class MilesBackend(TrainingBackend):
     async def save_checkpoint(
         self,
         handle: BackendHandle,
-        checkpoint_path: str,
-        step_id: Optional[int] = None,
-    ) -> str:
+        root: Path,
+        step: Optional[int] = None,
+        persist: bool = True,
+    ) -> None:
         h: MilesHandle = handle  # type: ignore[assignment]
+        if not persist:
+            return  # ephemeral sampler save: update_weights already delivered them to SGLang
 
-        async def _run() -> str:
+        async def _run() -> None:
             offload_train = h.args.offload_train if h.args else False
             if offload_train:
                 # Never return a path nothing was written to.
@@ -1203,28 +1214,30 @@ class MilesBackend(TrainingBackend):
                         "Adapter %s has taken no optimizer step; nothing to checkpoint",
                         h.adapter_name,
                     )
-                    return checkpoint_path
+                    return
                 await h.controller.set_adapter_step.remote(h.adapter_name, h.weight_version)
 
-            await h.train_group.save_model(step_id if step_id is not None else 0)
+            await h.train_group.save_model(step if step is not None else 0)
 
             if h.adapter_save_dir:
                 await asyncio.to_thread(
-                    _publish_adapter, h.adapter_save_dir, checkpoint_path, h.adapter_name,
+                    _publish_adapter, h.adapter_save_dir, str(root), h.adapter_name,
                 )
             else:
-                await asyncio.to_thread(_publish_native_adapter, h.args, checkpoint_path)
-            return checkpoint_path
+                await asyncio.to_thread(_publish_native_adapter, h.args, str(root))
 
         try:
             pool = self._pool
             if h.adapter_slot is not None and pool is not None:
-                return await self._pool_run(pool, _run, tenant=h.model_id)
+                await self._pool_run(pool, _run, tenant=h.model_id)
+                return
             await h.lock.acquire()
             try:
-                return await _run()
+                await _run()
             finally:
                 h.lock.release()
+        except BackendError:
+            raise
         except Exception as e:
             raise BackendError(
                 str(e), backend="miles", operation="save_checkpoint", original_error=e,
@@ -1233,7 +1246,7 @@ class MilesBackend(TrainingBackend):
     async def load_checkpoint(
         self,
         handle: BackendHandle,
-        checkpoint_path: str,
+        root: Path,
         optimizer: bool = False,
     ) -> None:
         h: MilesHandle = handle  # type: ignore[assignment]
@@ -1247,9 +1260,9 @@ class MilesBackend(TrainingBackend):
             )
         await h.lock.acquire()
         try:
-            # The actors take Megatron's --load directory, not the tinker:// URI;
-            # resolve it the way the builder does for create_model(checkpoint_path).
-            load_dir = resolve_native_checkpoint(checkpoint_path, h.args.save)
+            # The actors take Megatron's --load directory: the iter_* dir
+            # recorded under the checkpoint root when it was published.
+            load_dir = resolve_native_checkpoint(str(root))
             await h.train_group.load_checkpoint(load_dir, load_optimizer=optimizer)
             h.created_from_checkpoint = True
 
@@ -1257,7 +1270,7 @@ class MilesBackend(TrainingBackend):
             if h.rollout_manager is not None:
                 await h.train_group.update_weights()
 
-            logger.info("Miles checkpoint loaded from %s", checkpoint_path)
+            logger.info("Miles checkpoint loaded from %s", root)
 
         except Exception as e:
             raise BackendError(

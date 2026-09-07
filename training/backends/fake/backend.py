@@ -15,15 +15,16 @@ function of the inputs:
 Set FAKE_BACKEND_TRACE=<path> to append one JSON line per backend call
 ({"op", "model_id", ...args}) — tests read this instead of poking internals.
 """
+import asyncio
 import json
 import logging
 import os
 import random
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..base import BackendError, BackendHandle, TrainingBackend
-from ..checkpoint_interchange import resolve_checkpoint_root
 from ...core.loss_registry import LOSS_FNS
 
 logger = logging.getLogger(__name__)
@@ -94,21 +95,22 @@ class FakeBackend(TrainingBackend):
         self, model_id: str, request_id: str, base_model: str, num_gpus: int,
         lora_config: Optional[Dict[str, Any]] = None, parallelism: Optional[Dict[str, Any]] = None,
         rl_config: Optional[Dict[str, Any]] = None, rollout_config: Optional[Dict[str, Any]] = None,
-        debug_train_only: bool = False, checkpoint_path: Optional[str] = None,
+        debug_train_only: bool = False, resume_from: Optional[Path] = None,
         max_batch_size: int = 4096, max_seq_len: int = 2048,
         rlve_config: Optional[Dict[str, Any]] = None, wandb_config: Optional[Dict[str, Any]] = None,
         staleness_k: int = 0, objective: str = "language_modeling",
         num_labels: Optional[int] = None, head_config: Optional[Dict[str, Any]] = None,
+        native_root: Optional[Path] = None,
     ) -> BackendHandle:
         if objective != "language_modeling":
             raise BackendError(f"objective {objective!r} unsupported", backend="fake", operation="create_model")
         h = FakeHandle(model_id=model_id, backend_type="fake", base_model=base_model,
                        lora_config=lora_config, hf_path=base_model)
-        if checkpoint_path:
-            self._load_into(h, checkpoint_path)
+        if resume_from:
+            self._load_into(h, resume_from)
         self._models[model_id] = h
         self._trace("create_model", model_id, base_model=base_model, lora_config=lora_config,
-                    checkpoint_path=checkpoint_path)
+                    resume_from=resume_from, native_root=native_root)
         return h
 
     async def delete_model(self, handle: BackendHandle) -> None:
@@ -213,34 +215,37 @@ class FakeBackend(TrainingBackend):
         return out
 
     # --- checkpoints -----------------------------------------------------
-    async def save_checkpoint(self, handle: BackendHandle, checkpoint_path: str, step_id: Optional[int] = None) -> str:
+    async def save_checkpoint(self, handle: BackendHandle, root: Path, step: Optional[int] = None,
+                              persist: bool = True) -> None:
         h = self._handle(handle, "save_checkpoint")
-        root = resolve_checkpoint_root(checkpoint_path, create=True)
-        with open(os.path.join(root, STATE_FILE), "w") as f:
-            json.dump({"w": h.w, "weight_version": h.weight_version, "base_model": h.base_model,
-                       "lora_config": h.lora_config, "step_id": step_id,
-                       "optimizer": {"step_count": h.step_count}}, f)
-        self._trace("save_checkpoint", h.model_id, checkpoint_path=checkpoint_path, root=root, step_id=step_id)
-        return checkpoint_path
+        if persist:
+            # a name starting with "slow-" writes slowly, so the protocol suite
+            # can observe the store's pending state (overrides: save_delay_s)
+            if root.name.startswith("slow-"):
+                await asyncio.sleep(float(self.overrides.get("save_delay_s", 1.0)))
+            with open(os.path.join(root, STATE_FILE), "w") as f:
+                json.dump({"w": h.w, "weight_version": h.weight_version, "base_model": h.base_model,
+                           "lora_config": h.lora_config, "step": step,
+                           "optimizer": {"step_count": h.step_count}}, f)
+        self._trace("save_checkpoint", h.model_id, root=str(root), step=step, persist=persist)
 
-    def _load_into(self, h: FakeHandle, checkpoint_path: str, optimizer: bool = False) -> None:
-        root = resolve_checkpoint_root(checkpoint_path)
+    def _load_into(self, h: FakeHandle, root: Path, optimizer: bool = False) -> None:
         path = os.path.join(root, STATE_FILE)
         if not os.path.exists(path):
-            raise BackendError(f"Checkpoint {checkpoint_path} not found at {path}",
+            raise BackendError(f"Checkpoint {root} holds no {STATE_FILE}",
                                backend="fake", operation="load_checkpoint")
         with open(path) as f:
             st = json.load(f)
         if optimizer and "optimizer" not in st:
-            raise BackendError(f"Checkpoint {checkpoint_path} carries no optimizer state",
+            raise BackendError(f"Checkpoint {root} carries no optimizer state",
                                backend="fake", operation="load_checkpoint")
         h.w = st["w"]
         h.weight_version = st["weight_version"]
         if optimizer:
             h.step_count = st["optimizer"]["step_count"]
 
-    async def load_checkpoint(self, handle: BackendHandle, checkpoint_path: str,
+    async def load_checkpoint(self, handle: BackendHandle, root: Path,
                               optimizer: bool = False) -> None:
         h = self._handle(handle, "load_checkpoint")
-        self._load_into(h, checkpoint_path, optimizer=optimizer)
-        self._trace("load_checkpoint", h.model_id, checkpoint_path=checkpoint_path, optimizer=optimizer)
+        self._load_into(h, root, optimizer=optimizer)
+        self._trace("load_checkpoint", h.model_id, root=str(root), optimizer=optimizer)

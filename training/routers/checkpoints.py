@@ -15,7 +15,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from ..services.checkpoint_service import CheckpointService
 from ..services.session_service import SessionService
 from ..core.task_manager import TaskManager
-from ..core.dependencies import verify_api_key_dep
+from ..core.dependencies import verify_api_key_dep, get_checkpoint_store
+from ..checkpoints import CheckpointKind, CheckpointRef, CheckpointStore
 from ..storage import MetadataStorage, FuturesStorage
 from ..models.requests import (
     LoadWeightsRequest,
@@ -116,7 +117,6 @@ async def save_weights(
             request_id=request_id,
             path=request.path,
             training_clients=training_clients,
-            metadata_storage=metadata_storage
         )
 
     # Create async task
@@ -165,7 +165,6 @@ async def save_weights_for_sampler(
             request_id=request_id,
             name=request.name,
             training_clients=training_clients,
-            metadata_storage=metadata_storage,
             path=request.path,
             sampling_session_seq_id=request.sampling_session_seq_id
         )
@@ -173,7 +172,6 @@ async def save_weights_for_sampler(
         # Register ephemeral sampler with session if sampling_session_id was created
         sampling_session_id = result.get("sampling_session_id")
         if sampling_session_id:
-            checkpoint_path = result.get("checkpoint_path")
             # BUG-015: pin the weight version at save time so pinned logprob
             # reads are not served from the live (refit-every-step) engine.
             backend_handle = client_info.get("backend_handle")
@@ -182,7 +180,7 @@ async def save_weights_for_sampler(
                 sampler_id=sampling_session_id,
                 model_id=request.model_id,
                 base_model=base_model,
-                model_path=checkpoint_path,
+                model_path=result.get("uri"),
                 pinned_version=pinned_version,
             )
 
@@ -213,6 +211,7 @@ async def load_weights(
     futures_storage: FuturesStorage = Depends(get_futures_storage),
     metadata_storage: MetadataStorage = Depends(get_metadata_storage),
     training_clients: Dict = Depends(get_training_clients),
+    store: CheckpointStore = Depends(get_checkpoint_store),
 ):
     """Load a saved training checkpoint into a model.
 
@@ -230,16 +229,13 @@ async def load_weights(
             detail=f"LoadWeights is not permitted with seq_id {request.seq_id}: the model has already "
                    "trained; create a new model with checkpoint_path instead",
         )
-    parts = request.path.removeprefix("tinker://").split("/")
-    if not request.path.startswith("tinker://") or len(parts) != 3 or parts[1] != "weights":
-        raise HTTPException(status_code=400, detail=f"path must be tinker://<run>/weights/<name>, got {request.path!r}")
-    if metadata_storage.load_checkpoint(parts[0], parts[2]) is None:
-        raise HTTPException(status_code=404, detail=f"Checkpoint not found: {request.path}")
+    ref = CheckpointRef.parse(request.path)           # 400 on a malformed path
+    store.require(ref, kind=CheckpointKind.WEIGHTS)   # 404 / 425 / 500 / wrong kind, before the future exists
     request_id = generate_request_id()
 
     async def execute():
         return await service.load_weights(
-            model_id=request.model_id, request_id=request_id, path=request.path,
+            model_id=request.model_id, request_id=request_id, ref=ref,
             optimizer=request.optimizer,
             training_clients=training_clients, metadata_storage=metadata_storage,
         )
@@ -262,13 +258,15 @@ async def list_checkpoints(
     """Checkpoints of a training run, in the SDK's CheckpointsListResponse shape."""
     if metadata_storage.load_training_run(model_id) is None:
         raise HTTPException(status_code=404, detail=f"Training run not found: {model_id}")
-    return {"checkpoints": service.list_checkpoints(model_id, metadata_storage), "cursor": None}
+    return {"checkpoints": service.list_checkpoints(model_id), "cursor": None}
 
 
-def _delete(service, metadata_storage, model_id, checkpoint_type, checkpoint_id):
-    if checkpoint_type not in ("training", "sampler"):
+def _delete(service, model_id, checkpoint_type, checkpoint_id):
+    kinds = {"training": CheckpointKind.WEIGHTS, "sampler": CheckpointKind.SAMPLER_WEIGHTS}
+    if checkpoint_type not in kinds:
         raise HTTPException(status_code=400, detail="checkpoint_type must be 'training' or 'sampler'")
-    if not service.delete_checkpoint(model_id, checkpoint_type, checkpoint_id, metadata_storage):
+    ref = CheckpointRef.make(model_id, kinds[checkpoint_type], checkpoint_id)
+    if not service.delete_checkpoint(ref):
         raise HTTPException(status_code=404, detail=f"Checkpoint not found: {checkpoint_type} {checkpoint_id} of {model_id}")
     return Response(status_code=204)
 
@@ -284,7 +282,7 @@ async def delete_checkpoint_typed(
     kinds = {"weights": "training", "sampler_weights": "sampler"}
     if kind not in kinds:
         raise HTTPException(status_code=400, detail="checkpoint path must be weights/<id> or sampler_weights/<id>")
-    return _delete(service, metadata_storage, model_id, kinds[kind], checkpoint_id)
+    return _delete(service, model_id, kinds[kind], checkpoint_id)
 
 
 @router.delete("/api/v1/training_runs/{model_id}/checkpoints/{checkpoint_id}")
@@ -298,7 +296,7 @@ async def delete_checkpoint_bare(
     if not checkpoint_type:
         raise HTTPException(status_code=400, detail="specify the kind: .../checkpoints/weights/<id>, "
                             ".../checkpoints/sampler_weights/<id>, or ?checkpoint_type=training|sampler")
-    return _delete(service, metadata_storage, model_id, checkpoint_type, checkpoint_id)
+    return _delete(service, model_id, checkpoint_type, checkpoint_id)
 
 
 @router.post("/api/v1/weights_info", response_model=WeightsInfoResponse)
@@ -306,32 +304,22 @@ async def weights_info(
     request: WeightsInfoRequest,
     _: None = Depends(verify_api_key_dep),
     training_clients: Dict = Depends(get_training_clients),
-    metadata_storage: MetadataStorage = Depends(get_metadata_storage)
+    metadata_storage: MetadataStorage = Depends(get_metadata_storage),
+    store: CheckpointStore = Depends(get_checkpoint_store),
 ):
     """
     Get weights/checkpoint info from tinker path.
     Used for loading checkpoints via create_training_client_from_state.
 
-    Parses tinker:// URI and returns model metadata needed for checkpoint loading.
-    Validates both the model exists AND the specific checkpoint is recorded.
+    The path must name a completed checkpoint of either kind (400 malformed,
+    404 unknown, 425 still being written); the model info comes from the live
+    client or the stored training run.
     """
     tinker_path = request.tinker_path
     logger.info(f"weights_info request for: {tinker_path}")
-
-    # Parse tinker:// path: tinker://model_xxx/weights/checkpoint_name
-    if not tinker_path.startswith("tinker://"):
-        raise HTTPException(status_code=400, detail=f"Invalid tinker path: {tinker_path}")
-
-    # Extract model_id and checkpoint_name from path: tinker://model_xxx/weights/checkpoint_name
-    path_parts = tinker_path[9:].split("/")  # Remove "tinker://"
-    if len(path_parts) < 1:
-        raise HTTPException(status_code=400, detail=f"Invalid tinker path format: {tinker_path}")
-
-    model_id = path_parts[0]
-    checkpoint_name = path_parts[2] if len(path_parts) >= 3 else None
-    if checkpoint_name and path_parts[1] == "sampler_weights":
-        checkpoint_name = f"sampler_{checkpoint_name}"  # metadata key used by save_weights_for_sampler
-    logger.info(f"Extracted model_id: {model_id}, checkpoint_name: {checkpoint_name}")
+    ref = CheckpointRef.parse(tinker_path)
+    store.require(ref)
+    model_id = ref.model_id
 
     # Try to find model in active training clients first
     if model_id in training_clients:
@@ -339,17 +327,6 @@ async def weights_info(
         base_model = client_info.get("base_model", "")
         lora_rank = int((client_info.get("lora_config") or {}).get("rank") or 0)
         is_lora = lora_rank > 0
-
-        # Verify checkpoint exists if name was provided
-        if checkpoint_name:
-            checkpoint_meta = metadata_storage.load_checkpoint(model_id, checkpoint_name)
-            if not checkpoint_meta:
-                logger.warning(f"Checkpoint {checkpoint_name} not found for model {model_id}")
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Checkpoint not found: {checkpoint_name} for model {model_id}"
-                )
-
         logger.info(f"Found active model: base_model={base_model}, is_lora={is_lora}, lora_rank={lora_rank}")
         return WeightsInfoResponse(
             base_model=base_model,
@@ -364,17 +341,6 @@ async def weights_info(
         lora_config = metadata.get("lora_config", {})
         lora_rank = lora_config.get("rank", 0) if lora_config else 0
         is_lora = lora_rank > 0
-
-        # Verify checkpoint exists if name was provided
-        if checkpoint_name:
-            checkpoint_meta = metadata_storage.load_checkpoint(model_id, checkpoint_name)
-            if not checkpoint_meta:
-                logger.warning(f"Checkpoint {checkpoint_name} not found for model {model_id}")
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Checkpoint not found: {checkpoint_name} for model {model_id}"
-                )
-
         logger.info(f"Found stored metadata: base_model={base_model}, is_lora={is_lora}, lora_rank={lora_rank}")
         return WeightsInfoResponse(
             base_model=base_model,

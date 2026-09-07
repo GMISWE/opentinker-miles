@@ -19,8 +19,9 @@ def test_get_info_and_weights_info_report_lora(service_client, server):
     assert spath == f"tinker://{tc.model_id}/sampler_weights/sinfo"
     wi = server.post("/api/v1/weights_info", {"tinker_path": spath}).json()
     assert wi["is_lora"] is True and wi["lora_rank"] == 16
-    saved = [t for t in server.trace() if t["op"] == "save_checkpoint" and t["checkpoint_path"] == spath]
-    assert saved and saved[0]["root"].endswith(f"/{tc.model_id}/sampler_weights/sinfo")
+    saved = [t for t in server.trace() if t["op"] == "save_checkpoint" and t["model_id"] == tc.model_id
+             and t["root"].endswith(f"/{tc.model_id}/sampler_weights/sinfo")]
+    assert saved and saved[0]["persist"] is True and saved[0]["step"] == 2
 
 
 def test_full_param_model_reports_no_lora(service_client, server):

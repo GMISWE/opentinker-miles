@@ -10,6 +10,7 @@ language_modeling objective.
 """
 import asyncio
 import logging
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -79,7 +80,7 @@ class AutomodelBackend(TrainingBackend):
         rl_config: Optional[Dict[str, Any]] = None,
         rollout_config: Optional[Dict[str, Any]] = None,
         debug_train_only: bool = False,
-        checkpoint_path: Optional[str] = None,
+        resume_from: Optional[Path] = None,
         max_batch_size: int = 4096,
         max_seq_len: int = 2048,
         rlve_config: Optional[Dict[str, Any]] = None,
@@ -88,6 +89,7 @@ class AutomodelBackend(TrainingBackend):
         objective: str = Objective.SEQUENCE_CLASSIFICATION.value,
         num_labels: Optional[int] = None,
         head_config: Optional[Dict[str, Any]] = None,
+        native_root: Optional[Path] = None,
     ) -> AutomodelHandle:
         """Load an HF classification model + PEFT LoRA (no generation engine)."""
         if not is_classification(objective):
@@ -121,7 +123,7 @@ class AutomodelBackend(TrainingBackend):
         import asyncio
         await asyncio.to_thread(
             self._build_model, handle, base_model, objective, num_labels,
-            lora_config, head_config, checkpoint_path,
+            lora_config, head_config, str(resume_from) if resume_from else None,
         )
         return handle
 
@@ -303,37 +305,35 @@ class AutomodelBackend(TrainingBackend):
     # --- checkpoint / teardown ---
 
     async def save_checkpoint(
-        self, handle: BackendHandle, checkpoint_path: str,
-        step_id: Optional[int] = None,
-    ) -> str:
+        self, handle: BackendHandle, root: Path,
+        step: Optional[int] = None, persist: bool = True,
+    ) -> None:
         """Save the LoRA adapter + classification head (HF safetensors)."""
         import asyncio
         h: AutomodelHandle = handle  # type: ignore[assignment]
+        if not persist:
+            return  # no generation engine: an ephemeral sampler save has nothing to deliver
 
-        def _save() -> str:
-            import os
-            os.makedirs(checkpoint_path, exist_ok=True)
+        def _save() -> None:
             # PeftModel.save_pretrained writes the adapter; task_type SEQ_CLS/
             # TOKEN_CLS keeps the classifier in modules_to_save so it is saved too.
-            h.model.save_pretrained(checkpoint_path)
+            h.model.save_pretrained(str(root))
             if h.tokenizer is not None:
-                h.tokenizer.save_pretrained(checkpoint_path)
-            return checkpoint_path
+                h.tokenizer.save_pretrained(str(root))
 
-        path = await asyncio.to_thread(_save)
-        logger.info("Automodel checkpoint saved: %s (step=%s)", path, step_id)
-        return path
+        await asyncio.to_thread(_save)
+        logger.info("Automodel checkpoint saved: %s (step=%s)", root, step)
 
     async def load_checkpoint(
-        self, handle: BackendHandle, checkpoint_path: str, optimizer: bool = False,
+        self, handle: BackendHandle, root: Path, optimizer: bool = False,
     ) -> None:
         import asyncio
         h: AutomodelHandle = handle  # type: ignore[assignment]
         if optimizer:
             raise BackendError("automodel restores adapter weights only; optimizer state is not restored",
                                backend="automodel", operation="load_checkpoint")
-        await asyncio.to_thread(self._load_adapter, h, checkpoint_path)
-        logger.info("Automodel checkpoint loaded: %s", checkpoint_path)
+        await asyncio.to_thread(self._load_adapter, h, str(root))
+        logger.info("Automodel checkpoint loaded: %s", root)
 
     def _load_adapter(self, h: AutomodelHandle, checkpoint_path: str) -> None:
         """Load adapter weights into the existing PeftModel."""

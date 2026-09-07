@@ -4,6 +4,7 @@ ray + megatron.bridge
 """
 import asyncio
 import logging
+from pathlib import Path
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -68,7 +69,7 @@ class MegatronBridgeBackend(TrainingBackend):
         rl_config: Optional[Dict[str, Any]] = None,
         rollout_config: Optional[Dict[str, Any]] = None,
         debug_train_only: bool = False,
-        checkpoint_path: Optional[str] = None,
+        resume_from: Optional[Path] = None,
         max_batch_size: int = 4096,
         max_seq_len: int = 2048,
         rlve_config: Optional[Dict[str, Any]] = None,
@@ -77,6 +78,7 @@ class MegatronBridgeBackend(TrainingBackend):
         objective: str = Objective.SEQUENCE_CLASSIFICATION.value,
         num_labels: Optional[int] = None,
         head_config: Optional[Dict[str, Any]] = None,
+        native_root: Optional[Path] = None,
     ) -> MegatronBridgeHandle:
         """Spawn a GPU worker actor that builds the classifier + LoRA + optimizer."""
         if not is_classification(objective):
@@ -96,7 +98,9 @@ class MegatronBridgeBackend(TrainingBackend):
             base_ckpt_dir=hc.get("base_ckpt_dir", base_model),
             train_jsonl=hc.get("train_jsonl"), val_jsonl=hc.get("val_jsonl"),
             test_jsonl=hc.get("test_jsonl"), num_classes=num_labels,
-            result_dir=checkpoint_path or hc.get("result_dir", f"/data/{model_id}"),
+            # the recipe writes its own checkpoints under result_dir: the
+            # model's private area, so nothing lands outside the checkpoint base
+            result_dir=hc.get("result_dir", str(native_root) if native_root else f"/data/{model_id}"),
             experiment_name=model_id, model_size=hc.get("model_size", "evo2_1b_base"),
             tensor_model_parallel_size=(parallelism or {}).get("tp", 1),
             seq_length_tokens=seq_length, backbone_seq_length=seq_length,
@@ -124,6 +128,8 @@ class MegatronBridgeBackend(TrainingBackend):
 
         worker = MegatronBridgeWorker.remote(cfg_kwargs, _RECIPE_EXAMPLES)
         await _get(worker.ready.remote())   # blocks (in a thread) until setup() done
+        if resume_from:
+            await _get(worker.load_checkpoint.remote(str(resume_from), False))
 
         handle = MegatronBridgeHandle(
             model_id=model_id, backend_type="megatron_bridge", base_model=base_model,
@@ -176,20 +182,22 @@ class MegatronBridgeBackend(TrainingBackend):
 
     # --- checkpoint / teardown ---
 
-    async def save_checkpoint(self, handle: BackendHandle, checkpoint_path: str,
-                              step_id: Optional[int] = None) -> str:
+    async def save_checkpoint(self, handle: BackendHandle, root: Path,
+                              step: Optional[int] = None, persist: bool = True) -> None:
         h: MegatronBridgeHandle = handle  # type: ignore[assignment]
+        if not persist:
+            return
         try:
-            return await _get(h.worker.save_checkpoint.remote(checkpoint_path))
+            await _get(h.worker.save_checkpoint.remote(str(root)))
         except Exception as e:
             raise BackendError(f"save_checkpoint failed: {e!r}",
                                backend="megatron_bridge", operation="save_checkpoint")
 
-    async def load_checkpoint(self, handle: BackendHandle, checkpoint_path: str,
+    async def load_checkpoint(self, handle: BackendHandle, root: Path,
                               optimizer: bool = False) -> None:
         h: MegatronBridgeHandle = handle  # type: ignore[assignment]
         try:
-            await _get(h.worker.load_checkpoint.remote(checkpoint_path, optimizer))
+            await _get(h.worker.load_checkpoint.remote(str(root), optimizer))
         except Exception as e:
             raise BackendError(f"load_checkpoint failed: {e!r}",
                                backend="megatron_bridge", operation="load_checkpoint")

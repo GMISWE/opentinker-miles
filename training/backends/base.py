@@ -6,6 +6,7 @@ and BackendError — the contracts that Miles and NeMo RL implementations
 must satisfy.
 """
 from abc import ABC, abstractmethod
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, List, Optional
 
@@ -63,7 +64,7 @@ class TrainingBackend(ABC):
         rl_config: Optional[Dict[str, Any]] = None,
         rollout_config: Optional[Dict[str, Any]] = None,
         debug_train_only: bool = False,
-        checkpoint_path: Optional[str] = None,
+        resume_from: Optional[Path] = None,
         max_batch_size: int = 4096,
         max_seq_len: int = 2048,
         rlve_config: Optional[Dict[str, Any]] = None,
@@ -72,9 +73,20 @@ class TrainingBackend(ABC):
         objective: str = "language_modeling",
         num_labels: Optional[int] = None,
         head_config: Optional[Dict[str, Any]] = None,
+        native_root: Optional[Path] = None,
     ) -> BackendHandle:
         """
         Initialize training actors and inference engine.
+
+        Checkpoint directories come resolved from the checkpoint store
+        (training/checkpoints); a backend never sees a tinker:// URI.
+        `resume_from` is the root of a completed `weights` checkpoint to load
+        weights-only from (fresh optimizer, RNG and iteration count).
+        `native_root` is this model's private directory under the checkpoint
+        base -- the place for anything the engine writes on its own terms
+        (Megatron --save, per-adapter step checkpoints); the service always
+        passes it, and it outlives the model so a later resume can find what
+        was written there.
 
         The objective axis (feature 004) is additive: language_modeling is the
         default and leaves the existing causal path unchanged. LM-only backends
@@ -224,14 +236,24 @@ class TrainingBackend(ABC):
     async def save_checkpoint(
         self,
         handle: BackendHandle,
-        checkpoint_path: str,
-        step_id: Optional[int] = None,
-    ) -> str:
+        root: Path,
+        step: Optional[int] = None,
+        persist: bool = True,
+    ) -> None:
         """
-        Save model checkpoint.
+        Write a checkpoint under `root` (an existing, empty directory the store
+        created). What goes inside is the backend's: its native format wherever
+        the engine can write one, optimizer state wherever it can be restored,
+        and the cross-backend interchange adapter (training/checkpoints/
+        interchange.py) so another engine can import it. `step` is the store's
+        per-model counter for this save, unique for the life of the model --
+        the label for counter-named native artifacts (Megatron iter_*). It is
+        None, and `persist` False, for an ephemeral sampler save: the weights
+        already reached the inference engine and nothing need be written.
 
-        Returns:
-            Actual path where checkpoint was saved.
+        Raises:
+            BackendError: If the checkpoint cannot be written; the store then
+                marks the save failed and nothing under `root` is trusted.
         """
         ...
 
@@ -239,11 +261,12 @@ class TrainingBackend(ABC):
     async def load_checkpoint(
         self,
         handle: BackendHandle,
-        checkpoint_path: str,
+        root: Path,
         optimizer: bool = False,
     ) -> None:
         """
-        Load a checkpoint into a live model.
+        Load the checkpoint under `root` (a completed `weights` checkpoint, as
+        resolved by the store) into a live model.
 
         `optimizer=False` restores weights only and leaves the model's optimizer
         state as it is (fresh on a model that has not trained). `optimizer=True`
@@ -258,7 +281,7 @@ class TrainingBackend(ABC):
 
         Args:
             handle: Backend handle returned by create_model.
-            checkpoint_path: Path to the checkpoint directory.
+            root: The checkpoint directory.
             optimizer: Also restore optimizer state.
 
         Raises:

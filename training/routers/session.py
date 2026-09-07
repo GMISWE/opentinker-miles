@@ -27,7 +27,8 @@ from ..models.responses import (
     ListSessionsResponse,
     GetSamplerResponse,
 )
-from ..core.dependencies import verify_api_key_dep
+from ..core.dependencies import verify_api_key_dep, get_checkpoint_store
+from ..checkpoints import CheckpointStore
 from ..services.session_service import SessionService
 
 logger = logging.getLogger(__name__)
@@ -108,6 +109,7 @@ async def create_sampling_session(
     _: None = Depends(verify_api_key_dep),
     session_service: SessionService = Depends(get_session_service),
     training_clients: Dict = Depends(get_training_clients),
+    store: CheckpointStore = Depends(get_checkpoint_store),
 ):
     """
     Create a sampling session for inference.
@@ -125,9 +127,9 @@ async def create_sampling_session(
     # A sampler must name its owning model: a tinker:// model_path does; a bare
     # base_model has no engine behind it.
     from .sampling import resolve_target_model
-    model_id, _ = resolve_target_model(
+    model_id, pinned_version = resolve_target_model(
         training_clients, session_service,
-        model_path=request.model_path, base_model=request.base_model,
+        model_path=request.model_path, base_model=request.base_model, store=store,
     )
 
     # Generate sampling_session_id
@@ -142,6 +144,7 @@ async def create_sampling_session(
         base_model=request.base_model or training_clients[model_id].get("base_model"),
         model_path=request.model_path,
         model_id=model_id,
+        pinned_version=pinned_version,   # a checkpoint path pins the sampler at its saved version
     )
 
     logger.info(

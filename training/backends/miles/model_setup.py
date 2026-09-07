@@ -152,70 +152,29 @@ def detect_torch_dist_path(base_model: str) -> tuple[str, str]:
 NATIVE_CHECKPOINT_POINTER = "miles_native_checkpoint"
 
 
-def record_native_checkpoint(checkpoint_path: str, native_dir: str) -> None:
-    """Remember which Megatron iter_* directory a tinker:// checkpoint was
+def record_native_checkpoint(root: str, native_dir: str) -> None:
+    """Remember which Megatron iter_* directory the checkpoint under `root` was
     published from, beside its interchange adapter, so a later resume can find
-    it. The iter number is miles' own save counter, not derivable from the URI."""
-    from ..checkpoint_interchange import resolve_checkpoint_root
-    root = resolve_checkpoint_root(checkpoint_path, create=True)
+    it. The iter number is the store's per-model save counter, which the URI
+    does not carry."""
     with open(os.path.join(root, NATIVE_CHECKPOINT_POINTER), "w") as f:
         f.write(native_dir)
 
 
-def resolve_native_checkpoint(checkpoint_path: str, save_dir: str = "/data/checkpoints/tinker") -> str:
-    """The directory Megatron loads a tinker:// checkpoint from: the iter_*
-    directory recorded at publish time, or (checkpoints published before the
-    record existed) the legacy hash-derived name."""
-    from ..checkpoint_interchange import resolve_checkpoint_root
-    if checkpoint_path.startswith("tinker://"):
-        pointer = os.path.join(resolve_checkpoint_root(checkpoint_path), NATIVE_CHECKPOINT_POINTER)
-        if os.path.exists(pointer):
-            with open(pointer) as f:
-                native = f.read().strip()
-            if native and os.path.isdir(native):
-                logger.info("Checkpoint resume: %s → %s (recorded at publish)", checkpoint_path, native)
-                return native
-            raise FileNotFoundError(
-                f"Native Miles checkpoint recorded for {checkpoint_path} is gone: {native!r}")
-    return parse_checkpoint_uri(checkpoint_path, save_dir)
-
-
-def parse_checkpoint_uri(checkpoint_path: str, save_dir: str = "/data/checkpoints/tinker") -> str:
-    """
-    Parse tinker:// URI to filesystem checkpoint path.
-
-    Args:
-        checkpoint_path: Checkpoint path (tinker:// URI or filesystem path)
-        save_dir: Base directory for checkpoints
-
-    Returns:
-        Filesystem checkpoint path
-
-    Raises:
-        ValueError: If tinker:// URI format is invalid
-    """
-    if checkpoint_path.startswith("tinker://"):
-        import hashlib
-
-        uri_parts = checkpoint_path.replace("tinker://", "").split("/")
-        if len(uri_parts) >= 3 and uri_parts[1] == "weights":
-            checkpoint_name = uri_parts[2]
-            # Use same step_id calculation as save_weights
-            step_id = int(
-                hashlib.md5(checkpoint_name.encode()).hexdigest()[:8], 16
-            ) % 100000
-            filesystem_path = f"{save_dir}/iter_{step_id:07d}"
-            logger.info(
-                f"Checkpoint resume: {checkpoint_path} → {filesystem_path} "
-                f"(step_id={step_id})"
-            )
-            return filesystem_path
-        else:
-            raise ValueError(f"Invalid tinker:// URI format: {checkpoint_path}")
-    else:
-        # Direct filesystem path
-        logger.info(f"Checkpoint resume: loading from {checkpoint_path}")
-        return checkpoint_path
+def resolve_native_checkpoint(root: str) -> str:
+    """The directory Megatron loads the checkpoint under `root` from: the
+    iter_* directory recorded at publish time. A checkpoint without the record
+    (written by another backend) has no Megatron-native state to load."""
+    pointer = os.path.join(root, NATIVE_CHECKPOINT_POINTER)
+    if not os.path.exists(pointer):
+        raise FileNotFoundError(
+            f"{root} carries no {NATIVE_CHECKPOINT_POINTER}: not a Miles-native checkpoint")
+    with open(pointer) as f:
+        native = f.read().strip()
+    if not native or not os.path.isdir(native):
+        raise FileNotFoundError(f"Native Miles checkpoint recorded for {root} is gone: {native!r}")
+    logger.info("Checkpoint resume: %s -> %s (recorded at publish)", root, native)
+    return native
 
 
 def compute_sglang_mem_fraction(model_config: Dict[str, Any], model_name: str = "") -> float:
