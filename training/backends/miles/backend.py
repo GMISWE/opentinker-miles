@@ -24,6 +24,7 @@ from ..checkpoint_interchange import (
     export_hf_adapter,
     resolve_checkpoint_root,
 )
+from .model_setup import parse_checkpoint_uri
 
 logger = logging.getLogger(__name__)
 
@@ -1244,7 +1245,10 @@ class MilesBackend(TrainingBackend):
             )
         await h.lock.acquire()
         try:
-            await h.train_group.load_checkpoint(checkpoint_path, load_optimizer=optimizer)
+            # The actors take Megatron's --load directory, not the tinker:// URI;
+            # resolve it the way the builder does for create_model(checkpoint_path).
+            load_dir = parse_checkpoint_uri(checkpoint_path, h.args.save)
+            await h.train_group.load_checkpoint(load_dir, load_optimizer=optimizer)
             h.created_from_checkpoint = True
 
             # Sync loaded weights to inference engine
