@@ -808,9 +808,15 @@ class NemoRLBackend(TrainingBackend):
             await asyncio.to_thread(
                 _policy_load_checkpoint, h.policy, weights_path, optimizer_path,
             )
-            h.training_resident = False  # loaded state may not be GPU-resident
 
             if h.policy_generation is not None and not h.debug_train_only:
+                # The policy was offloaded after the last refit, so the loaded
+                # parameters sit on CPU; the refit streams DTensors and needs
+                # them on GPU (all_gather has no CPU backend). Same sequence as
+                # after an optimizer step: prepare_for_training, refit, offload.
+                if not h.training_resident:
+                    await asyncio.to_thread(h.policy.prepare_for_training)
+                    h.training_resident = True
                 logger.info("Refitting policy generation after checkpoint load for %s", h.model_id)
                 await asyncio.to_thread(
                     _refit_policy_generation,
@@ -819,6 +825,9 @@ class NemoRLBackend(TrainingBackend):
                     h.colocated_inference,
                     h.refit_memory_ratio,
                 )
+                h.training_resident = False  # the refit offloaded the policy
+            else:
+                h.training_resident = False  # loaded state may not be GPU-resident
                 async with h._generation_state_lock:
                     h.generation_state = "generation_ready"
 

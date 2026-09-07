@@ -24,7 +24,7 @@ from ..checkpoint_interchange import (
     export_hf_adapter,
     resolve_checkpoint_root,
 )
-from .model_setup import parse_checkpoint_uri
+from .model_setup import record_native_checkpoint, resolve_native_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +88,8 @@ def _publish_native_adapter(args, checkpoint_path: str) -> None:
         return
     latest = max(candidates, key=os.path.getmtime)
     export_hf_adapter(latest, resolve_checkpoint_root(checkpoint_path, create=True))
+    # the iter_* dir this adapter came from is what a resume must hand Megatron
+    record_native_checkpoint(checkpoint_path, os.path.dirname(latest))
 
 
 def _model_input_lens(data: List[Any]) -> List[int]:
@@ -1247,7 +1249,7 @@ class MilesBackend(TrainingBackend):
         try:
             # The actors take Megatron's --load directory, not the tinker:// URI;
             # resolve it the way the builder does for create_model(checkpoint_path).
-            load_dir = parse_checkpoint_uri(checkpoint_path, h.args.save)
+            load_dir = resolve_native_checkpoint(checkpoint_path, h.args.save)
             await h.train_group.load_checkpoint(load_dir, load_optimizer=optimizer)
             h.created_from_checkpoint = True
 
