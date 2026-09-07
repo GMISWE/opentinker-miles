@@ -14,7 +14,7 @@ from .model_setup import (
     auto_detect_all_parallelism,
     compute_sglang_mem_fraction,
     detect_torch_dist_path,
-    parse_checkpoint_uri,
+    resolve_native_checkpoint,
 )
 
 logger = logging.getLogger(__name__)
@@ -418,7 +418,7 @@ class MilesArgumentBuilder(ArgumentBuilder):
         # fresh optimizer, RNG and iteration count. Without these Megatron's
         # --load is a full resume. load_weights(optimizer=true) is the resume path.
         if checkpoint_path:
-            args.load = parse_checkpoint_uri(checkpoint_path, args.save)
+            args.load = resolve_native_checkpoint(checkpoint_path, args.save)
             args.no_load_optim = True
             args.no_load_rng = True
             args.finetune = True

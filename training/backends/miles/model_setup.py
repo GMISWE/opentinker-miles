@@ -149,6 +149,37 @@ def detect_torch_dist_path(base_model: str) -> tuple[str, str]:
         return base_model, hf_path
 
 
+NATIVE_CHECKPOINT_POINTER = "miles_native_checkpoint"
+
+
+def record_native_checkpoint(checkpoint_path: str, native_dir: str) -> None:
+    """Remember which Megatron iter_* directory a tinker:// checkpoint was
+    published from, beside its interchange adapter, so a later resume can find
+    it. The iter number is miles' own save counter, not derivable from the URI."""
+    from ..checkpoint_interchange import resolve_checkpoint_root
+    root = resolve_checkpoint_root(checkpoint_path, create=True)
+    with open(os.path.join(root, NATIVE_CHECKPOINT_POINTER), "w") as f:
+        f.write(native_dir)
+
+
+def resolve_native_checkpoint(checkpoint_path: str, save_dir: str = "/data/checkpoints/tinker") -> str:
+    """The directory Megatron loads a tinker:// checkpoint from: the iter_*
+    directory recorded at publish time, or (checkpoints published before the
+    record existed) the legacy hash-derived name."""
+    from ..checkpoint_interchange import resolve_checkpoint_root
+    if checkpoint_path.startswith("tinker://"):
+        pointer = os.path.join(resolve_checkpoint_root(checkpoint_path), NATIVE_CHECKPOINT_POINTER)
+        if os.path.exists(pointer):
+            with open(pointer) as f:
+                native = f.read().strip()
+            if native and os.path.isdir(native):
+                logger.info("Checkpoint resume: %s → %s (recorded at publish)", checkpoint_path, native)
+                return native
+            raise FileNotFoundError(
+                f"Native Miles checkpoint recorded for {checkpoint_path} is gone: {native!r}")
+    return parse_checkpoint_uri(checkpoint_path, save_dir)
+
+
 def parse_checkpoint_uri(checkpoint_path: str, save_dir: str = "/data/checkpoints/tinker") -> str:
     """
     Parse tinker:// URI to filesystem checkpoint path.
