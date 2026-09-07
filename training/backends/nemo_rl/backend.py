@@ -759,10 +759,12 @@ class NemoRLBackend(TrainingBackend):
                 "save_consolidated": False,
             })
 
+            # Optimizer state rides beside the weights so load_weights(optimizer=true)
+            # can restore it; LoRA moments are small.
             await asyncio.to_thread(
                 h.policy.save_checkpoint,
                 weights_path=weights_path,
-                optimizer_path=None,
+                optimizer_path=f"{local_path}/optimizer",
                 checkpointing_cfg=checkpointing_cfg,
             )
 
@@ -784,23 +786,27 @@ class NemoRLBackend(TrainingBackend):
         self,
         handle: BackendHandle,
         checkpoint_path: str,
+        optimizer: bool = False,
     ) -> None:
-        """Load checkpoint weights into policy, then sync to inference engine."""
+        """Load checkpoint weights (and, on request, optimizer state) into the
+        policy workers, then sync to the inference engine."""
         import os
 
         h: NemoRLHandle = handle  # type: ignore[assignment]
         try:
             local_path = _resolve_checkpoint_path(checkpoint_path)
             weights_path = _stage_foreign_adapter(local_path)
-            optimizer_path = f"{local_path}/optimizer"
-            # Only load optimizer state if it exists (checkpoint may be weights-only)
-            if not os.path.exists(optimizer_path):
-                optimizer_path = None
+            optimizer_path = None
+            if optimizer:
+                optimizer_path = f"{local_path}/optimizer"
+                if not os.path.isdir(optimizer_path):
+                    raise BackendError(
+                        f"Checkpoint {checkpoint_path} carries no optimizer state",
+                        backend="nemo_rl", operation="load_checkpoint",
+                    )
 
             await asyncio.to_thread(
-                h.policy.load_checkpoint,
-                weights_path=weights_path,
-                optimizer_path=optimizer_path,
+                _policy_load_checkpoint, h.policy, weights_path, optimizer_path,
             )
             h.training_resident = False  # loaded state may not be GPU-resident
 
@@ -818,6 +824,8 @@ class NemoRLBackend(TrainingBackend):
 
             logger.info("NeMo RL checkpoint loaded from %s", checkpoint_path)
 
+        except BackendError:
+            raise
         except Exception as e:
             raise BackendError(
                 str(e), backend="nemo_rl", operation="load_checkpoint", original_error=e,
@@ -1088,6 +1096,15 @@ def _resolve_checkpoint_path(path: str) -> str:
     """tinker://<run_id>/weights/<name> -> /data/checkpoints/<run_id>/<name>."""
     return resolve_checkpoint_root(path, create=True)
 
+
+
+def _policy_load_checkpoint(policy, weights_path: str, optimizer_path: Optional[str]) -> None:
+    """Policy exposes save_checkpoint but no load; fan the workers' load_checkpoint
+    out the same way (optimizer_path None = weights only)."""
+    import ray
+    ray.get(policy.worker_group.run_all_workers_single_data(
+        "load_checkpoint", weights_path=weights_path, optimizer_path=optimizer_path,
+    ))
 
 def _stage_foreign_adapter(local_path: str) -> str:
     """Return the weights_path to load, materializing an interchange adapter

@@ -218,12 +218,12 @@ async def load_weights(
 
     Permitted only as the model's first request (before any forward /
     forward_backward / optim_step), matching the Tinker service; later loads
-    belong in a fresh model created with checkpoint_path.
+    belong in a fresh model created with checkpoint_path. `optimizer=false`
+    restores weights only; `optimizer=true` also restores optimizer state and
+    fails the future when the checkpoint or backend cannot provide it.
     """
     if request.model_id not in training_clients:
         raise HTTPException(status_code=404, detail=f"Model {request.model_id} not found")
-    if request.optimizer:
-        raise HTTPException(status_code=400, detail="load_weights with optimizer=true is not supported")
     if futures_storage.has_training_requests(request.model_id):
         raise HTTPException(
             status_code=400,
@@ -240,6 +240,7 @@ async def load_weights(
     async def execute():
         return await service.load_weights(
             model_id=request.model_id, request_id=request_id, path=request.path,
+            optimizer=request.optimizer,
             training_clients=training_clients, metadata_storage=metadata_storage,
         )
 

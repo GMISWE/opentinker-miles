@@ -325,8 +325,12 @@ class VerlBackend(TrainingBackend):
             except Exception as e:
                 raise BackendError(str(e), backend="verl", operation="save_checkpoint", original_error=e) from e
 
-    async def load_checkpoint(self, handle: BackendHandle, checkpoint_path: str) -> None:
+    async def load_checkpoint(self, handle: BackendHandle, checkpoint_path: str,
+                              optimizer: bool = False) -> None:
         h: VerlHandle = handle  # type: ignore[assignment]
+        if optimizer:
+            raise BackendError("verl restores weights only; optimizer state is not restored",
+                               backend="verl", operation="load_checkpoint")
         async with h._lock:
             try:
                 await self._quiesce_samplers(h)

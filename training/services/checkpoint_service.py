@@ -92,13 +92,16 @@ class CheckpointService:
         path: str,
         training_clients: Dict[str, Dict[str, Any]],
         metadata_storage: MetadataStorage,
+        optimizer: bool = False,
     ) -> Dict[str, Any]:
-        """Load a training checkpoint into a live model (weights only)."""
+        """Load a training checkpoint into a live model: weights, plus optimizer
+        state when asked (the backend refuses rather than partially resumes)."""
         if model_id not in training_clients:
             raise KeyError(f"Model {model_id} not found")
         handle = training_clients[model_id]["backend_handle"]
-        logger.info("[%s] Loading weights for %s from %s", request_id, model_id, path)
-        await self.backend.load_checkpoint(handle, path)
+        logger.info("[%s] Loading %s for %s from %s", request_id,
+                    "weights + optimizer state" if optimizer else "weights", model_id, path)
+        await self.backend.load_checkpoint(handle, path, optimizer=optimizer)
         metadata_storage.update_training_run(
             training_clients[model_id].get("training_run_id", model_id),
             {"loaded_from": path, "last_request_time": datetime.now().isoformat()},

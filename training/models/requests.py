@@ -162,7 +162,7 @@ class LoadWeightsRequest(BaseModel):
 
     model_id: str = Field(..., description="Model ID")
     path: str = Field(..., description="tinker://<run>/weights/<name> to load from")
-    optimizer: bool = Field(default=False, description="Also restore optimizer state (not supported; must be false)")
+    optimizer: bool = Field(default=False, description="Also restore optimizer state (the checkpoint must carry it)")
     seq_id: Optional[int] = Field(default=None, description="Sequence ID for ordering")
 
 

@@ -62,3 +62,47 @@ def test_load_weights_first_request_rule(service_client, server):
     assert r.status_code in (400, 404)
     r = server.post("/api/v1/load_weights", {"model_id": "model_missing", "path": p, "optimizer": False})
     assert r.status_code == 404
+
+
+def test_load_weights_honours_the_optimizer_flag(service_client, server):
+    """weights-only leaves the optimizer fresh; with-optimizer restores it; a
+    checkpoint without optimizer state refuses rather than partially resumes.
+    The fake backend's optimizer state is its step counter, reported as grad_norm."""
+    src = service_client.create_lora_training_client(base_model="fake/tiny", rank=2)
+    for _ in range(2):
+        src.forward_backward([make_datum([1, 2, 3])], "cross_entropy")
+        src.optim_step(types.AdamParams(learning_rate=0.5)).result()
+    p = src.save_state("opt").result().path  # w = 1.0, step_count = 2
+
+    def load(model_id, optimizer, seq_id=1001):  # clear of the SDK's own seq_ids
+        r = server.post("/api/v1/load_weights", {"model_id": model_id, "path": p, "optimizer": optimizer, "seq_id": seq_id})
+        assert r.status_code == 200, r.text
+        return server.post("/api/v1/retrieve_future", {"request_id": r.json()["request_id"]}, timeout=60)
+
+    weights_only = service_client.create_lora_training_client(base_model="fake/tiny", rank=2)
+    assert load(weights_only.model_id, False).status_code == 200
+    op = weights_only.optim_step(types.AdamParams(learning_rate=0.0)).result()
+    assert op.metrics["fake_w"] == 1.0 and op.metrics["grad_norm"] == 1.0  # first step of a fresh optimizer
+
+    resumed = service_client.create_lora_training_client(base_model="fake/tiny", rank=2)
+    assert load(resumed.model_id, True).status_code == 200
+    op = resumed.optim_step(types.AdamParams(learning_rate=0.0)).result()
+    assert op.metrics["fake_w"] == 1.0 and op.metrics["grad_norm"] == 3.0  # continues from step 2
+
+    # the SDK's two resume constructors map onto the two flags
+    assert service_client.create_training_client_from_state(p).optim_step(
+        types.AdamParams(learning_rate=0.0)).result().metrics["grad_norm"] == 1.0
+    assert service_client.create_training_client_from_state_with_optimizer(p).optim_step(
+        types.AdamParams(learning_rate=0.0)).result().metrics["grad_norm"] == 3.0
+
+    # a checkpoint that carries no optimizer state: weights-only fine, with-optimizer refused
+    import json
+    state = server.checkpoint_base / src.model_id / "opt" / "fake_state.json"
+    st = json.loads(state.read_text())
+    st.pop("optimizer")
+    state.write_text(json.dumps(st))
+    fresh = service_client.create_lora_training_client(base_model="fake/tiny", rank=2)
+    fut = load(fresh.model_id, True)
+    assert fut.status_code == 400 and "no optimizer state" in fut.text, fut.text
+    fresh2 = service_client.create_lora_training_client(base_model="fake/tiny", rank=2)
+    assert load(fresh2.model_id, False).status_code == 200

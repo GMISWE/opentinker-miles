@@ -240,9 +240,18 @@ class TrainingBackend(ABC):
         self,
         handle: BackendHandle,
         checkpoint_path: str,
+        optimizer: bool = False,
     ) -> None:
         """
-        Load model weights from a checkpoint.
+        Load a checkpoint into a live model.
+
+        `optimizer=False` restores weights only and leaves the model's optimizer
+        state as it is (fresh on a model that has not trained). `optimizer=True`
+        also restores the optimizer state the checkpoint carries, and MUST raise
+        BackendError when the checkpoint has none or the backend cannot restore
+        it: never a silent partial resume. create_model(checkpoint_path=...) is
+        the weights-only load; save_checkpoint writes optimizer state wherever
+        the backend can.
 
         After loading, syncs weights to the inference engine via
         update_inference_weights / refit_policy_generation.
@@ -250,9 +259,11 @@ class TrainingBackend(ABC):
         Args:
             handle: Backend handle returned by create_model.
             checkpoint_path: Path to the checkpoint directory.
+            optimizer: Also restore optimizer state.
 
         Raises:
-            BackendError: If checkpoint loading fails.
+            BackendError: If checkpoint loading fails, or optimizer state was
+                requested and is unavailable.
         """
         ...
 

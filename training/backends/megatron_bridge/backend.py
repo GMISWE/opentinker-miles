@@ -185,10 +185,11 @@ class MegatronBridgeBackend(TrainingBackend):
             raise BackendError(f"save_checkpoint failed: {e!r}",
                                backend="megatron_bridge", operation="save_checkpoint")
 
-    async def load_checkpoint(self, handle: BackendHandle, checkpoint_path: str) -> None:
+    async def load_checkpoint(self, handle: BackendHandle, checkpoint_path: str,
+                              optimizer: bool = False) -> None:
         h: MegatronBridgeHandle = handle  # type: ignore[assignment]
         try:
-            await _get(h.worker.load_checkpoint.remote(checkpoint_path))
+            await _get(h.worker.load_checkpoint.remote(checkpoint_path, optimizer))
         except Exception as e:
             raise BackendError(f"load_checkpoint failed: {e!r}",
                                backend="megatron_bridge", operation="load_checkpoint")
