@@ -1231,6 +1231,7 @@ class MilesBackend(TrainingBackend):
         self,
         handle: BackendHandle,
         checkpoint_path: str,
+        optimizer: bool = False,
     ) -> None:
         h: MilesHandle = handle  # type: ignore[assignment]
         if h.adapter_slot is not None:
@@ -1243,7 +1244,7 @@ class MilesBackend(TrainingBackend):
             )
         await h.lock.acquire()
         try:
-            await h.train_group.load_checkpoint(checkpoint_path)
+            await h.train_group.load_checkpoint(checkpoint_path, load_optimizer=optimizer)
             h.created_from_checkpoint = True
 
             # Sync loaded weights to inference engine

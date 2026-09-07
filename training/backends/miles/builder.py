@@ -414,9 +414,14 @@ class MilesArgumentBuilder(ArgumentBuilder):
         args.ref_load = megatron_checkpoint_path
         args.save = self.default_save_dir
 
-        # Handle checkpoint resume
+        # create_model(checkpoint_path) is a weights-only load by contract: a
+        # fresh optimizer, RNG and iteration count. Without these Megatron's
+        # --load is a full resume. load_weights(optimizer=true) is the resume path.
         if checkpoint_path:
             args.load = parse_checkpoint_uri(checkpoint_path, args.save)
+            args.no_load_optim = True
+            args.no_load_rng = True
+            args.finetune = True
 
         # LoRA configuration. alpha defaults to rank per the API schema
         # (requests.py LoraConfig); alpha=0 zeroes LoRA scaling and gradients

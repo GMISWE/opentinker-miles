@@ -148,7 +148,9 @@ class MegatronBridgeWorker:
               opt_param_scheduler=self.scheduler, num_floating_point_operations_so_far=0)
         return checkpoint_path
 
-    def load_checkpoint(self, checkpoint_path: str) -> None:
+    def load_checkpoint(self, checkpoint_path: str, optimizer: bool = False) -> None:
         from megatron.bridge.training.checkpointing import load_checkpoint as _load
-        _load(state=self.state, model=self.model, optimizer=self.optimizer,
-              opt_param_scheduler=self.scheduler, checkpoint_path=checkpoint_path)
+        _load(state=self.state, model=self.model,
+              optimizer=self.optimizer if optimizer else None,
+              opt_param_scheduler=self.scheduler if optimizer else None,
+              checkpoint_path=checkpoint_path)

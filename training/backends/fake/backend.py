@@ -218,11 +218,12 @@ class FakeBackend(TrainingBackend):
         root = resolve_checkpoint_root(checkpoint_path, create=True)
         with open(os.path.join(root, STATE_FILE), "w") as f:
             json.dump({"w": h.w, "weight_version": h.weight_version, "base_model": h.base_model,
-                       "lora_config": h.lora_config, "step_id": step_id}, f)
+                       "lora_config": h.lora_config, "step_id": step_id,
+                       "optimizer": {"step_count": h.step_count}}, f)
         self._trace("save_checkpoint", h.model_id, checkpoint_path=checkpoint_path, root=root, step_id=step_id)
         return checkpoint_path
 
-    def _load_into(self, h: FakeHandle, checkpoint_path: str) -> None:
+    def _load_into(self, h: FakeHandle, checkpoint_path: str, optimizer: bool = False) -> None:
         root = resolve_checkpoint_root(checkpoint_path)
         path = os.path.join(root, STATE_FILE)
         if not os.path.exists(path):
@@ -230,10 +231,16 @@ class FakeBackend(TrainingBackend):
                                backend="fake", operation="load_checkpoint")
         with open(path) as f:
             st = json.load(f)
+        if optimizer and "optimizer" not in st:
+            raise BackendError(f"Checkpoint {checkpoint_path} carries no optimizer state",
+                               backend="fake", operation="load_checkpoint")
         h.w = st["w"]
         h.weight_version = st["weight_version"]
+        if optimizer:
+            h.step_count = st["optimizer"]["step_count"]
 
-    async def load_checkpoint(self, handle: BackendHandle, checkpoint_path: str) -> None:
+    async def load_checkpoint(self, handle: BackendHandle, checkpoint_path: str,
+                              optimizer: bool = False) -> None:
         h = self._handle(handle, "load_checkpoint")
-        self._load_into(h, checkpoint_path)
-        self._trace("load_checkpoint", h.model_id, checkpoint_path=checkpoint_path)
+        self._load_into(h, checkpoint_path, optimizer=optimizer)
+        self._trace("load_checkpoint", h.model_id, checkpoint_path=checkpoint_path, optimizer=optimizer)

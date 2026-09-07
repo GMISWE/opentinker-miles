@@ -325,10 +325,13 @@ class AutomodelBackend(TrainingBackend):
         return path
 
     async def load_checkpoint(
-        self, handle: BackendHandle, checkpoint_path: str,
+        self, handle: BackendHandle, checkpoint_path: str, optimizer: bool = False,
     ) -> None:
         import asyncio
         h: AutomodelHandle = handle  # type: ignore[assignment]
+        if optimizer:
+            raise BackendError("automodel restores adapter weights only; optimizer state is not restored",
+                               backend="automodel", operation="load_checkpoint")
         await asyncio.to_thread(self._load_adapter, h, checkpoint_path)
         logger.info("Automodel checkpoint loaded: %s", checkpoint_path)
 
