@@ -99,9 +99,11 @@ SETUPTOOLS_SCM_PRETEND_VERSION=${SETUPTOOLS_SCM_PRETEND_VERSION:-0.1.0} \
   pip install -e /work/tinker-cookbook --no-deps -q
 
 # deps missing from the base image that --no-deps skips
-# (distro: SDK; chz/termcolor/blobfile/tiktoken: cookbook;
-#  sympy/pylatexenc/math-verify: math_rl recipe extras)
-pip install -q distro chz termcolor blobfile tiktoken cloudpickle rich anyio \
+# (distro/pyqwest/orjson/zstandard/protobuf/click: SDK >= 0.25 — proto wire,
+#  zstd request bodies, pyqwest transport; chz/termcolor/blobfile/tiktoken:
+#  cookbook; sympy/pylatexenc/math-verify: math_rl recipe extras)
+pip install -q distro pyqwest orjson 'zstandard>=0.24' 'protobuf>=4.21' click \
+  chz termcolor blobfile tiktoken cloudpickle rich anyio \
   'httpx[http2]' sympy pylatexenc math-verify
 
 RUNTIME=$([ "$PROFILE" = miles ] && echo miles || echo nemo_rl)
