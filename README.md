@@ -85,7 +85,7 @@ Server-wide settings (`training/config.py`):
 | `TINKER_API_KEY` | API auth key | `tml-dev-key` |
 | `RAY_ADDRESS` / `RAY_NAMESPACE` | Ray cluster endpoint / namespace | auto (local head) / `default` |
 | `METADATA_DIR` | Futures DB, sessions DB, checkpoint metadata | `/data/metadata` |
-| `TINKERCLOUD_CHECKPOINT_BASE` | Root the `tinker://` checkpoint URIs resolve under | `/data/checkpoints` |
+| `TINKERCLOUD_CHECKPOINT_BASE` | Root of every model's checkpoints (`<model>/{weights,sampler_weights}/<name>/`) and native area (`<model>/native/`) | `/data/checkpoints` |
 | `SESSION_TIMEOUT_S` / `SESSION_REAP_INTERVAL_S` | Expire silent sessions and free their models (`-1` disables) | `600` / `60` |
 | `ALLOW_PARTIAL_BATCHES` | Pad batches smaller than the DP size | `false` |
 | `KGATEWAY_LOG_LEVEL` / `KGATEWAY_ACCESS_LOG` | Log level / HTTP access log | `INFO` / `false` |

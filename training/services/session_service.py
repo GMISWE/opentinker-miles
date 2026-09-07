@@ -290,7 +290,8 @@ class SessionService:
         sampling_session_id: str,
         base_model: Optional[str] = None,
         model_path: Optional[str] = None,
-        model_id: Optional[str] = None
+        model_id: Optional[str] = None,
+        pinned_version: Optional[int] = None,
     ) -> bool:
         """
         Link a sampling session to a parent session.
@@ -327,6 +328,7 @@ class SessionService:
                 base_model=base_model if base_model else None,
                 model_path=model_path,
                 model_id=model_id,
+                pinned_version=pinned_version,
             )
 
             # Persist to storage

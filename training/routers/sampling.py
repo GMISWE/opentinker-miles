@@ -13,7 +13,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from ..services.sampling_service import SamplingService
 from ..core.task_manager import TaskManager
-from ..core.dependencies import verify_api_key_dep
+from ..core.dependencies import verify_api_key_dep, get_checkpoint_store
+from ..checkpoints import CheckpointRef, CheckpointStore
 from ..storage import FuturesStorage
 from ..models.requests import (
     ASampleRequest,
@@ -89,13 +90,15 @@ def resolve_target_model(
     sampling_session_id: Optional[str] = None,
     model_path: Optional[str] = None,
     base_model: Optional[str] = None,
+    store: Optional[CheckpointStore] = None,
 ) -> tuple:
     """Return (model_id, pinned_version) for a sampling request, or raise.
 
     A sampler names its owning model (registered at save_weights_for_sampler /
-    create_sampling_session); a bare model_path names it by URI. There is no
-    fallback to "some model": under a multi-tenant pool that serves a
-    co-tenant's adapter, and a bare base_model has no engine behind it.
+    create_sampling_session); a checkpoint model_path names it through the
+    store. There is no fallback to "some model": under a multi-tenant pool
+    that serves a co-tenant's adapter, and a bare base_model has no engine
+    behind it.
     """
     if sampling_session_id:
         info = session_service.get_sampler(sampling_session_id) if session_service is not None else None
@@ -107,18 +110,19 @@ def resolve_target_model(
             raise HTTPException(status_code=404, detail=f"Sampler {sampling_session_id}'s model {info.model_id} no longer exists")
         return info.model_id, getattr(info, "pinned_version", None)
     if model_path:
-        model_id = model_id_from_path(model_path)
-        if model_id not in training_clients:
-            raise HTTPException(status_code=404, detail=f"Model {model_id!r} from model_path {model_path!r} not found")
-        return model_id, None
+        # A checkpoint path names its model AND the weight version it was
+        # saved at: the sampler is pinned there, not served the live weights.
+        ref = CheckpointRef.parse(model_path)
+        if store is None:
+            raise RuntimeError("resolve_target_model needs the checkpoint store to resolve a model_path")
+        store.require(ref)
+        if ref.model_id not in training_clients:
+            raise HTTPException(status_code=404, detail=f"Model {ref.model_id!r} from model_path {model_path!r} not found")
+        rec = store.get(ref) or {}
+        return ref.model_id, rec.get("weight_version")
     if base_model:
         raise HTTPException(status_code=400, detail=BASE_MODEL_SAMPLING_UNSUPPORTED)
     raise HTTPException(status_code=400, detail="Provide sampling_session_id or a tinker:// model_path")
-
-
-def model_id_from_path(model_path: str) -> str:
-    """tinker://<model_id>/... -> model_id."""
-    return model_path.removeprefix("tinker://").split("/")[0]
 
 
 def _sequence_ids(request_id: str, n: int) -> List[str]:
@@ -135,6 +139,7 @@ async def asample(
     task_manager: TaskManager = Depends(get_task_manager),
     training_clients: Dict = Depends(get_training_clients),
     session_service=Depends(get_session_service),
+    store: CheckpointStore = Depends(get_checkpoint_store),
 ):
     """
     Async sampling via SGLang.
@@ -153,7 +158,7 @@ async def asample(
     model_id, pinned_version = resolve_target_model(
         training_clients, session_service,
         sampling_session_id=request.sampling_session_id,
-        model_path=request.model_path, base_model=request.base_model,
+        model_path=request.model_path, base_model=request.base_model, store=store,
     )
     target_model_id = model_id
 
@@ -202,6 +207,7 @@ async def sample(
     task_manager: TaskManager = Depends(get_task_manager),
     training_clients: Dict = Depends(get_training_clients),
     session_service=Depends(get_session_service),
+    store: CheckpointStore = Depends(get_checkpoint_store),
 ):
     """
     Synchronous sampling via SGLang.
@@ -212,7 +218,7 @@ async def sample(
     model_id, _ = resolve_target_model(
         training_clients, session_service,
         sampling_session_id=request.sampling_session_id,
-        model_path=request.model_path, base_model=request.base_model,
+        model_path=request.model_path, base_model=request.base_model, store=store,
     )
 
     async def execute():
@@ -253,6 +259,7 @@ async def create_sampling_client(
     task_manager: TaskManager = Depends(get_task_manager),
     training_clients: Dict = Depends(get_training_clients),
     session_service=Depends(get_session_service),
+    store: CheckpointStore = Depends(get_checkpoint_store),
 ):
     """
     Create sampling client bound to the model named by model_path.
@@ -262,7 +269,7 @@ async def create_sampling_client(
 
     model_id, _ = resolve_target_model(
         training_clients, session_service,
-        model_path=request.model_path, base_model=request.base_model,
+        model_path=request.model_path, base_model=request.base_model, store=store,
     )
 
     async def execute():

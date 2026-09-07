@@ -205,7 +205,7 @@ class MetadataStorage:
         # Add metadata
         checkpoint_data["model_id"] = model_id
         checkpoint_data["checkpoint_name"] = checkpoint_name
-        checkpoint_data["created_at"] = datetime.utcnow().isoformat()
+        checkpoint_data.setdefault("created_at", datetime.utcnow().isoformat())
 
         # Save checkpoint metadata
         checkpoint_path = model_checkpoints_dir / f"{checkpoint_name}.json"

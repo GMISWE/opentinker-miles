@@ -31,6 +31,10 @@ class StorageConfig(BaseModel):
         default_factory=lambda: Path(os.getenv("METADATA_DIR", "/data/metadata")),
         description="Base directory for metadata storage"
     )
+    checkpoint_base: Path = Field(
+        default_factory=lambda: Path(os.getenv("TINKERCLOUD_CHECKPOINT_BASE", "/data/checkpoints")),
+        description="Root under which every model's checkpoints and native area live",
+    )
     futures_db_name: str = Field(
         default="futures.db",
         description="SQLite database filename"

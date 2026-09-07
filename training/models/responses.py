@@ -303,8 +303,8 @@ class SaveWeightsForSamplerResult(_Result):
     type: str = Field(default="save_weights_for_sampler", description="Response type")
     path: Optional[str] = Field(default=None, description="Tinker URI path (for persistent saves)")
     sampling_session_id: Optional[str] = Field(default=None, description="Sampling session ID (for ephemeral saves)")
-    checkpoint_path: Optional[str] = Field(default=None, description="Filesystem path")
-    step_id: Optional[int] = Field(default=None, description="Checkpoint step ID")
+    uri: Optional[str] = Field(default=None, description="Identity of the saved sampler weights, ephemeral saves included")
+    step: Optional[int] = Field(default=None, description="The store's per-model save counter (None for ephemeral)")
     name: Optional[str] = Field(default=None, description="Checkpoint name")
     status: str = Field(default="completed", description="Operation status")
 

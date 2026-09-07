@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 
 # Import modules
 from .storage import FuturesStorage, MetadataStorage, SessionStorage
+from .checkpoints import CheckpointError, CheckpointStore
 from .storage.futures import DuplicateSeqId
 from .config import get_config, TrainingConfig
 from .utils import APIKeyAuth
@@ -96,6 +97,12 @@ def create_app(config: Optional[TrainingConfig] = None) -> FastAPI:
             d.mkdir(parents=True, exist_ok=True)
         futures_storage = FuturesStorage(config_obj.storage.futures_db_path)
         metadata_storage = MetadataStorage(config_obj.storage.metadata_dir)
+        config_obj.storage.checkpoint_base.mkdir(parents=True, exist_ok=True)
+        checkpoint_store = CheckpointStore(config_obj.storage.checkpoint_base, metadata_storage)
+        swept = checkpoint_store.sweep_pending()
+        if swept:
+            logger.warning("Marked %d checkpoint save(s) interrupted by the last shutdown as failed", swept)
+        logger.info("Checkpoint base: %s", config_obj.storage.checkpoint_base)
 
         # Initialize session storage (separate DB file for sessions/samplers)
         session_db_path = config_obj.storage.metadata_dir / "sessions.db"
@@ -137,6 +144,7 @@ def create_app(config: Optional[TrainingConfig] = None) -> FastAPI:
         # Store in app state for dependency injection
         application.state.futures_storage = futures_storage
         application.state.metadata_storage = metadata_storage
+        application.state.checkpoint_store = checkpoint_store
         application.state.session_storage = session_storage
         application.state.auth = auth
         application.state.backend = backend
@@ -149,9 +157,9 @@ def create_app(config: Optional[TrainingConfig] = None) -> FastAPI:
         from .services.sampling_service import SamplingService
         from .services.session_service import SessionService
 
-        application.state.model_service = ModelService(backend=backend)
+        application.state.model_service = ModelService(backend=backend, store=checkpoint_store)
         application.state.training_service = TrainingService(backend=backend)
-        application.state.checkpoint_service = CheckpointService(backend=backend)
+        application.state.checkpoint_service = CheckpointService(backend=backend, store=checkpoint_store)
         application.state.sampling_service = SamplingService(backend=backend)
         # Initialize SessionService with storage for persistence
         application.state.session_service = SessionService(storage=session_storage)
@@ -212,6 +220,13 @@ def create_app(config: Optional[TrainingConfig] = None) -> FastAPI:
         conflict can never succeed on retry."""
         return JSONResponse(status_code=400, content={"error": str(exc), "status_code": 400,
                                                       "path": str(request.url.path)})
+
+    @application.exception_handler(CheckpointError)
+    async def checkpoint_error_handler(request: Request, exc: CheckpointError):
+        """Store verdicts on a checkpoint identity: 400 malformed / wrong kind,
+        404 unknown, 425 still being written, 500 the save failed."""
+        return JSONResponse(status_code=exc.status_code, content={"error": str(exc), "status_code": exc.status_code,
+                                                                  "path": str(request.url.path)})
 
     @application.exception_handler(HTTPException)
     async def http_exception_handler(request: Request, exc: HTTPException):

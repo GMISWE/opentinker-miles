@@ -13,6 +13,7 @@ forward + backward + optimizer.step() in a single call.
 """
 import asyncio
 import logging
+from pathlib import Path
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -21,11 +22,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from ..base import BackendError, BackendHandle, TrainingBackend
 from .config import NemoRLConfig
 from ...core.loss_registry import clip_thresholds
-from ..checkpoint_interchange import (
-    export_hf_adapter,
-    resolve_checkpoint_root,
-    stage_hf_adapter,
-)
+from ...checkpoints.interchange import export_hf_adapter, stage_hf_adapter
 
 if TYPE_CHECKING:
     from .generation import NemoRLBatchAccumulator
@@ -119,7 +116,7 @@ class NemoRLBackend(TrainingBackend):
         rl_config: Optional[Dict[str, Any]] = None,
         rollout_config: Optional[Dict[str, Any]] = None,
         debug_train_only: bool = False,
-        checkpoint_path: Optional[str] = None,
+        resume_from: Optional[Path] = None,
         max_batch_size: int = 4096,
         max_seq_len: int = 2048,
         rlve_config: Optional[Dict[str, Any]] = None,
@@ -128,6 +125,7 @@ class NemoRLBackend(TrainingBackend):
         objective: str = "language_modeling",
         num_labels: Optional[int] = None,
         head_config: Optional[Dict[str, Any]] = None,
+        native_root: Optional[Path] = None,
     ) -> NemoRLHandle:
         if objective != "language_modeling":
             raise BackendError(
@@ -147,7 +145,6 @@ class NemoRLBackend(TrainingBackend):
                 rl_config=rl_config,
                 rollout_config=rollout_config,
                 debug_train_only=debug_train_only,
-                checkpoint_path=checkpoint_path,
                 max_batch_size=max_batch_size,
                 max_seq_len=max_seq_len,
                 rlve_config=rlve_config,
@@ -156,13 +153,9 @@ class NemoRLBackend(TrainingBackend):
             logger.info("[%s] NeMo RL config built, hf_path=%s", request_id, hf_path)
 
             # Policy(weights_path=...) goes straight to the checkpoint
-            # manager's load_checkpoint, so it needs the resolved <root>/weights
-            # dir — not the tinker:// URI — and a foreign adapter staged into
-            # the layout that loader sniffs.
-            init_weights_path = (
-                _stage_foreign_adapter(_resolve_checkpoint_path(checkpoint_path))
-                if checkpoint_path else None
-            )
+            # manager's load_checkpoint, so it needs the <root>/weights dir,
+            # with a foreign adapter staged into the layout that loader sniffs.
+            init_weights_path = _stage_foreign_adapter(str(resume_from)) if resume_from else None
 
             policy, policy_generation, cluster, tokenizer, loss_fn = await asyncio.to_thread(
                 _init_nemo_rl_components,
@@ -745,13 +738,16 @@ class NemoRLBackend(TrainingBackend):
     async def save_checkpoint(
         self,
         handle: BackendHandle,
-        checkpoint_path: str,
-        step_id: Optional[int] = None,
-    ) -> str:
+        root: Path,
+        step: Optional[int] = None,
+        persist: bool = True,
+    ) -> None:
         """Save model checkpoint via policy.save_checkpoint()."""
         h: NemoRLHandle = handle  # type: ignore[assignment]
+        if not persist:
+            return  # ephemeral sampler save: the refit already delivered the weights
         try:
-            local_path = _resolve_checkpoint_path(checkpoint_path)
+            local_path = str(root)
 
             weights_path = f"{local_path}/weights"
             checkpointing_cfg = h.config.get("checkpointing", {
@@ -774,8 +770,7 @@ class NemoRLBackend(TrainingBackend):
                 export_hf_adapter, f"{weights_path}/model", local_path,
             )
 
-            logger.info("NeMo RL checkpoint saved to %s", local_path)
-            return checkpoint_path  # Return original URI for metadata consistency
+            logger.info("NeMo RL checkpoint saved to %s (step %s)", local_path, step)
 
         except Exception as e:
             raise BackendError(
@@ -785,7 +780,7 @@ class NemoRLBackend(TrainingBackend):
     async def load_checkpoint(
         self,
         handle: BackendHandle,
-        checkpoint_path: str,
+        root: Path,
         optimizer: bool = False,
     ) -> None:
         """Load checkpoint weights (and, on request, optimizer state) into the
@@ -794,14 +789,14 @@ class NemoRLBackend(TrainingBackend):
 
         h: NemoRLHandle = handle  # type: ignore[assignment]
         try:
-            local_path = _resolve_checkpoint_path(checkpoint_path)
+            local_path = str(root)
             weights_path = _stage_foreign_adapter(local_path)
             optimizer_path = None
             if optimizer:
                 optimizer_path = f"{local_path}/optimizer"
                 if not os.path.isdir(optimizer_path):
                     raise BackendError(
-                        f"Checkpoint {checkpoint_path} carries no optimizer state",
+                        f"Checkpoint {root} carries no optimizer state",
                         backend="nemo_rl", operation="load_checkpoint",
                     )
 
@@ -831,7 +826,7 @@ class NemoRLBackend(TrainingBackend):
                 async with h._generation_state_lock:
                     h.generation_state = "generation_ready"
 
-            logger.info("NeMo RL checkpoint loaded from %s", checkpoint_path)
+            logger.info("NeMo RL checkpoint loaded from %s", root)
 
         except BackendError:
             raise
@@ -1100,12 +1095,6 @@ async def _ensure_generation_ready(handle) -> None:
 # ---------------------------------------------------------------------------
 # Internal helper functions (called via asyncio.to_thread)
 # ---------------------------------------------------------------------------
-
-def _resolve_checkpoint_path(path: str) -> str:
-    """tinker://<run_id>/weights/<name> -> /data/checkpoints/<run_id>/<name>."""
-    return resolve_checkpoint_root(path, create=True)
-
-
 
 def _policy_load_checkpoint(policy, weights_path: str, optimizer_path: Optional[str]) -> None:
     """Policy exposes save_checkpoint but no load; fan the workers' load_checkpoint

@@ -179,6 +179,33 @@ class TestBackendSignatureContract:
             BackendFactory.backend_class("nope")
 
 
+class TestCheckpointRootContract:
+    """save_checkpoint writes only under the root it is handed; persist=False
+    writes nothing; load_checkpoint reads the same root back. The CPU adapter
+    is the one that runs here; the GPU adapters share the signature (above)."""
+
+    def test_fake_writes_under_root_and_round_trips(self, tmp_path):
+        from tinkercloud.training.backends.fake.backend import FakeBackend
+        b = FakeBackend()
+        h = asyncio.run(b.create_model("m", "r", "fake/tiny", 0, native_root=tmp_path / "native"))
+        h.w = 0.75
+        root = tmp_path / "weights" / "c1"
+        root.mkdir(parents=True)
+        asyncio.run(b.save_checkpoint(h, root, step=3, persist=True))
+        written = {p.relative_to(tmp_path) for p in tmp_path.rglob("*") if p.is_file()}
+        assert written == {root.relative_to(tmp_path) / "fake_state.json"}
+        h2 = asyncio.run(b.create_model("m2", "r", "fake/tiny", 0, resume_from=root, native_root=tmp_path / "n2"))
+        assert h2.w == 0.75
+
+    def test_persist_false_writes_nothing(self, tmp_path):
+        from tinkercloud.training.backends.fake.backend import FakeBackend
+        b = FakeBackend()
+        h = asyncio.run(b.create_model("m", "r", "fake/tiny", 0, native_root=tmp_path / "native"))
+        root = tmp_path / "sampler_weights" / "e1"
+        asyncio.run(b.save_checkpoint(h, root, step=None, persist=False))
+        assert not root.exists()
+
+
 class TestSamplingContract:
     """Test sample()/prepare_for_generation() error contracts (no GPU needed)."""
 
